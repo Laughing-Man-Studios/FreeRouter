@@ -17,3 +17,5 @@ make an implementation appear compliant.
 
 When requirements are ambiguous, stop and ask before making a
 material assumption.
+
+Always use the configured GitHub MCP server to inspect or execute any actions, updates, or management tasks related to GitHub repositories and planning projects (e.g., issues, PRs, project boards, or code changes).
