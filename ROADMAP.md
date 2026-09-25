@@ -204,14 +204,14 @@ Progressively move toward:
 
 Context awareness should evolve in stages.
 
-#### Early implementation
+#### 3.6 Early implementation
 
 - Maintain configured context-window metadata per model.
 - Estimate incoming request size before dispatch.
 - Do not send a request to a model that is known to be incapable of accepting it.
 - Return a clear error if no eligible configured model can satisfy the request.
 
-#### Later
+#### 3.6 Later
 
 - Route oversized requests to a compatible larger-context model when routing policy allows model substitution.
 - Add more sophisticated message truncation only after there is evidence it is useful.
@@ -254,7 +254,7 @@ Evaluate remaining models by quality/quota policy
 
 ### 3.8 Client Model Selection
 
-#### MVP
+#### 3.8 MVP
 
 Clients explicitly select a model.
 
@@ -269,7 +269,7 @@ Example conceptually:
 
 The router does not yet attempt to understand the task or select among models automatically.
 
-#### Later
+#### 3.8 Later
 
 Add a router-controlled model option, conceptually:
 
@@ -336,7 +336,7 @@ This means the router intentionally concentrates traffic on the preferred model 
 
 ### 3.10 Error Handling & Failover
 
-#### MVP
+#### 3.10 MVP
 
 Keep failover intentionally simple.
 
@@ -350,7 +350,7 @@ Basic policy:
 
 The MVP should not implement an elaborate cascade engine.
 
-#### Later
+#### 3.10 Later
 
 Add:
 
@@ -400,7 +400,7 @@ Only models with compatible tool support remain eligible
 
 ### 3.13 Client Management
 
-#### MVP
+#### 3.13 MVP
 
 - Single trusted user.
 - No client authentication layer is required beyond whatever network-level protection is used for the private deployment.
@@ -410,7 +410,7 @@ Only models with compatible tool support remain eligible
 
 Do not expose the service publicly without adding an authentication/security layer later.
 
-#### Later
+#### 3.13 Later
 
 - internal client API keys
 - per-client rate limits
@@ -448,7 +448,7 @@ An external persistence dependency may be introduced in a later phase. The speci
 
 ### 3.15 Configuration & Secrets
 
-#### MVP
+#### 3.15 MVP
 
 Use `config.yaml` for configuration.
 
@@ -481,7 +481,7 @@ providers:
 
 For MVP, configuration changes may require a restart.
 
-#### Later
+#### 3.15 Later
 
 - encrypted persistent API-key storage
 - Administrative API for key management
@@ -565,7 +565,7 @@ The architecture should be able to grow toward:
 
 ---
 
-# 5. Technical Roadmap
+## 5. Technical Roadmap
 
 The roadmap is intentionally milestone-driven. Each milestone should leave the service in a usable state rather than requiring a large “big bang” release.
 
@@ -601,11 +601,11 @@ The schedule is intentionally loose. A reasonable working expectation is roughly
 
 ## Milestone 0: Technical Prototype
 
-### Objective
+### Milestone 0: Objective
 
 Prove that the core abstraction works with the minimum amount of code.
 
-### Deliverables
+### Milestone 0: Deliverables
 
 - Select implementation stack.
 - Create basic project structure.
@@ -628,7 +628,7 @@ Prove that the core abstraction works with the minimum amount of code.
 - authentication
 - UI
 
-### Exit criteria
+### Milestone 0: Exit criteria
 
 A local OpenAI-compatible client can send one chat-completion request through the router to Google and receive a normalized response.
 
@@ -636,11 +636,11 @@ A local OpenAI-compatible client can send one chat-completion request through th
 
 ## Milestone 1: MVP OpenAI-Compatible Proxy
 
-### Objective
+### Milestone 1: Objective
 
 Create the smallest genuinely useful version of the service.
 
-### Deliverables
+### Milestone 1: Deliverables
 
 - Google adapter.
 - Mistral adapter.
@@ -683,7 +683,7 @@ Provider adapter
 Normalized response
 ```
 
-### Exit criteria
+### Milestone 1: Exit criteria
 
 The service can reliably pass requests between OpenHands/another OpenAI-compatible client and Google/Mistral while selecting among configured keys and avoiding obviously unavailable keys.
 
@@ -691,11 +691,11 @@ The service can reliably pass requests between OpenHands/another OpenAI-compatib
 
 ## Milestone 2: Persistent & Interactive MVP
 
-### Objective
+### Milestone 2: Objective
 
 Make the MVP practical for repeated local use and early OpenHands testing.
 
-### Deliverables
+### Milestone 2: Deliverables
 
 - Local persistent state using one implementation only.
 - Restore recent usage/cooldown state after restart.
@@ -715,7 +715,7 @@ Begin using the router with the local OpenHands instance as an actual workload a
 
 Tool calling remains outside the MVP boundary but should be the next compatibility feature after streaming.
 
-### Exit criteria
+### Milestone 2: Exit criteria
 
 The router survives a restart without immediately losing its quota state and can serve interactive OpenHands workloads with streaming where supported.
 
@@ -723,11 +723,11 @@ The router survives a restart without immediately losing its quota state and can
 
 ## Milestone 3: Capability-Aware Router
 
-### Objective
+### Milestone 3: Objective
 
 Move from “send this exact model a request” toward “select from models that can actually satisfy this request.”
 
-### Deliverables
+### Milestone 3: Deliverables
 
 - Expand model registry metadata.
 - Configurable context-window metadata.
@@ -753,7 +753,7 @@ Remove models without usable free quota
 Rank remaining candidates
 ```
 
-### Exit criteria
+### Milestone 3: Exit criteria
 
 A request is never deliberately sent to a model that the local registry already knows cannot satisfy its hard requirements.
 
@@ -761,11 +761,11 @@ A request is never deliberately sent to a model that the local registry already 
 
 ## Milestone 4: Quality-First Free Router
 
-### Objective
+### Milestone 4: Objective
 
 Introduce the first true `model = free` style routing behavior.
 
-### Deliverables
+### Milestone 4: Deliverables
 
 - Router-controlled virtual model option.
 - Configurable routing-policy weights.
@@ -795,7 +795,7 @@ score remaining models
 choose highest-quality candidate
 ```
 
-### Exit criteria
+### Milestone 4: Exit criteria
 
 The router can choose a free model without the client having to name the provider/model explicitly, while keeping the decision understandable from structured logs.
 
@@ -803,11 +803,11 @@ The router can choose a free model without the client having to name the provide
 
 ## Milestone 5: Adaptive Router
 
-### Objective
+### Milestone 5: Objective
 
 Move from static model metadata toward a router that learns from observed runtime behavior.
 
-### Deliverables
+### Milestone 5: Deliverables
 
 - Record provider/model latency.
 - Track observed success/failure rates.
@@ -835,11 +835,11 @@ As routing becomes more sophisticated, the routing-overhead target may be relaxe
 
 ## Milestone 6: Managed Router
 
-### Objective
+### Milestone 6: Objective
 
 Convert the personal router into a maintainable managed service without changing its core routing concepts.
 
-### Deliverables
+### Milestone 6: Deliverables
 
 - Encrypted persistent storage for provider API keys.
 - Administrative API.
@@ -874,11 +874,11 @@ Candidate technologies can be evaluated later based on:
 
 ## Milestone 7: Web UI & Provider Platform
 
-### Objective
+### Milestone 7: Objective
 
 Make provider/model administration and future provider expansion substantially easier.
 
-### Deliverables
+### Milestone 7: Deliverables
 
 - Web UI backed by the Admin API.
 - Key management screens.
@@ -919,10 +919,10 @@ The precise level of automation depends on what each provider exposes reliably.
 
 ---
 
-# 6. Data & Fallback Flow Matrix
+## 6. Data & Fallback Flow Matrix
 
 | Event / Trigger | MVP Action | Later Enhancement | Terminal Action |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Incoming exact-model request | Validate, select eligible key, reserve quota, dispatch | Capability-aware model selection | Return normalized error if no eligible key/model |
 | Incoming router-controlled request | Not supported initially | Filter, score, and select best free model | Return normalized error if no eligible model |
 | Key available | Select eligible key using simple LRU | Quota-aware / health-aware selection | — |
@@ -937,7 +937,7 @@ The precise level of automation depends on what each provider exposes reliably.
 
 ---
 
-# 7. Testing Strategy
+## 7. Testing Strategy
 
 ## MVP unit tests
 
@@ -988,9 +988,9 @@ Manual provider testing remains useful initially for validating:
 
 ---
 
-# 8. Security & Privacy Roadmap
+## 8. Security & Privacy Roadmap
 
-## MVP
+### 8.1 MVP
 
 Assume a trusted, private deployment.
 
@@ -1001,7 +1001,7 @@ Assume a trusted, private deployment.
 - Avoid committing secrets to source control.
 - Restrict network exposure appropriately for a private service.
 
-## Later
+### 8.2 Later
 
 - encrypted API-key storage
 - Admin API authentication
@@ -1013,7 +1013,7 @@ Assume a trusted, private deployment.
 
 ---
 
-# 9. Administrative API/UI Roadmap
+## 9. Administrative API/UI Roadmap
 
 Administrative management is explicitly postponed until after the routing architecture has stabilized.
 
@@ -1037,7 +1037,7 @@ A particularly valuable future UI feature is an **explainable routing view** sho
 
 ---
 
-# 10. Explicit Non-Goals / Deferred Features
+## 10. Explicit Non-Goals / Deferred Features
 
 The following are intentionally outside the foreseeable MVP and early roadmap unless a concrete use case changes priorities:
 
@@ -1075,7 +1075,7 @@ These are not commitments, but are valid long-term ideas:
 
 ---
 
-# 11. Long-Term Architecture Direction
+## 11. Long-Term Architecture Direction
 
 The intended evolution is:
 
@@ -1148,7 +1148,7 @@ Each concern should have a narrow interface so that the project's routing intell
 
 ---
 
-# 12. Current Project Definition
+## 12. Current Project Definition
 
 At the end of this requirements/grill-me session, the project can be summarized as follows:
 
