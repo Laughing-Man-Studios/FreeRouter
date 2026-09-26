@@ -4,20 +4,22 @@
 
 Milestone 0 will establish the foundational architecture of the Free LLM Router using a single Uvicorn process running FastAPI on Python 3.13 with `uvloop`. The implementation will strictly enforce the architectural boundary between the external OpenAI-compatible API and internal routing logic using `NormalizedRequest` and `NormalizedResponse` Pydantic models.
 
-Dependency management will rely exclusively on `uv`. Configuration will be loaded via a **manual YAML parser** that reads `config.yaml` and passes the resulting dictionary to Pydantic `BaseSettings`, allowing native environment variable overrides (e.g., `GEMINI_API_KEY`).
+Dependency management will rely exclusively on `uv`. Configuration will be loaded via a **manual YAML parser**: a custom `pydantic-settings` source reads `config.yaml` with `pyyaml` and returns a mapping, which the settings model validates. The sources are ordered so that **environment variables strictly override `config.yaml` values** (ADR-001), with an uncommitted local `.env` sitting between them.
+
+Secrets are read from the environment only. The YAML source refuses to load a document that defines a secret-named field (`gemini_api_key`, `api_key`, `keys`, `token`, `secret`, `password`) or references a secret via `${VAR}`, so a key cannot reach version-controlled configuration. The key is held as a `SecretStr`, so it cannot leak through `repr()` or a serialised configuration. Any invalid configuration, unknown key, or missing `GEMINI_API_KEY` raises a single `ConfigError` that chains the underlying exception, and validation messages report field locations only, never field values.
 
 The ASGI lifespan will execute a **synchronous-to-asynchronous database handoff**: it will open a standard synchronous `sqlite3` connection strictly to run Alembic migrations, close it, and then initialize the `aiosqlite` engine with strict WAL pragmas for the async runtime.
 
-Logging will use the standard library `logging` module equipped with a custom JSON formatter and **`contextvars`** (injected via FastAPI middleware) to attach request-scoped metadata (e.g., `request_id`, `model`, `latency`) without passing logger objects through the call stack, while explicitly dropping prompt and completion data.
+Logging will use the standard library `logging` module equipped with a custom JSON formatter and **`contextvars`** (injected via FastAPI middleware) to attach request-scoped metadata (e.g., `request_id`, `model`, `latency_ms`, `http_status`) without passing logger objects through the call stack. Privacy is enforced structurally rather than by convention: the formatter copies only an **allowlist of operational fields** off a log record, so prompt text, message content, completion text, payloads, and secrets cannot reach a log line. Field names follow CONSTITUTION §9.1 (`latency_ms`, `http_status`, `request_id`, `model`, `provider`).
 
 Dependency injection will use a **hybrid approach**: singletons (`httpx.AsyncClient`, `Config`, `aiosqlite` engine) are created and stored on `app.state` during the lifespan, and exposed to route handlers via lightweight FastAPI `Depends()` getter functions.
 
 ## Components Affected
 
-The project structure will be established under the `src/` directory with clear domain boundaries:
+The project structure will be established under the `src/` directory with clear domain boundaries. All modules live in a single `free_router` package, so imports are namespaced (`free_router.core.config`) rather than occupying generic top-level names such as `core` or `db`:
 
 ```text
-src/
+src/free_router/
  ├── api/
  │   ├── main.py                # FastAPI app, ASGI lifespan (sync DB -> async DB), global exception handlers, contextvars middleware
  │   └── routes.py              # POST /v1/chat/completions ingress, uses Depends() for state access
@@ -37,6 +39,8 @@ src/
 ```
 
 *Note: Multi-stage `Dockerfile` and `.github/workflows/ci.yml` (linting, typing, testing, Docker build verification) are explicitly in scope for this milestone.*
+
+*Note: `db/`, `providers/`, and `migrations/` are created by the batch that first uses them, since git cannot track empty directories.*
 
 ## Interfaces
 
