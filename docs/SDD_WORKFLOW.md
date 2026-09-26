@@ -466,9 +466,9 @@ This reduces duplication and reduces the amount of context agents need to proces
 
 ---
 
-## 13. Using the GitHub MCP Server
+## 13. Using the `gh` CLI
 
-The GitHub MCP server should be used to keep the GitHub Project synchronized with actual development activity.
+The `gh` CLI should be used to keep the GitHub Project synchronized with actual development activity.
 
 At the start of a work session:
 
@@ -489,11 +489,52 @@ At the end of a work session:
 5. If blocked, record the blocker in GitHub.
 ```
 
-The GitHub MCP server should be treated as an **operational interface to the project's work-tracking system**, not as a replacement for repository documentation.
+The `gh` CLI should be treated as an **operational interface to the project's work-tracking system**, not as a replacement for repository documentation.
 
 The coding agent should not fabricate Project status.
 
 A work item should only be moved to a completed state when the implementation has been verified against the applicable specification and acceptance criteria.
+
+### Project board commands
+
+This repository uses a GitHub Projects v2 board. There are no classic
+project boards.
+
+```text
+gh project list --owner Laughing-Man-Studios
+gh project field-list <number> --owner Laughing-Man-Studios
+gh project item-list <number> --owner Laughing-Man-Studios
+```
+
+The board's `Status` field accepts: `Backlog`, `Ready`, `In progress`,
+`In review`, `Done`.
+
+Move an item by issue URL, which avoids having to look up the internal
+project item ID first. The project number is a positional argument;
+`--id` refers to the project *item* ID (`PVTI_...`) and must not be
+combined with `--url`.
+
+```text
+gh project item-edit <project-number> --owner Laughing-Man-Studios \
+  --url <issue-url> --field "Status" --value "In progress"
+```
+
+The board also carries `Start date`, `Target date`, `Priority` and
+`Size` columns. These are currently empty. If they are populated later,
+note that they are separate from the issue-level custom fields of the
+same name and must be kept consistent with them.
+
+### Issue fields
+
+`gh issue edit` covers titles, bodies, labels, milestones, assignees,
+sub-issue relationships (`--parent`, `--add-sub-issue`) and issue types
+(`--type`).
+
+Issue-level custom fields (Start date, Target date, Priority, Effort)
+have no CLI flag. Write them with the `setIssueFieldValue` GraphQL
+mutation via `gh api graphql`, reading each field's `id` and any
+single-select `optionId` from the repository's `issueFields` first.
+See AGENTS.md for the governing convention.
 
 ---
 
@@ -914,7 +955,7 @@ Break implementation into bounded tasks.
 
 ### Step 7 — Start work
 
-Use the GitHub MCP server to move the Project item into the appropriate active state.
+Use the `gh` CLI to move the Project item into the appropriate active state.
 
 Give the coding agent only the relevant context.
 
@@ -928,7 +969,7 @@ Compare the implementation against the specification and acceptance criteria.
 
 ### Step 10 — Complete the work item
 
-Use the GitHub MCP server to update the Project item when the feature is actually complete.
+Use the `gh` CLI to update the Project item when the feature is actually complete.
 
 Link the relevant PR/commit where appropriate.
 
