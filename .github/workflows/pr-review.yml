@@ -1,24 +1,57 @@
-
-name: PR Review (GenAI Code Review)
+name: PR Review (Dual)
 
 on:
   pull_request:
-    types: [opened, synchronize, ready_for_review]
+    types: [opened, reopened, ready_for_review, synchronize]
 
 permissions:
   contents: read
+  issues: write
   pull-requests: write
 
 jobs:
-  review:
+  genai_code_review:
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+    name: Run GenAI Code Review
     steps:
       - uses: cirolini/genai-code-review@v3
         with:
           provider: openai-compatible
           base_url: https://openrouter.ai/api/v1
-          model: openrouter/free
+          model: nvidia/nemotron-3-super-120b-a12b:free
           api_key: ${{ secrets.OPENROUTER_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           github_pr_id: ${{ github.event.number }}
+          max_tokens: 32000
+          temperature: 0
+          custom_prompt: |
+            Review this pull request diff and report the most important findings.
+
+            For every finding, describe the problem, its location (file and line
+            range), and why it matters, entirely in prose.
+
+            Do NOT include a code suggestion, replacement code, or any
+            ```suggestion fenced block. Do not propose exact replacement text
+            for the flagged lines under any field name (suggestion, fix, patch,
+            or similar) - describe the fix in words only, so a human decides
+            how to write the actual change.
+
+  pr_agent_job:
+    if: ${{ github.event.sender.type != 'Bot' }}
+    runs-on: ubuntu-latest
+    name: Run PR Agent review
+    steps:
+      - name: PR Agent action step
+        uses: qodo-ai/pr-agent@main
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          config.model: "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
+          config.fallback_models: '["openrouter/nvidia/nemotron-3-super-120b-a12b:free"]'
+          config.custom_model_max_tokens: "32000"
+          config.temperature: "0"
+          github_action_config.auto_review: "true"
+          github_action_config.auto_describe: "false"
+          github_action_config.auto_improve: "false"
+          github_action_config.pr_actions: '["opened", "reopened", "ready_for_review", "review_requested", "synchronize"]'

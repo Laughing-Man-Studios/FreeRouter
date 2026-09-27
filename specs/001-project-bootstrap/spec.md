@@ -49,6 +49,7 @@ The final response layer must map the internal `NormalizedResponse` back to a st
 - The system must load a minimal `config.yaml` to register the available model.
 - **Pydantic Validation:** All configuration parsing, including the injection of environment variables for secrets, must be validated via Pydantic models at startup.
 - API keys must strictly be loaded from environment variables (e.g., `GEMINI_API_KEY`). Hardcoding secrets or committing them to `config.yaml` is strictly forbidden.
+- **Secret Indirection:** `config.yaml` must not reference secrets through environment variable placeholders (e.g., `${GEMINI_API_KEY}`); the loader must reject such references, and any secret-named field, as a configuration error at startup. Secrets are read from the process environment, optionally via an uncommitted local `.env` file.
 - **Fail Fast:** The router must refuse to start and exit immediately if the `config.yaml` is invalid, if Pydantic validation fails, or if the required Google API key environment variable is missing.
 
 ### 7. Docker & Runtime Workflow
