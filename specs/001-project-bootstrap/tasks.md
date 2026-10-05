@@ -59,9 +59,27 @@ This document outlines the implementation tasks for the M0 Technical Prototype, 
 
 **Maps to GitHub Issue:** `#3 Google Adapter Implementation`
 
-- [ ] **T010: Adapter Protocol.** Implement `src/free_router/providers/base.py` defining the abstract `ProviderAdapter` interface protocol. It must take a `NormalizedRequest` and `httpx.AsyncClient`, and return a `NormalizedResponse`.
-- [ ] **T011: Google Adapter.** Implement `src/free_router/providers/google/adapter.py`. Map the internal request to the Gemini API format. **Crucial:** Wrap the initial provider connection and dispatch in a strict `asyncio.timeout(0.4)` block. Catch `httpx` errors and raise the corresponding custom router exceptions (`ProviderAuthError`, `ProviderServerError`, etc.).
-- [ ] **T012: Adapter Tests.** Write `respx` unit tests for the Google adapter simulating deterministic responses: Success (200), Auth Error (401), Server Error (500), and Timeout (Scenarios 8, 9, & 10).
+- [x] **T010: Adapter Protocol.** Implement `src/free_router/providers/base.py` defining the abstract `ProviderAdapter` interface protocol. It must take a `NormalizedRequest` and `httpx.AsyncClient`, and return a `NormalizedResponse`.
+- [x] **T011: Google Adapter.** Implement `src/free_router/providers/google/adapter.py`. Map the internal request to the Gemini API format. **Crucial:** Wrap the initial provider connection and dispatch in a strict `asyncio.timeout(0.4)` block. Catch `httpx` errors and raise the corresponding custom router exceptions (`ProviderAuthError`, `ProviderServerError`, etc.).
+- [x] **T012: Adapter Tests.** Write `respx` unit tests for the Google adapter simulating deterministic responses: Success (200), Auth Error (401), Server Error (500), and Timeout (Scenarios 8, 9, & 10).
+
+> **Notes on T010–T012:**
+>
+> - **The 0.4 s window covers headers only, by decision.** The spec scopes it to "the initial
+>   provider connection and response header phase", which is confirmed as the intended reading.
+>   Dispatch therefore uses `client.send(request, stream=True)` and reads the body with `aread()`
+>   *after* the window closes. Using the convenience `client.post()` reads the body inside the window
+>   and would 504 every real multi-second completion.
+> - **`build_adapter(provider, http_client)` factory** resolves an adapter from the configured
+>   provider name, and `resolve_model` now returns `(provider, provider_id)`. This closes the seam
+>   where `routes.py` hardcoded `MockAdapter` and a literal `provider="google"`.
+> - **`providers/mock.py` is deleted.** The placeholder is no longer referenced by any code path.
+> - **Auth uses the `x-goog-api-key` header**, not a `?key=` query parameter, so the secret cannot
+>   appear in URLs or access logs. A test asserts the key never reaches the URL.
+> - **Still on `generateContent`** (`v1beta/models/{id}:generateContent`) per spec. Google now
+>   presents the newer Interactions API (`v1beta2/interactions`) as the going-forward path;
+>   migrating is deferred to a later milestone and confined to the adapter module.
+> - **`gemini-3.5-flash-lite` confirmed** as a real, supported model id. No `config.yaml` change.
 
 **Verification & Stop:**
 
