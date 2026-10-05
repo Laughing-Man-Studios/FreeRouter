@@ -25,7 +25,7 @@ from free_router.core.normalization import (
     normalize_chat_completion_request,
     to_openai_completion,
 )
-from free_router.providers.mock import MockAdapter
+from free_router.providers.base import build_adapter
 
 __all__ = [
     "chat_completions",
@@ -50,8 +50,8 @@ def get_http_client(request: Request) -> httpx.AsyncClient:
     return cast("httpx.AsyncClient", request.app.state.http_client)
 
 
-def resolve_model(config: Config, model: str) -> str:
-    """Confirm the requested model is configured and return its provider id.
+def resolve_model(config: Config, model: str) -> tuple[str, str]:
+    """Confirm the requested model is configured and return its provider mapping.
 
     The router honours explicit model selection and never substitutes a
     different model, so an unknown id is rejected before dispatch
@@ -62,14 +62,15 @@ def resolve_model(config: Config, model: str) -> str:
         model: The externally-requested model id.
 
     Returns:
-        The provider-native model id to dispatch.
+        A ``(provider, provider_model_id)`` pair: which adapter to use and the
+        provider-native model id to send it.
 
     Raises:
         UnsupportedModelError: If no configured model matches.
     """
     for entry in config.models:
         if entry.id == model:
-            return entry.provider_id
+            return entry.provider, entry.provider_id
     available = ", ".join(entry.id for entry in config.models)
     raise UnsupportedModelError(
         f"Model '{model}' is not available. Configured models: {available}.",
@@ -101,15 +102,13 @@ async def chat_completions(
 
     # Model validation happens here, inside the route handler, so no dispatch
     # can occur for a model the router does not serve (spec Behavioral Rules).
-    provider_id = resolve_model(config, normalized.model)
+    provider, provider_id = resolve_model(config, normalized.model)
 
     started = time.perf_counter()
-    # Batch 2 dispatches to a placeholder adapter; T010/T011 replace this with
-    # the GoogleAdapter Protocol implementation.
-    adapter = MockAdapter(http_client=http_client)
-    with log_context(model=normalized.model, provider="google"):
+    adapter = build_adapter(provider, http_client)
+    with log_context(model=normalized.model, provider=provider):
         logger.info("provider_dispatched", extra={"event": "provider_dispatched"})
-        response: NormalizedResponse = await adapter.chat_completion(normalized)
+        response: NormalizedResponse = await adapter.chat_completion(normalized, provider_id)
         logger.info(
             "provider_responded",
             extra={
