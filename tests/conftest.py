@@ -13,10 +13,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from free_router.core.logging import NORMALISED_LOGGERS, JsonFormatter
 
-MANAGED_ENV_VARS = ("GEMINI_API_KEY", "LOG_LEVEL", "ROUTER_CONFIG_PATH")
+MANAGED_ENV_VARS = ("GEMINI_API_KEY", "LOG_LEVEL", "ROUTER_CONFIG_PATH", "ROUTER_DB_PATH")
 """Environment variables that must not leak into a test."""
 
 MINIMAL_CONFIG = """\
@@ -66,6 +68,35 @@ def set_api_key(monkeypatch: pytest.MonkeyPatch) -> Callable[..., str]:
         return value
 
     return _set
+
+
+@pytest.fixture
+def ready_app(
+    workdir: Path,
+    tmp_path: Path,
+    write_config: Callable[..., Path],
+    set_api_key: Callable[..., str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[Callable[[], FastAPI]]:
+    """A factory for an app whose startup steps all succeed.
+
+    The database is redirected away from the working directory so a test can
+    assert on its lifecycle without picking up the default ``./data`` path.
+    """
+    from free_router.api.main import create_app
+
+    write_config()
+    set_api_key()
+    monkeypatch.setenv("ROUTER_DB_PATH", str(tmp_path / "router.db"))
+
+    yield create_app
+
+
+@pytest.fixture
+def client(ready_app: Callable[[], FastAPI]) -> Iterator[TestClient]:
+    """A started :class:`TestClient` with a throwaway database and configuration."""
+    with TestClient(ready_app()) as started:
+        yield started
 
 
 class LogRecorder:
@@ -118,6 +149,26 @@ def log_recorder() -> Iterator[LogRecorder]:
         yield recorder
     finally:
         recorder.close()
+
+
+@pytest.fixture
+def json_logs(log_recorder: LogRecorder) -> LogRecorder:
+    """A :class:`LogRecorder` wired to the root logger.
+
+    ``caplog`` is unusable for the router's own records: it only captures at
+    WARNING by default, and ``configure_logging`` clears root handlers during
+    startup. This fixture attaches after startup and restores the root logger
+    afterwards, so tests can assert on the real JSON contract at INFO level.
+    """
+    root = logging.getLogger()
+    root.addHandler(log_recorder.handler)
+    previous_level = root.level
+    root.setLevel(logging.DEBUG)
+    try:
+        yield log_recorder
+    finally:
+        root.removeHandler(log_recorder.handler)
+        root.setLevel(previous_level)
 
 
 @pytest.fixture

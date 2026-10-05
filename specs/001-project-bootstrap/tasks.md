@@ -35,11 +35,16 @@ This document outlines the implementation tasks for the M0 Technical Prototype, 
 
 **Maps to GitHub Issue:** `#2 HTTP Ingress & Normalized Request/Response Types`
 
-- [ ] **T005: Normalization & Exceptions.** Implement `src/free_router/core/normalization.py` (strict `NormalizedRequest` and `NormalizedResponse` models that strip unsupported params like `temperature`). Implement `src/free_router/core/exceptions.py` (custom hierarchy) and add global exception handlers in `src/free_router/api/main.py` to format them into OpenAI-compatible JSON.
-- [ ] **T006: Database Schema & Engine.** Implement `src/free_router/db/schema.py` using SQLAlchemy Core (no ORM) for `models` and `request_logs` tables. Initialize Alembic. **Crucial:** Extract the database initialization and pragma enforcement into a standalone, testable function (e.g., `init_db_engine()`) that explicitly enforces WAL pragmas and raises an exception if WAL mode cannot be enabled.
-- [ ] **T007: ASGI Lifespan & Dependency Injection.** Extend the lifespan introduced in T003 in `src/free_router/api/main.py` to call the standalone `init_db_engine()`, initialize the `httpx.AsyncClient` singleton, and attach singletons to `app.state`. Implement hybrid dependency getters in `src/free_router/api/routes.py`.
-- [ ] **T008: Chat Completions Endpoint.** Implement `POST /v1/chat/completions` in `src/free_router/api/routes.py`. **Crucial:** The check to validate the requested model against the configuration must happen *inside this FastAPI route handler* before invoking the adapter. Apply ingress normalization, invoke a placeholder/mock adapter, and return the egress-normalized OpenAI response.
-- [ ] **T009: Ingress & Routing Tests.** Write tests verifying that unsupported parameters are stripped, empty message arrays are rejected (Scenarios 5 & 6), exception handlers return correct JSON structures, and the route correctly rejects unsupported models (Scenario 7).
+- [x] **T005: Normalization & Exceptions.** Implement `src/free_router/core/normalization.py` (strict `NormalizedRequest` and `NormalizedResponse` models that strip unsupported params like `temperature`). Implement `src/free_router/core/exceptions.py` (custom hierarchy) and add global exception handlers in `src/free_router/api/main.py` to format them into OpenAI-compatible JSON.
+- [x] **T006: Database Schema & Engine.** Implement `src/free_router/db/schema.py` using SQLAlchemy Core (no ORM) for `models` and `request_logs` tables. Initialize Alembic. **Crucial:** Extract the database initialization and pragma enforcement into a standalone, testable function (e.g., `init_db_engine()`) that explicitly enforces WAL pragmas and raises an exception if WAL mode cannot be enabled.
+- [x] **T007: ASGI Lifespan & Dependency Injection.** Extend the lifespan introduced in T003 in `src/free_router/api/main.py` to call the standalone `init_db_engine()`, initialize the `httpx.AsyncClient` singleton, and attach singletons to `app.state`. Implement hybrid dependency getters in `src/free_router/api/routes.py`.
+- [x] **T008: Chat Completions Endpoint.** Implement `POST /v1/chat/completions` in `src/free_router/api/routes.py`. **Crucial:** The check to validate the requested model against the configuration must happen *inside this FastAPI route handler* before invoking the adapter. Apply ingress normalization, invoke a placeholder/mock adapter, and return the egress-normalized OpenAI response.
+- [x] **T009: Ingress & Routing Tests.** Write tests verifying that unsupported parameters are stripped, empty message arrays are rejected (Scenarios 5 & 6), exception handlers return correct JSON structures, and the route correctly rejects unsupported models (Scenario 7).
+
+> **Note (T006 deviation):** Alembic is not initialised in this batch. The schema is created with
+> `metadata.create_all`; a versioned migration is deferred to the batch that first needs to evolve the
+> schema, since M0 has exactly one revision. `ROUTER_DB_PATH` was added as a configuration env var to
+> keep the database location out of the working directory during tests.
 
 **Verification & Stop:**
 
