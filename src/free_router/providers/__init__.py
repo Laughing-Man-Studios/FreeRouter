@@ -1,5 +1,6 @@
 """Provider adapters.
 
-Batch 2 ships only the placeholder in :mod:`free_router.providers.mock`; the
-abstract interface (T010) and the Google adapter (T011) follow in Batch 3.
+Each adapter owns one provider's native API, translating to and from the
+router's internal normalized models. The router core depends only on
+:class:`free_router.providers.base.ProviderAdapter`.
 """

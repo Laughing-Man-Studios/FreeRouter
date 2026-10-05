@@ -23,6 +23,7 @@ from free_router.core.exceptions import ValidationError
 
 __all__ = [
     "SUPPORTED_INGRESS_FIELDS",
+    "FinishReason",
     "NormalizedRequest",
     "NormalizedResponse",
     "normalize_chat_completion_request",
