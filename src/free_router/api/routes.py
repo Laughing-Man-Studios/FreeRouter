@@ -104,6 +104,13 @@ async def chat_completions(
     # can occur for a model the router does not serve (spec Behavioral Rules).
     provider, provider_id = resolve_model(config, normalized.model)
 
+    # Published on request.state so the logging middleware can attribute the
+    # request_completed record. The middleware binds its context around
+    # call_next and logs after the route returns, so a log_context made inside
+    # the handler is already unwound by then and would not reach that record.
+    request.state.model = normalized.model
+    request.state.provider = provider
+
     started = time.perf_counter()
     adapter = build_adapter(provider, http_client)
     with log_context(model=normalized.model, provider=provider):

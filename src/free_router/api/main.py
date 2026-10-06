@@ -129,6 +129,15 @@ async def request_context_middleware(
     """Bind a request id for the duration of the call and log the outcome.
 
     The request body is never read and never logged.
+
+    The completion record is emitted from inside the ``log_context`` opened
+    here, but ``model`` and ``provider`` are only known once a route has
+    resolved them, and a route's own binding is unwound when it returns. They
+    are therefore read back off ``request.state`` and rebound for the
+    completion record, so a single line carries the request id, the provider,
+    the model, the status, and the latency. An unset attribute yields ``None``,
+    which the formatter omits, so a request that failed before reaching a
+    provider still logs cleanly.
     """
     request_id = request.headers.get(REQUEST_ID_HEADER.lower()) or uuid.uuid4().hex
     request.app.state.request_id = request_id
@@ -138,22 +147,30 @@ async def request_context_middleware(
         try:
             response = await call_next(request)
         except Exception as exc:
-            logger.exception(
-                "request_failed",
-                extra={"event": "request_failed", "error_category": type(exc).__name__},
-            )
+            with log_context(
+                model=getattr(request.state, "model", None),
+                provider=getattr(request.state, "provider", None),
+            ):
+                logger.exception(
+                    "request_failed",
+                    extra={"event": "request_failed", "error_category": type(exc).__name__},
+                )
             raise
 
         latency_ms = round((time.perf_counter() - started) * 1000, 3)
         response.headers[REQUEST_ID_HEADER] = request_id
-        logger.info(
-            "request_completed",
-            extra={
-                "event": "request_completed",
-                "http_status": response.status_code,
-                "latency_ms": latency_ms,
-            },
-        )
+        with log_context(
+            model=getattr(request.state, "model", None),
+            provider=getattr(request.state, "provider", None),
+        ):
+            logger.info(
+                "request_completed",
+                extra={
+                    "event": "request_completed",
+                    "http_status": response.status_code,
+                    "latency_ms": latency_ms,
+                },
+            )
         return response
 
 
