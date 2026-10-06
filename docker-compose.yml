@@ -21,7 +21,18 @@ services:
 
     environment:
       # Required. The app refuses to start without it (spec 6, Scenario 2).
-      GEMINI_API_KEY: ${GEMINI_API_KEY:?GEMINI_API_KEY must be set in .env}
+      #
+      # Resolved from the shell environment first, falling back to .env. An
+      # exported shell variable therefore needs no .env entry at all:
+      #   export GEMINI_API_KEY=...   # or add it to ~/.zshrc
+      #   docker compose up -d
+      # This keeps the secret out of any file on disk, which is the whole point
+      # of the env-only rule in spec 6.
+      #
+      # The `:?` suffix fails interpolation when the value is absent, so a
+      # missing key is reported before a container starts rather than as a
+      # crash-loop afterwards.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?GEMINI_API_KEY must be exported or set in .env}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
     volumes:
