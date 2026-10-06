@@ -51,15 +51,11 @@ class DatabaseInitializationError(RuntimeError):
 
 
 async def init_db_engine(database_path: str | Path | None = None) -> AsyncEngine:
-    """Create the database, apply pragmas, and return a ready engine.
+    """Migrate the database, apply pragmas, and return a ready engine.
 
-    The schema is created with ``metadata.create_all`` rather than an Alembic
-    revision. That is sufficient while the project has a single revision, and
-    ``alembic`` is not a declared dependency. Note that ``create_all`` only
-    ever adds tables and columns: it never alters or drops them, so a container
-    starting against an older volume can silently disagree with the code.
-    Versioned migrations return as T017, when a second revision exists or the
-    Docker image ships against a persistent volume.
+    Alembic migrations run first, over a synchronous connection, so the schema
+    is correct before any traffic is served (spec 8). Only then is the async
+    engine opened. The two drivers share the same file.
 
     Args:
         database_path: Database file location. Defaults to
@@ -70,25 +66,25 @@ async def init_db_engine(database_path: str | Path | None = None) -> AsyncEngine
         ``AsyncEngine.dispose`` is a coroutine.
 
     Raises:
-        DatabaseInitializationError: If the file cannot be created, a pragma
-            fails, or WAL mode is not active afterwards.
+        DatabaseInitializationError: If the file cannot be created, migrations
+            fail, a pragma fails, or WAL mode is not active afterwards.
     """
-    from free_router.db.schema import metadata
-
     path = Path(database_path) if database_path is not None else DEFAULT_DATABASE_PATH
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise DatabaseInitializationError(
-            f"Unable to create database directory '{path.parent}': {exc}"
-        ) from exc
+    _ensure_parent_directory(path)
+
+    # Imported here rather than at module scope: free_router.migrations imports
+    # DEFAULT_DATABASE_PATH from this module, so a top-level import would be
+    # circular.
+    from free_router.migrations import run_migrations
+
+    # Migrations first: they create the tables the pragmas and engine expect.
+    run_migrations(path)
 
     engine = _create_engine(path)
     try:
         async with engine.connect() as connection:
             await _apply_pragmas(connection)
             await _enforce_wal(connection)
-            await connection.run_sync(metadata.create_all)
             await connection.commit()
     except DatabaseInitializationError:
         await engine.dispose()
@@ -97,6 +93,23 @@ async def init_db_engine(database_path: str | Path | None = None) -> AsyncEngine
         await engine.dispose()
         raise DatabaseInitializationError(f"Unable to initialise database '{path}': {exc}") from exc
     return engine
+
+
+def _ensure_parent_directory(path: Path) -> None:
+    """Create the directory holding the database file.
+
+    Done before migrations run, because Alembic opens the database directly
+    and will not create a missing parent directory itself.
+
+    Raises:
+        DatabaseInitializationError: If the directory cannot be created.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise DatabaseInitializationError(
+            f"Unable to create database directory '{path.parent}': {exc}"
+        ) from exc
 
 
 def _create_engine(path: Path) -> AsyncEngine:
