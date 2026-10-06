@@ -13,7 +13,9 @@ dependencies = [
     "pyyaml",
     "httpx",
     "aiosqlite",
-    "sqlalchemy",
+    # `[asyncio]` pulls greenlet, which SQLAlchemy's async layer requires.
+    # Declaring plain `sqlalchemy` makes create_async_engine fail at import.
+    "sqlalchemy[asyncio]",
     # `alembic` is deliberately absent until a second schema revision exists.
     # See specs/001-project-bootstrap/tasks.md (Batch 4, T017) and
     # docs/adr/0001-initial-technology-stack.md.
