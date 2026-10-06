@@ -42,9 +42,10 @@ This document outlines the implementation tasks for the M0 Technical Prototype, 
 - [x] **T009: Ingress & Routing Tests.** Write tests verifying that unsupported parameters are stripped, empty message arrays are rejected (Scenarios 5 & 6), exception handlers return correct JSON structures, and the route correctly rejects unsupported models (Scenario 7).
 
 > **Note (T006 deviation):** Alembic is not initialised in this batch. The schema is created with
-> `metadata.create_all`, which suffices for a single revision; a versioned migration is deferred to
-> **T017** (Batch 4), tracked there with its reintroduction trigger. `ROUTER_DB_PATH` was added as a
-> configuration env var to keep the database location out of the working directory during tests.
+> `metadata.create_all`, which suffices for a single revision. A versioned migration arrived as
+> **T017** in Batch 4, once the Docker workflow made the add-only limitation a real risk; see that
+> entry for how the adoption path works. `ROUTER_DB_PATH` was added as a configuration env var to
+> keep the database location out of the working directory during tests.
 
 **Verification & Stop:**
 
@@ -104,12 +105,41 @@ This document outlines the implementation tasks for the M0 Technical Prototype, 
 - [ ] **T013: End-to-End Integration Tests.** Write comprehensive tests for the full ingress-to-egress routing flow using FastAPI's `TestClient` and `respx` to mock the external Google API at the HTTP boundary. Cover a successful chat completion (Scenario 1) and verify the full error mapping pipeline.
 - [ ] **T014: Dockerfile.** Create a multi-stage `Dockerfile` using `uv` for dependency resolution. The runtime stage must strictly use `python:3.13-slim`, run as a non-root user, utilize `uvloop`, and include a Docker `HEALTHCHECK`.
 - [ ] **T015: Docker Compose.** Create a `docker-compose.yml` file for local development orchestration. It should handle mounting the SQLite data volume and passing the `.env` variables (like `GEMINI_API_KEY`) to the container.
-- [ ] **T016: Migrate `db/engine.py` to `aiosqlite`.** Replace the synchronous `pysqlite` engine with `sqlite+aiosqlite`, applying pragmas and verifying WAL through an async connection. **Why:** CONSTITUTION §3.1 and spec §8 both require the `aiosqlite` async driver for the MVP; the current synchronous engine is a known divergence, scheduled for correction *before* T014 so the container is not built against a non-compliant database layer. `check_same_thread=False` becomes unnecessary. **Trigger to move earlier:** any request-path write to `request_logs`, since a synchronous write inside an async handler blocks every other in-flight request. `_enforce_wal` is already driver-agnostic and is the part that must be preserved.
-- [ ] **T017: Reintroduce Alembic when a second revision exists.** Initialise Alembic with an initial migration and run migrations at container startup per spec §8 and ADR-0001. **Why deferred:** `alembic` is not a declared dependency while `metadata.create_all` suffices for a single revision. `create_all` only ever *adds* tables and columns — it never alters or drops them — so a container starting against an older volume can silently disagree with the code. **Trigger:** a second schema revision, or T014 shipping an image that persists a volume across upgrades.
+- [x] **T016: Migrate `db/engine.py` to `aiosqlite`.** Replace the synchronous `pysqlite` engine with `sqlite+aiosqlite`, applying pragmas and verifying WAL through an async connection. **Why:** CONSTITUTION §3.1 and spec §8 both require the `aiosqlite` async driver for the MVP; the current synchronous engine is a known divergence, scheduled for correction *before* T014 so the container is not built against a non-compliant database layer. `check_same_thread=False` becomes unnecessary. **Trigger to move earlier:** any request-path write to `request_logs`, since a synchronous write inside an async handler blocks every other in-flight request. `_enforce_wal` is already driver-agnostic and is the part that must be preserved.
+- [x] **T017: Reintroduce Alembic when a second revision exists.** Initialise Alembic with an initial migration and run migrations at container startup per spec §8 and ADR-0001. **Why deferred:** `alembic` is not a declared dependency while `metadata.create_all` suffices for a single revision. `create_all` only ever *adds* tables and columns — it never alters or drops them — so a container starting against an older volume can silently disagree with the code. **Trigger:** a second schema revision, or T014 shipping an image that persists a volume across upgrades.
 - [ ] **T018: CI Pipeline.** Create `.github/workflows/ci.yml` defining the GitHub Actions workflow, wiring in the `ruff` and `mypy` (strict) configuration established in T001. **Crucial:** The pipeline must run `ruff check`, `mypy`, the `pytest` suite, and a dry-run Docker build.
 - [ ] **T019: Live Gemini round trip.** Send one real `POST /v1/chat/completions` request through the containerised router to `google/gemini-3.5-flash-lite` using a valid `GEMINI_API_KEY`, and confirm a normalized OpenAI response. **Why:** every scenario is currently proven only against `respx`; a wrong request field name would pass all mock tests and fail here. This is M0's literal exit criterion. Also confirm the shipped `docker-compose.yml` workflow starts cleanly with `docker compose up`.
 
 **Suggested order:** T016 → T017 → T013 → T014 → T015 → T018 → T019. The database layer is corrected before the container is built, so the image is not built against a knowingly non-compliant database.
+
+> **Completed in T016 (Batch 4):** the engine is now `sqlite+aiosqlite`, closing the CONSTITUTION §3.1
+> and spec §8 divergence. `init_db_engine` is a coroutine returning an `AsyncEngine`; pragmas, WAL
+> enforcement, and schema work run through `conn.run_sync`. `_enforce_wal` kept its original logic
+> verbatim, including re-reading the live journal mode, because SQLite does not raise when WAL cannot
+> be enabled — that re-read is the only thing turning silent degradation into a startup failure.
+> `check_same_thread=False` was removed as it guarded nothing under an async driver. `journal_mode_of`
+> stays synchronous on raw `sqlite3` so it verifies the file independently of the engine.
+>
+> **One dependency surprise:** `sqlalchemy[asyncio]` is required, not plain `sqlalchemy`. The async
+> layer imports `greenlet`, so declaring `aiosqlite` alone is insufficient — `create_async_engine`
+> fails at import. Recorded in `pyproject.toml` so the extra is not "simplified" away.
+>
+> Verified beyond unit tests: Scenario 4 still aborts startup end to end through the async path; and
+> 200 sequential writes took 48 ms while a concurrent 1 ms ticker ran 90 times, so the loop is not
+> blocked. A blocking driver would have scored 0.
+
+> **Completed in T017 (Batch 4):** Alembic initialised with revision `0001_initial`. Migrations run
+> over a synchronous `pysqlite` connection before the async engine opens — the sync-to-async handoff
+> `plan.md` describes. There is no reason to carry an async migration toolchain for a startup-only
+> step that must finish before traffic is accepted, and both drivers open the same file. The URL is
+> passed programmatically so the migration target cannot drift from the engine's.
+>
+> A database with user tables but no `alembic_version` is **stamped at head rather than upgraded**.
+> That is the adoption path for a volume written before migrations existed: its schema can only be
+> the initial revision, and a plain upgrade fails trying to create tables that already exist. Without
+> this, upgrading an existing `docker compose` volume would break startup.
+>
+> `env.py` uses `render_as_batch` throughout, since SQLite cannot `ALTER` most things in place.
 
 **Verification & Stop:**
 

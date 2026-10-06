@@ -63,7 +63,7 @@ src/free_router/
 
 - `get_config(request: Request) -> Config`: Returns `request.app.state.config`
 - `get_http_client(request: Request) -> httpx.AsyncClient`: Returns `request.app.state.http_client`
-- `get_db_engine(request: Request) -> aiosqlite.Connection`: Returns `request.app.state.db_engine`
+- `get_db_engine(request: Request) -> AsyncEngine`: Returns `request.app.state.db_engine`
 
 ## Data / Persistence Changes
 
@@ -78,7 +78,13 @@ The embedded SQLite database will reside at a fixed path (e.g., `/data/router.db
 7. Instantiate the `httpx.AsyncClient` singleton with aggressive timeouts: `connect=0.25`, `pool=0.05`, `write=1.0`, `read=10.0`.
 8. Attach `config`, `db_engine`, and `http_client` to `app.state`.
 
-The initial M0 Alembic migration will create two foundational tables using SQLAlchemy Core:
+Alembic is configured programmatically (`free_router.migrations.alembic_config`) rather than through
+`alembic.ini`, so the migration target is the same path the engine opens and cannot drift between the
+two. A database carrying tables but no `alembic_version` is **stamped** at head rather than upgraded:
+that is the adoption path for a volume written before migrations existed, and without it an existing
+deployment would fail to start.
+
+The initial M0 Alembic migration (`0001_initial`) creates two foundational tables using SQLAlchemy Core:
 
 - `models`: Stores provider mapping configuration (e.g., matching `google/gemini-3.5-flash-lite` to the Google provider).
 - `request_logs`: Stores basic metadata for operational auditing (timestamp, model requested, provider used, latency, HTTP status code), **strictly omitting** prompt and completion text.
