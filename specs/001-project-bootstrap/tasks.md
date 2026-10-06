@@ -107,7 +107,7 @@ This document outlines the implementation tasks for the M0 Technical Prototype, 
 - [x] **T015: Docker Compose.** Create a `docker-compose.yml` file for local development orchestration. It should handle mounting the SQLite data volume and passing the `.env` variables (like `GEMINI_API_KEY`) to the container.
 - [x] **T016: Migrate `db/engine.py` to `aiosqlite`.** Replace the synchronous `pysqlite` engine with `sqlite+aiosqlite`, applying pragmas and verifying WAL through an async connection. **Why:** CONSTITUTION §3.1 and spec §8 both require the `aiosqlite` async driver for the MVP; the current synchronous engine is a known divergence, scheduled for correction *before* T014 so the container is not built against a non-compliant database layer. `check_same_thread=False` becomes unnecessary. **Trigger to move earlier:** any request-path write to `request_logs`, since a synchronous write inside an async handler blocks every other in-flight request. `_enforce_wal` is already driver-agnostic and is the part that must be preserved.
 - [x] **T017: Reintroduce Alembic when a second revision exists.** Initialise Alembic with an initial migration and run migrations at container startup per spec §8 and ADR-0001. **Why deferred:** `alembic` is not a declared dependency while `metadata.create_all` suffices for a single revision. `create_all` only ever *adds* tables and columns — it never alters or drops them — so a container starting against an older volume can silently disagree with the code. **Trigger:** a second schema revision, or T014 shipping an image that persists a volume across upgrades.
-- [ ] **T018: CI Pipeline.** Create `.github/workflows/ci.yml` defining the GitHub Actions workflow, wiring in the `ruff` and `mypy` (strict) configuration established in T001. **Crucial:** The pipeline must run `ruff check`, `mypy`, the `pytest` suite, and a dry-run Docker build.
+- [x] **T018: CI Pipeline.** Create `.github/workflows/ci.yml` defining the GitHub Actions workflow, wiring in the `ruff` and `mypy` (strict) configuration established in T001. **Crucial:** The pipeline must run `ruff check`, `mypy`, the `pytest` suite, and a dry-run Docker build.
 - [ ] **T019: Live Gemini round trip.** Send one real `POST /v1/chat/completions` request through the containerised router to `google/gemini-3.5-flash-lite` using a valid `GEMINI_API_KEY`, and confirm a normalized OpenAI response. **Why:** every scenario is currently proven only against `respx`; a wrong request field name would pass all mock tests and fail here. This is M0's literal exit criterion. Also confirm the shipped `docker-compose.yml` workflow starts cleanly with `docker compose up`.
 
 **Suggested order:** T016 → T017 → T013 → T014 → T015 → T018 → T019. The database layer is corrected before the container is built, so the image is not built against a knowingly non-compliant database.
@@ -184,6 +184,46 @@ This document outlines the implementation tasks for the M0 Technical Prototype, 
 > container reports `healthy`; migrations run on a fresh volume and are **skipped** on restart; the
 > database lands in the mounted volume with WAL active; `uvloop` is the configured loop. Runtime image
 > is 300MB, of which the venv is 74MB.
+
+> **Completed in T018 (Batch 4):** `.github/workflows/ci.yml` with six jobs. Each mirrors a local
+> command, so a green run means the same checks pass on a developer machine:
+>
+> - `lint` — `ruff check` and `ruff format --check`, kept as separate steps so a failure names which
+>   half disagreed
+> - `typecheck` — `mypy --strict src/`. Strict is already set in `pyproject.toml`; the flag is
+>   repeated so a future config change cannot silently relax CI
+> - `test` — `pytest`, with **no** `GEMINI_API_KEY` set. A follow-up step asserts the variable is
+>   absent, which is what proves the suite is fully mocked and cannot reach a provider
+> - `docker` — builds the image, then asserts the contract mechanically: a non-empty `User` that is
+>   not root, a `HEALTHCHECK` present, and Python 3.13 at runtime. It then runs the container and
+>   polls `/health` for up to 30 s rather than sleeping a fixed interval, so a slow runner does not
+>   produce a flaky failure
+> - `markdown` — `markdownlint-cli2`, using the existing `.markdownlint-cli2.yaml`
+> - `security` — `pip-audit`, installed standalone rather than added as a project dependency. It is
+>   **advisory, not a gate**: `pip-audit` exits 1 on any finding, so the result is captured and
+>   surfaced as a warning instead of failing the job
+>
+> `pr-review.yml` was **replaced**, not extended. Both prior actions are gone (`cirolini/genai-code-review@v3`,
+> `qodo-ai/pr-agent@main`); a single `Laughing-Man-Studios/FreeReview@v1` job replaces them, kept
+> separate from `ci.yml` because it is advisory while `ci.yml` is the actual gate.
+>
+> Three details there are load-bearing, taken from the action's own `action.yml` rather than guessed:
+>
+> - `github_token` is wired explicitly to `${{ github.token }}`. GitHub does not expose `GITHUB_TOKEN`
+>   to an action invoked with `uses:`, so without it the action can read the pull request but cannot
+>   post the review.
+> - `max_output_tokens: 4000`. Lowering it does not save money — the binding constraint is requests
+>   per day, and a `:free` endpoint prices at zero per token. At 1500 the bundled reasoning model
+>   returned no content on 4 of 4 attempts because it spends the budget reasoning before answering.
+> - `privacy_mode: strict` stays on, sending `provider.zdr=true` so source code is not retained by a
+>   provider.
+>
+> A bot-sender guard is carried over from the old `pr_agent_job`. An agent that opens a pull request
+> would otherwise trigger a review of its own work, which is circular and spends quota.
+>
+> **Behaviour change worth noting:** the new action never approves, blocks, or fails a build, so
+> merging is no longer gated on review completion. That is the point of adopting it, but it does mean
+> a cancelled or failing review no longer shows as a red check.
 
 > **Completed in T015 (Batch 4):** compose stack using a **named volume**, not a bind mount. The
 > container runs as uid 10001 and a bind mount inherits host directory ownership, so a non-root
