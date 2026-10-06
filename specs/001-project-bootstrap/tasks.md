@@ -102,7 +102,7 @@ This document outlines the implementation tasks for the M0 Technical Prototype, 
 
 **Carry-over from earlier batches, tracked here so all M0 work lives in one place:**
 
-- [ ] **T013: End-to-End Integration Tests.** Write comprehensive tests for the full ingress-to-egress routing flow using FastAPI's `TestClient` and `respx` to mock the external Google API at the HTTP boundary. Cover a successful chat completion (Scenario 1) and verify the full error mapping pipeline.
+- [x] **T013: End-to-End Integration Tests.** Write comprehensive tests for the full ingress-to-egress routing flow using FastAPI's `TestClient` and `respx` to mock the external Google API at the HTTP boundary. Cover a successful chat completion (Scenario 1) and verify the full error mapping pipeline.
 - [ ] **T014: Dockerfile.** Create a multi-stage `Dockerfile` using `uv` for dependency resolution. The runtime stage must strictly use `python:3.13-slim`, run as a non-root user, utilize `uvloop`, and include a Docker `HEALTHCHECK`.
 - [ ] **T015: Docker Compose.** Create a `docker-compose.yml` file for local development orchestration. It should handle mounting the SQLite data volume and passing the `.env` variables (like `GEMINI_API_KEY`) to the container.
 - [x] **T016: Migrate `db/engine.py` to `aiosqlite`.** Replace the synchronous `pysqlite` engine with `sqlite+aiosqlite`, applying pragmas and verifying WAL through an async connection. **Why:** CONSTITUTION §3.1 and spec §8 both require the `aiosqlite` async driver for the MVP; the current synchronous engine is a known divergence, scheduled for correction *before* T014 so the container is not built against a non-compliant database layer. `check_same_thread=False` becomes unnecessary. **Trigger to move earlier:** any request-path write to `request_logs`, since a synchronous write inside an async handler blocks every other in-flight request. `_enforce_wal` is already driver-agnostic and is the part that must be preserved.
@@ -140,6 +140,26 @@ This document outlines the implementation tasks for the M0 Technical Prototype, 
 > this, upgrading an existing `docker compose` volume would break startup.
 >
 > `env.py` uses `render_as_batch` throughout, since SQLite cannot `ALTER` most things in place.
+
+> **Completed in T013 (Batch 4):** 35 integration tests exercising the seams between layers — an
+> OpenAI body in, a Gemini request on the wire, a normalized response back, an OpenAI completion out.
+> They found **two real bugs**, both invisible to the layer-level suites:
+>
+> - **A provider 400 was returning 502.** `PROVIDER_ERROR_STATUS_MAP` had no entry for
+>   `ProviderValidationError`, and that class does not subclass `ValidationError`, so `_status_for`
+>   fell through to the generic `ProviderBaseError` branch. Spec §10 requires 400. The map is now
+>   ordered most-specific-first and says so, because its failure mode is silent: a missing entry
+>   inherits a neighbour's status rather than raising.
+> - **Transport errors escaped as 500.** The adapter caught `httpx.TimeoutException` but not
+>   `httpx.HTTPError` broadly, so a connection failure (refused, DNS, TLS, reset) bypassed status
+>   mapping and reached the generic handler as a 500 `unhandled_error` — misattributing a network
+>   problem to the router itself. `TimeoutException` is now matched ahead of `HTTPError`, since the
+>   former subclasses the latter and must map to 504.
+>
+> Two tests exist purely to prevent regressions of that class:
+> `test_no_exception_is_missing_from_the_status_map` asserts every concrete `RouterBaseError`
+> declares a status, and `test_database_is_ready_before_traffic_is_served` reads the schema through
+> plain `sqlite3` so it proves migrations are committed on disk. Test count: 108 → 143.
 
 **Verification & Stop:**
 
