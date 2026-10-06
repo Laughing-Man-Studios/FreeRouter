@@ -10,10 +10,18 @@ the lifespan stays a thin orchestrator. WAL enforcement failure raises
 :class:`DatabaseInitializationError` rather than degrading quietly -- the
 application must refuse to start in that case (spec Scenario 4).
 
-Note that SQLAlchemy's ``aiosqlite`` dialect is deliberately not used here. M0
-runs a fixed set of statements once at startup and never queries from the
-event loop, so a plain connection is sufficient and keeps the dependency
-surface minimal.
+This module currently builds a **synchronous** ``pysqlite`` engine, which is
+correct for M0: initialisation runs once in the lifespan before the server
+accepts traffic, and nothing queries from the event loop yet. A blocking call
+at startup is invisible to clients.
+
+That is a divergence from CONSTITUTION 3.1 and spec section 8, both of which
+require the ``aiosqlite`` async driver for the MVP so that concurrent agent
+workloads cannot block the event loop. The divergence is scheduled for
+correction in Batch 4 (T016), before the Dockerfile lands, so the container is
+not built against a knowingly non-compliant database layer. The trigger for
+moving earlier is any request-path write to ``request_logs``: a synchronous
+write inside an async handler blocks every other in-flight request.
 """
 
 from __future__ import annotations
@@ -50,8 +58,12 @@ def init_db_engine(database_path: str | Path | None = None) -> Engine:
     """Create the database, apply pragmas, and return a ready engine.
 
     The schema is created with ``metadata.create_all`` rather than an Alembic
-    revision for M0; the migration toolchain lands with the same batch that
-    needs versioned schema changes.
+    revision. That is sufficient while the project has a single revision, and
+    ``alembic`` is not a declared dependency. Note that ``create_all`` only
+    ever adds tables and columns: it never alters or drops them, so a container
+    starting against an older volume can silently disagree with the code.
+    Versioned migrations return in Batch 4 (T017), when a second revision exists
+    or the Docker image ships against a persistent volume.
 
     Args:
         database_path: Database file location. Defaults to
