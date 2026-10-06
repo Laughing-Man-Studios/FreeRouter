@@ -13,8 +13,14 @@ dependencies = [
     "pyyaml",
     "httpx",
     "aiosqlite",
-    "alembic",
     "sqlalchemy",
+    # `alembic` is deliberately absent until a second schema revision exists.
+    # See specs/001-project-bootstrap/tasks.md (Batch 4, T017) and
+    # docs/adr/0001-initial-technology-stack.md.
+    #
+    # `aiosqlite` is retained because CONSTITUTION 3.1 mandates an async driver
+    # for the MVP. It is declared but not yet imported; db/engine.py still uses
+    # a synchronous pysqlite engine. Converting it is tracked as Batch 4 (T016).
 ]
 
 [dependency-groups]
