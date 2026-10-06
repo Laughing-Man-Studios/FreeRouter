@@ -21,11 +21,25 @@ from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
 
 from free_router.db.engine import DEFAULT_DATABASE_PATH, DatabaseInitializationError
+from free_router.db.schema import metadata
 
 __all__ = ["MIGRATIONS_DIR", "alembic_config", "run_migrations"]
 
 MIGRATIONS_DIR = Path(__file__).parent
 """Directory holding ``env.py`` and the revision scripts."""
+
+INITIAL_SCHEMA_TABLES = frozenset(table.name for table in metadata.sorted_tables)
+"""Tables created by revision ``0001_initial``.
+
+Derived from the schema definition rather than hardcoded, so adding a table
+automatically widens the set the adoption path accepts.
+
+Caveat: this reflects the *current* schema, which is only correct while there is
+exactly one revision. When a second revision lands, the adoption path must be
+reconsidered — a database from the pre-Alembic era is only ever at the initial
+revision, and comparing its tables against a multi-revision schema would make the
+exact-match test unreachable.
+"""
 
 
 def alembic_config(database_path: str | Path | None = None) -> Config:
@@ -77,10 +91,25 @@ def run_migrations(database_path: str | Path | None = None) -> None:
 
 
 def _needs_adoption(database_path: str | Path | None) -> bool:
-    """True when the database has user tables but no Alembic version table.
+    """True when the database holds the router's pre-Alembic schema in full.
 
-    That combination means the file predates Alembic and must be stamped
-    rather than upgraded.
+    That means every table from :data:`INITIAL_SCHEMA_TABLES` is present and
+    there is no ``alembic_version``: the file predates Alembic and must be
+    stamped rather than upgraded.
+
+    **Every** router table must be present. An earlier version accepted any
+    database with a table and no ``alembic_version``, so pointing
+    ``ROUTER_DB_PATH`` at an unrelated SQLite file declared it migrated while
+    ``models`` and ``request_logs`` were never created. Nothing in M0 queries
+    them, so that would not have surfaced until the first feature that did.
+
+    *Extra* tables are tolerated. Migrations only ever touch tables they own, so
+    an unrelated table alongside the router's schema neither blocks stamping nor
+    affects the outcome; requiring an exact match would needlessly fail a
+    developer's database that also holds something else.
+
+    Anything short of the full router schema falls through to ``upgrade``, which
+    creates what is missing and fails loudly on a genuine conflict.
     """
     resolved = Path(database_path) if database_path is not None else DEFAULT_DATABASE_PATH
     if not resolved.exists():
@@ -99,8 +128,7 @@ def _needs_adoption(database_path: str | Path | None) -> bool:
 
     if "alembic_version" in names:
         return False
-    # alembic_version aside, only tables the router owns count.
-    return bool(names - {"sqlite_sequence"})
+    return INITIAL_SCHEMA_TABLES <= names
 
 
 def current_revision(database_path: str | Path | None = None) -> str | None:
