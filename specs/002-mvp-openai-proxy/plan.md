@@ -74,9 +74,10 @@ src/free_router/
 @dataclass(frozen=True)
 class KeyRef:
     """A single credential slot. Carries an alias, never key material."""
-    alias: str          # safe to log
+
+    alias: str  # safe to log
     provider: str
-    secret: SecretStr   # never logged, never serialised
+    secret: SecretStr  # never logged, never serialised
 ```
 
 The alias is the **only** identifier that may reach a log line or the database.
