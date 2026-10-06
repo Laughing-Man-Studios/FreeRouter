@@ -329,6 +329,34 @@ def test_provider_400_maps_to_client_400(client: TestClient) -> None:
 
 
 @respx.mock
+def test_provider_invalid_key_maps_to_client_401(client: TestClient) -> None:
+    """A bad API key surfaces as 401 even though Google reports 400.
+
+    Verified live: Gemini answers an invalid key with 400 INVALID_ARGUMENT.
+    Without classification the client would see 400 and debug its payload
+    rather than its credentials.
+    """
+    mock_google(
+        status=400,
+        json_body={
+            "error": {
+                "code": 400,
+                "message": "API key not valid. Please pass a valid API key.",
+                "status": "INVALID_ARGUMENT",
+            }
+        },
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": MODEL, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "provider_auth_error"
+
+
+@respx.mock
 def test_provider_500_maps_to_client_502(client: TestClient) -> None:
     """Scenario 9: a 5xx becomes 502 Bad Gateway, never a 5xx passthrough."""
     mock_google(status=500, text="upstream exploded")
