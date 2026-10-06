@@ -1,0 +1,9 @@
+config:
+  default: true
+  MD013: false # Disable line-length rule
+  MD033: false # Allow inline HTML
+globs:
+  - "**/*.md"
+ignores:
+  - "node_modules/**"
+  - ".venv/**"

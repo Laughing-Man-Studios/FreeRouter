@@ -1,0 +1,26 @@
+# Virtual environments
+.venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets: only .env.example is tracked
+.env
+
+# Local SQLite state
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Scratch database used when authoring revisions via the Alembic CLI
+router-scratch.db*
+
+# Docker build output (the Dockerfile itself is tracked)
+.docker/

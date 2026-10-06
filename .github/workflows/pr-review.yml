@@ -1,23 +1,53 @@
-name: PR Review (GenAI Code Review)
+name: PR Review
+
+# Advisory AI code review. The review is published as a pull request comment;
+# it never approves, blocks, or fails a build. Merging is not gated on it.
+#
+# Distinct from ci.yml, which is the actual gate.
 
 on:
   pull_request:
-    types: [opened, synchronize, ready_for_review]
+    types: [opened, reopened, synchronize]
 
 permissions:
   contents: read
+  # Required to post the review. Without it the action reads the PR but cannot
+  # publish findings.
   pull-requests: write
 
 jobs:
   review:
-    if: github.event.pull_request.draft == false
+    # Skipped for bot-authored PRs. An agent that opens a PR would otherwise
+    # trigger a review of its own work, which is circular and wastes quota.
+    if: github.event.pull_request.draft == false && github.event.sender.type != 'Bot'
     runs-on: ubuntu-latest
+    name: Free Review Action
     steps:
-      - uses: cirolini/genai-code-review@v3
+      - uses: Laughing-Man-Studios/FreeReview@v1
         with:
-          provider: openai-compatible
-          base_url: https://openrouter.ai/api/v1
-          model: openrouter/free
-          api_key: ${{ secrets.OPENROUTER_API_KEY }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          github_pr_id: ${{ github.event.number }}
+          openrouter_api_key: ${{ secrets.OPENROUTER_API_KEY }}
+
+          # GitHub does not expose GITHUB_TOKEN to an action invoked with
+          # `uses:`, so it must be wired explicitly or the action can read the
+          # pull request but cannot post the review.
+          github_token: ${{ github.token }}
+
+          # Strict sends provider.zdr=true and provider.data_collection=deny,
+          # so no source code reaches a provider that retains it. Keep this on
+          # for a repository whose diffs are proprietary.
+          privacy_mode: strict
+
+          # 4000 is the measured floor for the bundled reasoning model. At 1500
+          # it returned no content on four of four attempts, because it spends
+          # the budget reasoning before answering. Do not lower it expecting a
+          # cheaper run: the binding constraint is requests per day, not
+          # tokens, and a ':free' endpoint prices at zero per token.
+          max_output_tokens: 4000
+
+          # Suggestions are off by default. Turn them on once the findings have
+          # proven useful; accepting unverified patches is not automatic.
+          include_suggestions: false
+
+          # Skips very large PRs rather than burning the daily allowance on a
+          # refactor.
+          max_changed_lines: 2000
