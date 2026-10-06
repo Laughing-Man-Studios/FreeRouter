@@ -112,6 +112,10 @@ jobs:
           context: .
           push: false
           load: true
+          # Tags must be explicit. build-push-action otherwise names the loaded
+          # image free-router:<ref-sha> from the checkout ref, which no later
+          # step knows to look for.
+          tags: free-router:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -120,7 +124,7 @@ jobs:
           set -euo pipefail
 
           # A non-root image is a hard requirement (CONSTITUTION 3.2, spec 7).
-          user="$(docker inspect free-router --format '{{.Config.User}}')"
+          user="$(docker inspect free-router:ci --format '{{.Config.User}}')"
           if [ -z "$user" ]; then
             echo "::error::no USER set; the image would run as root"
             exit 1
@@ -133,14 +137,14 @@ jobs:
           fi
 
           # spec 7 requires python:3.13-slim and a healthcheck.
-          health="$(docker inspect free-router --format '{{json .Config.Healthcheck}}')"
+          health="$(docker inspect free-router:ci --format '{{json .Config.Healthcheck}}')"
           if [ "$health" = "null" ]; then
             echo "::error::no HEALTHCHECK defined"
             exit 1
           fi
           echo "Healthcheck present."
 
-          if ! docker run --rm free-router python -c "import sys; assert sys.version_info[:2] == (3, 13), sys.version"; then
+          if ! docker run --rm free-router:ci python -c "import sys; assert sys.version_info[:2] == (3, 13), sys.version"; then
             echo "::error::runtime is not Python 3.13"
             exit 1
           fi
@@ -154,7 +158,7 @@ jobs:
           # provider access.
           docker run -d --name router -p 8000:8000 \
             -e GEMINI_API_KEY=ci-placeholder-key \
-            free-router
+            free-router:ci
 
           # Poll rather than sleep a fixed amount, so a slow runner does not
           # produce a flaky failure.
