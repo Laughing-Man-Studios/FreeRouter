@@ -22,10 +22,11 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from sqlalchemy.ext.asyncio import AsyncEngine
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from free_router.api.routes import router
-from free_router.core.config import ConfigError, load_config
+from free_router.core.config import Config, ConfigError, load_config
 from free_router.core.exceptions import (
     ProviderAuthError,
     ProviderBaseError,
@@ -63,14 +64,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     configure_logging(os.environ.get("LOG_LEVEL", "INFO"))
 
-    config = _startup_step("config_invalid", lambda: load_config())
-    app.state.config = config
-
-    database_path = os.environ.get("ROUTER_DB_PATH")
-    app.state.db_engine = _startup_step(
-        "database_init_failed",
-        lambda: init_db_engine(database_path),
-    )
+    app.state.config = await _startup_step("config_invalid", _load_config)
+    app.state.db_engine = await _startup_step("database_init_failed", _init_database)
 
     app.state.http_client = httpx.AsyncClient(timeout=HTTP_CLIENT_TIMEOUT)
     logger.info("startup_completed", extra={"event": "startup_completed"})
@@ -81,16 +76,30 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         client: httpx.AsyncClient | None = getattr(app.state, "http_client", None)
         if client is not None:
             await client.aclose()
-        engine = getattr(app.state, "db_engine", None)
+        engine: AsyncEngine | None = getattr(app.state, "db_engine", None)
         if engine is not None:
-            engine.dispose()
+            # AsyncEngine.dispose is a coroutine; a bare call would leak the pool.
+            await engine.dispose()
         logger.info("shutdown_completed", extra={"event": "shutdown_completed"})
 
 
-def _startup_step(error_category: str, step: Callable[[], Any]) -> Any:
-    """Run a startup step, logging a fatal error and re-raising on failure."""
+async def _load_config() -> Config:
+    """Load configuration. Exists to give every startup step one signature."""
+    return load_config()
+
+
+async def _init_database() -> AsyncEngine:
+    """Initialise the database engine against ``ROUTER_DB_PATH``."""
+    return await init_db_engine(os.environ.get("ROUTER_DB_PATH"))
+
+
+async def _startup_step(error_category: str, step: Callable[[], Awaitable[Any]]) -> Any:
+    """Await a startup step, logging a fatal error and re-raising on failure.
+
+    Steps are coroutines so database initialisation does not block the loop.
+    """
     try:
-        return step()
+        return await step()
     except (ConfigError, DatabaseInitializationError) as exc:
         logger.critical(
             "startup_failed",
