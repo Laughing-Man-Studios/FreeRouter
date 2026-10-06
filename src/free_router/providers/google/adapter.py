@@ -113,7 +113,12 @@ class GoogleAdapter:
     async def _send(
         self, url: str, headers: dict[str, str], payload: dict[str, Any]
     ) -> httpx.Response:
-        """Dispatch under the strict header-receipt timeout."""
+        """Dispatch under the strict header-receipt timeout.
+
+        Raises:
+            ProviderTimeoutError: If connection or headers exceed the budget.
+            ProviderServerError: If the provider cannot be reached at all.
+        """
         try:
             build = self._http_client.build_request("POST", url, json=payload, headers=headers)
             async with asyncio.timeout(PROVIDER_TIMEOUT_SECONDS):
@@ -121,7 +126,9 @@ class GoogleAdapter:
                 # timeout bounds connection + headers only. The body is read
                 # afterwards, outside this window.
                 response = await self._http_client.send(build, stream=True)
-        except TimeoutError as exc:
+        except httpx.TimeoutException as exc:
+            # Checked before the broader httpx.HTTPError below, since a timeout
+            # is a subclass of it and must map to 504, not 502.
             logger.warning(
                 "provider_timeout",
                 extra={"event": "provider_timeout", "error_category": "provider_timeout"},
@@ -129,7 +136,24 @@ class GoogleAdapter:
             raise ProviderTimeoutError(
                 f"The upstream provider did not respond within {PROVIDER_TIMEOUT_SECONDS}s."
             ) from exc
-        except httpx.TimeoutException as exc:
+        except httpx.HTTPError as exc:
+            # Transport failures (connection refused, DNS, TLS, reset) are
+            # raised as exceptions rather than returned as responses, so they
+            # bypass status mapping entirely. Uncaught they reach the generic
+            # handler and are reported as a router fault, which misattributes a
+            # network problem to the router itself.
+            logger.warning(
+                "provider_transport_error",
+                extra={
+                    "event": "provider_transport_error",
+                    "error_category": "provider_transport_error",
+                },
+            )
+            raise ProviderServerError("The upstream provider could not be reached.") from exc
+        except TimeoutError as exc:
+            # asyncio.timeout raises the builtin TimeoutError, which is what
+            # the strict header budget trips. It is not an httpx exception, so
+            # it needs its own clause.
             logger.warning(
                 "provider_timeout",
                 extra={"event": "provider_timeout", "error_category": "provider_timeout"},

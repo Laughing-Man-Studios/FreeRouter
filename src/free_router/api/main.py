@@ -32,7 +32,9 @@ from free_router.core.exceptions import (
     ProviderBaseError,
     ProviderServerError,
     ProviderTimeoutError,
+    ProviderValidationError,
     RouterBaseError,
+    UnsupportedModelError,
     ValidationError,
 )
 from free_router.core.logging import configure_logging, log_context
@@ -46,12 +48,23 @@ HTTP_CLIENT_TIMEOUT = httpx.Timeout(connect=0.25, pool=0.05, write=1.0, read=10.
 """Aggressive client timeouts so a hung provider cannot stall the event loop."""
 
 PROVIDER_ERROR_STATUS_MAP: dict[type[RouterBaseError], int] = {
-    ProviderAuthError: 401,
-    ValidationError: 400,
-    ProviderServerError: 502,
+    # Order is significant: _status_for returns the first isinstance match, so
+    # specific types precede the generic ones they would otherwise be swallowed
+    # by. ProviderValidationError must precede ProviderBaseError's 502 fallback,
+    # and ProviderAuthError must precede ProviderValidationError's 400.
     ProviderTimeoutError: 504,
+    ProviderAuthError: 401,
+    ProviderValidationError: 400,
+    ProviderServerError: 502,
+    ValidationError: 400,
+    UnsupportedModelError: 400,
 }
-"""Exception-to-status mapping required by spec 10."""
+"""Exception-to-status mapping required by spec 10.
+
+Every concrete subclass of :class:`RouterBaseError` belongs here. An exception
+missing from this map silently inherits a neighbour's status, which is how a
+provider 400 once returned 502.
+"""
 
 
 @asynccontextmanager
@@ -186,8 +199,11 @@ def register_exception_handlers(app: FastAPI) -> None:
 def _status_for(exc: RouterBaseError) -> int:
     """Resolve the HTTP status for a router exception.
 
-    Unknown exception types fall back to 500 rather than being treated as a
-    client error.
+    Order matters: the map is walked most-specific-first, so a
+    ProviderValidationError (a ProviderBaseError, which would otherwise fall
+    through to 502) is matched before the generic provider fallback. Every
+    concrete exception in :mod:`free_router.core.exceptions` must appear here
+    or it will be reported with the wrong status.
     """
     for error_type, status in PROVIDER_ERROR_STATUS_MAP.items():
         if isinstance(exc, error_type):
