@@ -543,7 +543,7 @@ A future Admin UI should make routing decisions and key health understandable wi
 - Unit tests included in MVP.
 - Manual integration testing initially.
 - Routing overhead target: **<500 ms** for the simple MVP decision path.
-- MVP success criterion: approximately **50% successful requests** under realistic free-tier/provider availability during early testing. This is a deliberately modest proof-of-concept target rather than a long-term service-level objective.
+- MVP success criterion: **≥80% successful requests** under realistic free-tier/provider availability during early testing. *(Raised from an initial ~50% figure at `m0.0.0`. M0 measured ~50–60% with a single key and no retry, against provider header latency spanning 482 ms–5364 ms — a baseline that already met the old figure. With key pooling, quota awareness, and failover in M1, the target rises. This remains a milestone target, not a long-term service-level objective; the achieved rate is measured at the M1 close-out and informs M2's priorities.)*
 
 ### Long-term qualities
 
@@ -686,6 +686,8 @@ Normalized response
 ### Milestone 1: Exit criteria
 
 The service can reliably pass requests between OpenHands/another OpenAI-compatible client and Google/Mistral while selecting among configured keys and avoiding obviously unavailable keys.
+
+*Added at M1 planning (`specs/002-mvp-openai-proxy`): the achieved success rate must also be **measured and recorded** against the ≥80% MVP criterion, with the measurement conditions stated. A measured rate materially below target is treated as information informing M2's priorities, not as milestone failure — but it must never be left unmeasured.*
 
 ---
 
