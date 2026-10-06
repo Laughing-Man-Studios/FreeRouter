@@ -14,7 +14,9 @@ dependencies = [
     "httpx",
     "aiosqlite",
     "alembic",
-    "sqlalchemy",
+    # `[asyncio]` pulls greenlet, which SQLAlchemy's async layer requires.
+    # Declaring plain `sqlalchemy` makes create_async_engine fail at import.
+    "sqlalchemy[asyncio]",
 ]
 
 [dependency-groups]

@@ -1,0 +1,65 @@
+# Local development orchestration for the Free LLM Router.
+#
+# Secrets are never defined here. `.env` is read by compose for variable
+# substitution and is gitignored; `.env.example` is the committed template.
+# config.yaml carries only the model mapping, never a key (spec 6).
+
+services:
+  router:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: free-router:dev
+    container_name: free-router
+    restart: unless-stopped
+
+    ports:
+      # Bound to loopback only. The MVP is single-user and has no
+      # authentication layer (CONSTITUTION 3.4), so exposing this on all
+      # interfaces would publish an unauthenticated proxy to the network.
+      - "127.0.0.1:8000:8000"
+
+    environment:
+      # Required. The app refuses to start without it (spec 6, Scenario 2).
+      #
+      # Resolved from the shell environment first, falling back to .env. An
+      # exported shell variable therefore needs no .env entry at all:
+      #   export GEMINI_API_KEY=...   # or add it to ~/.zshrc
+      #   docker compose up -d
+      # This keeps the secret out of any file on disk, which is the whole point
+      # of the env-only rule in spec 6.
+      #
+      # The `:?` suffix fails interpolation when the value is absent, so a
+      # missing key is reported before a container starts rather than as a
+      # crash-loop afterwards.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?GEMINI_API_KEY must be exported or set in .env}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+    volumes:
+      # A named volume rather than a host bind mount. The container runs as
+      # uid 10001, and a bind mount inherits host directory ownership, so a
+      # non-root container cannot write to it unless the host directory happens
+      # to match. A named volume is created by the image with correct ownership.
+      - router-data:/data
+
+    healthcheck:
+      # Duplicated from the Dockerfile so `docker compose ps` reflects health
+      # without inspecting the image. Keep the two in sync.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys,urllib.request;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  router-data:

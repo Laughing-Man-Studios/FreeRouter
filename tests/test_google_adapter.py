@@ -241,6 +241,93 @@ async def test_auth_error_raises_provider_auth_error(
 
 
 @respx.mock
+async def test_invalid_api_key_400_maps_to_auth_error(
+    http_client: httpx.AsyncClient,
+) -> None:
+    """Google reports a bad API key as 400, not 401. Verified live.
+
+    Mapping every 400 to a payload error would report an auth failure as a bad
+    request, sending an operator to debug their payload instead of their
+    credentials. This is the real body Google returns for an invalid key.
+    """
+    respx.post(GENERATE_URL).mock(
+        return_value=httpx.Response(
+            400,
+            json={
+                "error": {
+                    "code": 400,
+                    "message": "API key not valid. Please pass a valid API key.",
+                    "status": "INVALID_ARGUMENT",
+                }
+            },
+        )
+    )
+
+    with pytest.raises(ProviderAuthError):
+        await GoogleAdapter(http_client=http_client).chat_completion(
+            _request(), "gemini-3.5-flash-lite"
+        )
+
+
+@respx.mock
+async def test_permission_denied_400_maps_to_auth_error(
+    http_client: httpx.AsyncClient,
+) -> None:
+    """The PERMISSION_DENIED status flag is also an auth failure."""
+    respx.post(GENERATE_URL).mock(
+        return_value=httpx.Response(
+            400,
+            json={"error": {"status": "PERMISSION_DENIED", "message": "nope"}},
+        )
+    )
+
+    with pytest.raises(ProviderAuthError):
+        await GoogleAdapter(http_client=http_client).chat_completion(
+            _request(), "gemini-3.5-flash-lite"
+        )
+
+
+@respx.mock
+async def test_genuine_bad_payload_400_is_not_an_auth_error(
+    http_client: httpx.AsyncClient,
+) -> None:
+    """A real payload rejection must stay a validation error.
+
+    Guards the classifier from over-reaching: only credential signals promote a
+    400 to an auth error.
+    """
+    respx.post(GENERATE_URL).mock(
+        return_value=httpx.Response(
+            400,
+            json={
+                "error": {
+                    "status": "INVALID_ARGUMENT",
+                    "message": "* contents.parts.text: field required",
+                }
+            },
+        )
+    )
+
+    with pytest.raises(ProviderValidationError):
+        await GoogleAdapter(http_client=http_client).chat_completion(
+            _request(), "gemini-3.5-flash-lite"
+        )
+
+
+@respx.mock
+async def test_unparseable_400_body_is_a_validation_error(
+    http_client: httpx.AsyncClient,
+) -> None:
+    """An unreadable body falls back to the default mapping, not auth."""
+    respx.post(GENERATE_URL).mock(return_value=httpx.Response(400, text="not json"))
+
+    with pytest.raises(ProviderValidationError):
+        await GoogleAdapter(http_client=http_client).chat_completion(
+            _request(), "gemini-3.5-flash-lite"
+        )
+
+
+@respx.mock
 async def test_server_error_raises_provider_server_error(
     http_client: httpx.AsyncClient,
 ) -> None:

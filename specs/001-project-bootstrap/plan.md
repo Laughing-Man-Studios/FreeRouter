@@ -34,7 +34,7 @@ src/free_router/
  ├── providers/
  │   ├── base.py                # Abstract adapter interface protocol
  │   └── google/
- │       └── adapter.py         # Gemini-specific translation, raises custom exceptions, enforces asyncio.timeout(0.4)
+ │       └── adapter.py         # Gemini-specific translation, raises custom exceptions, enforces the provider timeout
  └── migrations/                 # Alembic configuration and initial M0 migration script
 ```
 
@@ -57,13 +57,13 @@ src/free_router/
 ### Provider Adapter
 
 - `ProviderAdapter` Protocol: Defines `async def chat_completion(request: NormalizedRequest, client: httpx.AsyncClient) -> NormalizedResponse`.
-- `GoogleAdapter`: Implements the protocol. Translates `NormalizedRequest` to Gemini API format. **Crucially**, the initial provider connection and response header phase must be wrapped in a strict `asyncio.timeout(0.4)` window. Catches `httpx` errors and raises the appropriate custom exception (e.g., `ProviderAuthError`, `ProviderTimeoutError`).
+- `GoogleAdapter`: Implements the protocol. Translates `NormalizedRequest` to Gemini API format. **Crucially**, the initial provider connection and response header phase must be wrapped in a strict `asyncio.timeout` window (5 s by default, see spec §8 for why the original 0.4 s was re-scoped). Catches `httpx` errors and raises the appropriate custom exception (e.g., `ProviderAuthError`, `ProviderTimeoutError`).
 
 ### Dependency Injection (Hybrid)
 
 - `get_config(request: Request) -> Config`: Returns `request.app.state.config`
 - `get_http_client(request: Request) -> httpx.AsyncClient`: Returns `request.app.state.http_client`
-- `get_db_engine(request: Request) -> aiosqlite.Connection`: Returns `request.app.state.db_engine`
+- `get_db_engine(request: Request) -> AsyncEngine`: Returns `request.app.state.db_engine`
 
 ## Data / Persistence Changes
 
@@ -78,7 +78,13 @@ The embedded SQLite database will reside at a fixed path (e.g., `/data/router.db
 7. Instantiate the `httpx.AsyncClient` singleton with aggressive timeouts: `connect=0.25`, `pool=0.05`, `write=1.0`, `read=10.0`.
 8. Attach `config`, `db_engine`, and `http_client` to `app.state`.
 
-The initial M0 Alembic migration will create two foundational tables using SQLAlchemy Core:
+Alembic is configured programmatically (`free_router.migrations.alembic_config`) rather than through
+`alembic.ini`, so the migration target is the same path the engine opens and cannot drift between the
+two. A database carrying tables but no `alembic_version` is **stamped** at head rather than upgraded:
+that is the adoption path for a volume written before migrations existed, and without it an existing
+deployment would fail to start.
+
+The initial M0 Alembic migration (`0001_initial`) creates two foundational tables using SQLAlchemy Core:
 
 - `models`: Stores provider mapping configuration (e.g., matching `google/gemini-3.5-flash-lite` to the Google provider).
 - `request_logs`: Stores basic metadata for operational auditing (timestamp, model requested, provider used, latency, HTTP status code), **strictly omitting** prompt and completion text.
@@ -120,7 +126,7 @@ FastAPI global exception handlers will be overridden to bypass default HTML/text
   - Success (200) → Verify correct `NormalizedResponse` and OpenAI JSON egress.
   - Unauthorized (401) → Verify adapter raises `ProviderAuthError` and router returns 401.
   - Server Error (500) → Verify adapter raises `ProviderServerError` and router returns 502.
-  - Timeout → Verify the `asyncio.timeout(0.4)` triggers, adapter raises `ProviderTimeoutError`, and router returns 504.
+  - Timeout → Verify the configured `asyncio.timeout` triggers, adapter raises `ProviderTimeoutError`, and router returns 504.
 - **Database**: Verify that the synchronous migration succeeds and that the async engine enforces WAL mode (test will assert failure if WAL pragma is artificially blocked).
 
 ## Risks / Tradeoffs
@@ -135,5 +141,5 @@ FastAPI global exception handlers will be overridden to bypass default HTML/text
 2. **Sync-to-Async DB Handoff**: Using a standard `sqlite3` connection strictly for the Alembic migration phase avoids async Alembic complexity, while handing off to `aiosqlite` ensures optimal async performance during the app's runtime.
 3. **Contextvars for Logging**: Utilizing `contextvars` allows request-scoped metadata injection into standard library `logging` records without polluting function signatures with custom logger objects.
 4. **Custom Exception Hierarchy**: Decouples provider-specific `httpx` error handling from FastAPI response formatting, ensuring a single source of truth for OpenAI-compatible error mapping.
-5. **Strict Timeout Envelope**: Enforcing `asyncio.timeout(0.4)` *inside* the Google Adapter's dispatch method guarantees the <500ms routing overhead target is respected at the network boundary, independent of the `httpx` read/write timeouts.
+5. **Strict Timeout Envelope**: A configurable `asyncio.timeout` *inside* the Google Adapter bounds provider I/O independently of the `httpx` read/write timeouts. The budget was originally 0.4 s, derived from the routing-overhead target; live measurement showed provider headers alone exceed it, so it is now 5 s by default. The <500 ms routing target is unaffected — the routing path measures 0.003 ms.
 6. **M0 Scope Includes Docker/CI**: Bundling the multi-stage `uv` Dockerfile and CI pipeline into this milestone ensures the prototype is immediately verifiable in a reproducible, production-like environment from day one.

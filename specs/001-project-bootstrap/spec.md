@@ -61,7 +61,11 @@ The final response layer must map the internal `NormalizedResponse` back to a st
 ### 8. Outbound Networking & Lifespan Management
 
 - The ASGI startup/shutdown lifecycle must explicitly manage the creation and closure of a single `httpx.AsyncClient` singleton.
-- The initial provider connection and response header phase must be wrapped in a strict `asyncio.timeout(0.4)` window to guarantee the <500 ms routing envelope.
+- The initial provider connection and response header phase must be wrapped in a strict `asyncio.timeout` window. The budget is **5 seconds by default**, overridable via the `ROUTER_PROVIDER_TIMEOUT` environment variable.
+- **Rationale (amended after live verification).** This requirement originally specified a 0.4-second window, on the theory that it protected the <500 ms routing envelope. Live measurement against `gemini-3.5-flash-lite` disproved that: fifteen calls measured p50 743 ms, p90 2332 ms, and 2893 ms maximum, so a 400 ms window failed real traffic roughly seven times in eight.
+- The original figure conflated two different things. CONSTITUTION §2.5 and ROADMAP §4 set the <500 ms target for **routing decisions**, not provider network I/O. The router's own decision path measures 0.003 ms mean and 0.015 ms worst case over 2000 iterations, leaving roughly 190,000× headroom against that target, while every millisecond of the old window was being spent on provider I/O the router does not control.
+- The window therefore bounds connection and response headers only, never generation. M1 will give each failover attempt its own budget (ROADMAP §3.10).
+- The <500 ms routing-overhead target is retained and **documented rather than enforced**. An assertion at that scale would never fire and would be dead code; reintroduce it when routing logic becomes non-trivial.
 - The ASGI lifespan must initialize an embedded SQLite database using the `aiosqlite` async driver and enforce Write-Ahead Logging (WAL) via pragmas. The application must refuse to start if WAL mode cannot be enabled.
 - Alembic migrations must run automatically at container startup before the app begins accepting traffic.
 
@@ -156,9 +160,15 @@ The router must map provider-side errors to strict OpenAI-compatible HTTP conven
 ### Scenario 10: Provider Timeout Exceeded
 
 - **Given** the router dispatches a request to the Google API
-- **And** the provider fails to respond within the strict 400ms `asyncio.timeout` window
+- **And** the provider fails to respond within the configured `asyncio.timeout` window (5 s by default)
 - **When** the adapter catches the timeout exception
 - **Then** the router must return an HTTP 504 Gateway Timeout or 502 Bad Gateway to the client.
+
+> **Amended after live verification.** This scenario originally specified a 400 ms window. That value
+> was derived from the routing-overhead target and applied to provider I/O; live measurement showed
+> provider headers alone routinely exceed it. The scenario now refers to the configured window. The
+> behaviour is unchanged — a provider that exceeds its budget still yields 504 — but the budget is
+> one the provider can actually meet.
 
 ## Edge Cases
 
