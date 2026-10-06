@@ -61,13 +61,15 @@ This document outlines the implementation tasks for the M0 Technical Prototype, 
 **Maps to GitHub Issue:** `#3 Google Adapter Implementation`
 
 - [x] **T010: Adapter Protocol.** Implement `src/free_router/providers/base.py` defining the abstract `ProviderAdapter` interface protocol. It must take a `NormalizedRequest` and `httpx.AsyncClient`, and return a `NormalizedResponse`.
-- [x] **T011: Google Adapter.** Implement `src/free_router/providers/google/adapter.py`. Map the internal request to the Gemini API format. **Crucial:** Wrap the initial provider connection and dispatch in a strict `asyncio.timeout(0.4)` block. Catch `httpx` errors and raise the corresponding custom router exceptions (`ProviderAuthError`, `ProviderServerError`, etc.).
+- [x] **T011: Google Adapter.** Implement `src/free_router/providers/google/adapter.py`. Map the internal request to the Gemini API format. **Crucial:** Wrap the initial provider connection and dispatch in a strict `asyncio.timeout` block. Catch `httpx` errors and raise the corresponding custom router exceptions (`ProviderAuthError`, `ProviderServerError`, etc.).
 - [x] **T012: Adapter Tests.** Write `respx` unit tests for the Google adapter simulating deterministic responses: Success (200), Auth Error (401), Server Error (500), and Timeout (Scenarios 8, 9, & 10).
 
 > **Notes on T010–T012:**
 >
-> - **The 0.4 s window covers headers only, by decision.** The spec scopes it to "the initial
+> - **The window covers headers only, by decision.** The spec scopes it to "the initial
 >   provider connection and response header phase", which is confirmed as the intended reading.
+>   (The *value* of that window was 0.4 s when this batch ran and was later re-scoped to 5 s in T019;
+>   see the Batch 4 T019 note.)
 >   Dispatch therefore uses `client.send(request, stream=True)` and reads the body with `aread()`
 >   *after* the window closes. Using the convenience `client.post()` reads the body inside the window
 >   and would 504 every real multi-second completion.
@@ -85,7 +87,7 @@ This document outlines the implementation tasks for the M0 Technical Prototype, 
 **Verification & Stop:**
 
 1. Run `pytest tests/test_google_adapter.py`.
-2. Verify all adapter tests pass, including the strict 400ms timeout enforcement (Scenario 10).
+2. Verify all adapter tests pass, including the configured provider timeout enforcement (Scenario 10).
 3. **STOP**, wait for human review, and use `gh` to mark Issue #3 as complete.
 
 > **Note (T012 gap):** All M0 scenarios are proven against `respx`, including both timeout
@@ -108,7 +110,7 @@ This document outlines the implementation tasks for the M0 Technical Prototype, 
 - [x] **T016: Migrate `db/engine.py` to `aiosqlite`.** Replace the synchronous `pysqlite` engine with `sqlite+aiosqlite`, applying pragmas and verifying WAL through an async connection. **Why:** CONSTITUTION §3.1 and spec §8 both require the `aiosqlite` async driver for the MVP; the current synchronous engine is a known divergence, scheduled for correction *before* T014 so the container is not built against a non-compliant database layer. `check_same_thread=False` becomes unnecessary. **Trigger to move earlier:** any request-path write to `request_logs`, since a synchronous write inside an async handler blocks every other in-flight request. `_enforce_wal` is already driver-agnostic and is the part that must be preserved.
 - [x] **T017: Reintroduce Alembic when a second revision exists.** Initialise Alembic with an initial migration and run migrations at container startup per spec §8 and ADR-0001. **Why deferred:** `alembic` is not a declared dependency while `metadata.create_all` suffices for a single revision. `create_all` only ever *adds* tables and columns — it never alters or drops them — so a container starting against an older volume can silently disagree with the code. **Trigger:** a second schema revision, or T014 shipping an image that persists a volume across upgrades.
 - [x] **T018: CI Pipeline.** Create `.github/workflows/ci.yml` defining the GitHub Actions workflow, wiring in the `ruff` and `mypy` (strict) configuration established in T001. **Crucial:** The pipeline must run `ruff check`, `mypy`, the `pytest` suite, and a dry-run Docker build.
-- [ ] **T019: Live Gemini round trip.** Send one real `POST /v1/chat/completions` request through the containerised router to `google/gemini-3.5-flash-lite` using a valid `GEMINI_API_KEY`, and confirm a normalized OpenAI response. **Why:** every scenario is currently proven only against `respx`; a wrong request field name would pass all mock tests and fail here. This is M0's literal exit criterion. Also confirm the shipped `docker-compose.yml` workflow starts cleanly with `docker compose up`.
+- [x] **T019: Live Gemini round trip.** Send one real `POST /v1/chat/completions` request through the containerised router to `google/gemini-3.5-flash-lite` using a valid `GEMINI_API_KEY`, and confirm a normalized OpenAI response. **Why:** every scenario is currently proven only against `respx`; a wrong request field name would pass all mock tests and fail here. This is M0's literal exit criterion. Also confirm the shipped `docker-compose.yml` workflow starts cleanly with `docker compose up`.
 
 **Suggested order:** T016 → T017 → T013 → T014 → T015 → T018 → T019. The database layer is corrected before the container is built, so the image is not built against a knowingly non-compliant database.
 
@@ -221,6 +223,47 @@ This document outlines the implementation tasks for the M0 Technical Prototype, 
 > **Behaviour change worth noting:** the new action never approves, blocks, or fails a build, so
 > merging is no longer gated on review completion. That is the point of adopting it, but it does mean
 > a cancelled or failing review no longer shows as a red check.
+> **Completed in T019 (Batch 4) — live Gemini round trip.** Verified against the real API through the
+> containerised stack: a `system` message was promoted to `systemInstruction`, the reply was normalised
+> to the OpenAI shape, and the prompt and API key appeared nowhere in the logs. M0's literal exit
+> criterion is met.
+>
+> **Two defects found by live testing that no mock could catch:**
+>
+> 1. **The 0.4 s timeout made the router unusable.** Spec §8 wrapped provider I/O in the same budget
+>    CONSTITUTION §2.5 and ROADMAP §4 set for *routing decisions*. Those are different things. Live
+>    measurement: provider headers took p50 743 ms / p90 2332 ms / max 2893 ms, so a 400 ms window
+>    failed real traffic roughly seven times in eight. The router's own decision path measures
+>    **0.003 ms** mean (0.015 ms worst case over 2000 iterations) — about 190,000× headroom against its
+>    500 ms target. Spec §8 and Scenario 10 were amended; the budget is now **5 s**, overridable via
+>    `ROUTER_PROVIDER_TIMEOUT` so M1 can give each failover attempt its own budget. The <500 ms
+>    routing-overhead target is retained and **documented, not enforced** — an assertion at that scale
+>    would never fire.
+>
+> 2. **Google reports an invalid API key as `400`, not `401`.** Verified live: `400 INVALID_ARGUMENT`
+>    with `"API key not valid. Please pass a valid API key."` (and `403` when the key is absent
+>    entirely). Mapping every 400 to a payload error reported an auth failure as a bad request,
+>    pointing an operator at their payload instead of their credentials. The adapter now classifies a
+>    400 by inspecting the error envelope, promoting only genuine credential signals to
+>    `ProviderAuthError`.
+>
+> Fixing (2) required making `_raise_for_status` async: it now reads the body with `aread()` on the
+> error path, because the response is opened with `stream=True` and the sync `read()` raises
+> *"Attempted to call a sync iterator on an async stream"*. The stream is closed before raising —
+> verified with 50 consecutive error-path dispatches — otherwise every provider error would leak a
+> pooled connection.
+>
+> **Provider latency is highly variable, and this is the biggest open risk.** A 10-request sample from
+> the host succeeded 10/10 but spanned **482 ms to 5364 ms**. Through the container, success rate was
+> roughly **50–60%** at a 5 s budget, with the balance returning 504. Direct calls from *inside* the
+> container, bypassing all router code, also failed ~50% of the time — so this is upstream behaviour,
+> not something the router introduces. ROADMAP §4 sets an MVP target of "approximately 50% successful
+> requests" under realistic free-tier availability, so M0 is arguably meeting its stated bar; but a
+> single-request prototype has no way to work around it. **M1 must handle this**: retry budgets,
+> failover across keys, and `Retry-After` interpretation for 429 are all ROADMAP §3.10 items and are
+> now prerequisites for the service being usable, not later refinements. Consider raising
+> `ROUTER_PROVIDER_TIMEOUT` above 5 s if higher per-request success matters more than responsiveness.
+>
 > **Completed in T015 (Batch 4):** compose stack using a **named volume**, not a bind mount. The
 > container runs as uid 10001 and a bind mount inherits host directory ownership, so a non-root
 > container cannot write to it unless the host directory happens to match. The bind-mount case was
