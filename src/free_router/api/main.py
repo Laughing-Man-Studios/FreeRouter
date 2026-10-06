@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncEngine
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from free_router.api.health import health_router
 from free_router.api.routes import router
 from free_router.core.config import Config, ConfigError, load_config
 from free_router.core.exceptions import (
@@ -223,6 +224,7 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Free LLM Router", lifespan=lifespan)
     app.middleware("http")(request_context_middleware)
     register_exception_handlers(app)
+    app.include_router(health_router)
     app.include_router(router)
     return app
 
