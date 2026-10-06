@@ -127,7 +127,7 @@ This document outlines the implementation tasks for the M0 Technical Prototype, 
 > Verified beyond unit tests: Scenario 4 still aborts startup end to end through the async path; and
 > 200 sequential writes took 48 ms while a concurrent 1 ms ticker ran 90 times, so the loop is not
 > blocked. A blocking driver would have scored 0.
-
+>
 > **Completed in T017 (Batch 4):** Alembic initialised with revision `0001_initial`. Migrations run
 > over a synchronous `pysqlite` connection before the async engine opens — the sync-to-async handoff
 > `plan.md` describes. There is no reason to carry an async migration toolchain for a startup-only
@@ -140,7 +140,6 @@ This document outlines the implementation tasks for the M0 Technical Prototype, 
 > this, upgrading an existing `docker compose` volume would break startup.
 >
 > `env.py` uses `render_as_batch` throughout, since SQLite cannot `ALTER` most things in place.
-
 > **Completed in T013 (Batch 4):** 35 integration tests exercising the seams between layers — an
 > OpenAI body in, a Gemini request on the wire, a normalized response back, an OpenAI completion out.
 > They found **two real bugs**, both invisible to the layer-level suites:
@@ -160,7 +159,6 @@ This document outlines the implementation tasks for the M0 Technical Prototype, 
 > `test_no_exception_is_missing_from_the_status_map` asserts every concrete `RouterBaseError`
 > declares a status, and `test_database_is_ready_before_traffic_is_served` reads the schema through
 > plain `sqlite3` so it proves migrations are committed on disk. Test count: 108 → 143.
-
 > **Completed in T014 (Batch 4):** multi-stage `uv` build onto `python:3.13-slim`, non-root
 > (uid 10001), `uvloop` named explicitly on the `uvicorn` command line, plus a Docker `HEALTHCHECK`.
 >
@@ -184,7 +182,6 @@ This document outlines the implementation tasks for the M0 Technical Prototype, 
 > container reports `healthy`; migrations run on a fresh volume and are **skipped** on restart; the
 > database lands in the mounted volume with WAL active; `uvloop` is the configured loop. Runtime image
 > is 300MB, of which the venv is 74MB.
-
 > **Completed in T018 (Batch 4):** `.github/workflows/ci.yml` with six jobs. Each mirrors a local
 > command, so a green run means the same checks pass on a developer machine:
 >
@@ -224,7 +221,6 @@ This document outlines the implementation tasks for the M0 Technical Prototype, 
 > **Behaviour change worth noting:** the new action never approves, blocks, or fails a build, so
 > merging is no longer gated on review completion. That is the point of adopting it, but it does mean
 > a cancelled or failing review no longer shows as a red check.
-
 > **Completed in T015 (Batch 4):** compose stack using a **named volume**, not a bind mount. The
 > container runs as uid 10001 and a bind mount inherits host directory ownership, so a non-root
 > container cannot write to it unless the host directory happens to match. The bind-mount case was
