@@ -42,9 +42,9 @@ This document outlines the implementation tasks for the M0 Technical Prototype, 
 - [x] **T009: Ingress & Routing Tests.** Write tests verifying that unsupported parameters are stripped, empty message arrays are rejected (Scenarios 5 & 6), exception handlers return correct JSON structures, and the route correctly rejects unsupported models (Scenario 7).
 
 > **Note (T006 deviation):** Alembic is not initialised in this batch. The schema is created with
-> `metadata.create_all`; a versioned migration is deferred to the batch that first needs to evolve the
-> schema, since M0 has exactly one revision. `ROUTER_DB_PATH` was added as a configuration env var to
-> keep the database location out of the working directory during tests.
+> `metadata.create_all`, which suffices for a single revision; a versioned migration is deferred to
+> **T017** (Batch 4), tracked there with its reintroduction trigger. `ROUTER_DB_PATH` was added as a
+> configuration env var to keep the database location out of the working directory during tests.
 
 **Verification & Stop:**
 
@@ -87,16 +87,29 @@ This document outlines the implementation tasks for the M0 Technical Prototype, 
 2. Verify all adapter tests pass, including the strict 400ms timeout enforcement (Scenario 10).
 3. **STOP**, wait for human review, and use `gh` to mark Issue #3 as complete.
 
+> **Note (T012 gap):** All M0 scenarios are proven against `respx`, including both timeout
+> directions. **No request has been made against the live Gemini API**, because that needs a real
+> `GEMINI_API_KEY`. This is a real risk rather than deferred polish: a wrong request field name would
+> pass every mock test and fail live. M0's exit criterion is literally a successful live round trip,
+> so a single manual call is tracked as a Batch 4 closing step.
+
 ---
 
 ## Batch 4: Test Suite Finalization & Docker/CI Setup
 
 **Maps to GitHub Issue:** `#5 Unit Test Suite & Docker Development Environment Setup`
 
+**Carry-over from earlier batches, tracked here so all M0 work lives in one place:**
+
 - [ ] **T013: End-to-End Integration Tests.** Write comprehensive tests for the full ingress-to-egress routing flow using FastAPI's `TestClient` and `respx` to mock the external Google API at the HTTP boundary. Cover a successful chat completion (Scenario 1) and verify the full error mapping pipeline.
 - [ ] **T014: Dockerfile.** Create a multi-stage `Dockerfile` using `uv` for dependency resolution. The runtime stage must strictly use `python:3.13-slim`, run as a non-root user, utilize `uvloop`, and include a Docker `HEALTHCHECK`.
 - [ ] **T015: Docker Compose.** Create a `docker-compose.yml` file for local development orchestration. It should handle mounting the SQLite data volume and passing the `.env` variables (like `GEMINI_API_KEY`) to the container.
-- [ ] **T016: CI Pipeline.** Create `.github/workflows/ci.yml` defining the GitHub Actions workflow, wiring in the `ruff` and `mypy` (strict) configuration established in T001. **Crucial:** The pipeline must run `ruff check`, `mypy`, the `pytest` suite, and a dry-run Docker build.
+- [ ] **T016: Migrate `db/engine.py` to `aiosqlite`.** Replace the synchronous `pysqlite` engine with `sqlite+aiosqlite`, applying pragmas and verifying WAL through an async connection. **Why:** CONSTITUTION §3.1 and spec §8 both require the `aiosqlite` async driver for the MVP; the current synchronous engine is a known divergence, scheduled for correction *before* T014 so the container is not built against a non-compliant database layer. `check_same_thread=False` becomes unnecessary. **Trigger to move earlier:** any request-path write to `request_logs`, since a synchronous write inside an async handler blocks every other in-flight request. `_enforce_wal` is already driver-agnostic and is the part that must be preserved.
+- [ ] **T017: Reintroduce Alembic when a second revision exists.** Initialise Alembic with an initial migration and run migrations at container startup per spec §8 and ADR-0001. **Why deferred:** `alembic` is not a declared dependency while `metadata.create_all` suffices for a single revision. `create_all` only ever *adds* tables and columns — it never alters or drops them — so a container starting against an older volume can silently disagree with the code. **Trigger:** a second schema revision, or T014 shipping an image that persists a volume across upgrades.
+- [ ] **T018: CI Pipeline.** Create `.github/workflows/ci.yml` defining the GitHub Actions workflow, wiring in the `ruff` and `mypy` (strict) configuration established in T001. **Crucial:** The pipeline must run `ruff check`, `mypy`, the `pytest` suite, and a dry-run Docker build.
+- [ ] **T019: Live Gemini round trip.** Send one real `POST /v1/chat/completions` request through the containerised router to `google/gemini-3.5-flash-lite` using a valid `GEMINI_API_KEY`, and confirm a normalized OpenAI response. **Why:** every scenario is currently proven only against `respx`; a wrong request field name would pass all mock tests and fail here. This is M0's literal exit criterion. Also confirm the shipped `docker-compose.yml` workflow starts cleanly with `docker compose up`.
+
+**Suggested order:** T016 → T017 → T013 → T014 → T015 → T018 → T019. The database layer is corrected before the container is built, so the image is not built against a knowingly non-compliant database.
 
 **Verification & Stop:**
 
