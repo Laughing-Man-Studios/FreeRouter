@@ -21,3 +21,6 @@ data/
 
 # Scratch database used when authoring revisions via the Alembic CLI
 router-scratch.db*
+
+# Docker build output (the Dockerfile itself is tracked)
+.docker/
