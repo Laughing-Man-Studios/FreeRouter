@@ -103,8 +103,8 @@ This document outlines the implementation tasks for the M0 Technical Prototype, 
 **Carry-over from earlier batches, tracked here so all M0 work lives in one place:**
 
 - [x] **T013: End-to-End Integration Tests.** Write comprehensive tests for the full ingress-to-egress routing flow using FastAPI's `TestClient` and `respx` to mock the external Google API at the HTTP boundary. Cover a successful chat completion (Scenario 1) and verify the full error mapping pipeline.
-- [ ] **T014: Dockerfile.** Create a multi-stage `Dockerfile` using `uv` for dependency resolution. The runtime stage must strictly use `python:3.13-slim`, run as a non-root user, utilize `uvloop`, and include a Docker `HEALTHCHECK`.
-- [ ] **T015: Docker Compose.** Create a `docker-compose.yml` file for local development orchestration. It should handle mounting the SQLite data volume and passing the `.env` variables (like `GEMINI_API_KEY`) to the container.
+- [x] **T014: Dockerfile.** Create a multi-stage `Dockerfile` using `uv` for dependency resolution. The runtime stage must strictly use `python:3.13-slim`, run as a non-root user, utilize `uvloop`, and include a Docker `HEALTHCHECK`.
+- [x] **T015: Docker Compose.** Create a `docker-compose.yml` file for local development orchestration. It should handle mounting the SQLite data volume and passing the `.env` variables (like `GEMINI_API_KEY`) to the container.
 - [x] **T016: Migrate `db/engine.py` to `aiosqlite`.** Replace the synchronous `pysqlite` engine with `sqlite+aiosqlite`, applying pragmas and verifying WAL through an async connection. **Why:** CONSTITUTION §3.1 and spec §8 both require the `aiosqlite` async driver for the MVP; the current synchronous engine is a known divergence, scheduled for correction *before* T014 so the container is not built against a non-compliant database layer. `check_same_thread=False` becomes unnecessary. **Trigger to move earlier:** any request-path write to `request_logs`, since a synchronous write inside an async handler blocks every other in-flight request. `_enforce_wal` is already driver-agnostic and is the part that must be preserved.
 - [x] **T017: Reintroduce Alembic when a second revision exists.** Initialise Alembic with an initial migration and run migrations at container startup per spec §8 and ADR-0001. **Why deferred:** `alembic` is not a declared dependency while `metadata.create_all` suffices for a single revision. `create_all` only ever *adds* tables and columns — it never alters or drops them — so a container starting against an older volume can silently disagree with the code. **Trigger:** a second schema revision, or T014 shipping an image that persists a volume across upgrades.
 - [ ] **T018: CI Pipeline.** Create `.github/workflows/ci.yml` defining the GitHub Actions workflow, wiring in the `ruff` and `mypy` (strict) configuration established in T001. **Crucial:** The pipeline must run `ruff check`, `mypy`, the `pytest` suite, and a dry-run Docker build.
@@ -160,6 +160,45 @@ This document outlines the implementation tasks for the M0 Technical Prototype, 
 > `test_no_exception_is_missing_from_the_status_map` asserts every concrete `RouterBaseError`
 > declares a status, and `test_database_is_ready_before_traffic_is_served` reads the schema through
 > plain `sqlite3` so it proves migrations are committed on disk. Test count: 108 → 143.
+
+> **Completed in T014 (Batch 4):** multi-stage `uv` build onto `python:3.13-slim`, non-root
+> (uid 10001), `uvloop` named explicitly on the `uvicorn` command line, plus a Docker `HEALTHCHECK`.
+>
+> **A subtask was added: `GET /health`.** Spec §7 mandates a healthcheck and there was nothing to point
+> it at. It is deliberately trivial and does **not** check provider reachability: Docker restarts on
+> unhealthy, so a probe that failed on a transient upstream outage would cause restart loops against a
+> router working as intended. It sits at `/health`, not under `/v1`, so it is not advertised as part of
+> the OpenAI-compatible surface.
+>
+> Two build failures were hit, both of which would have shipped a broken image:
+>
+> - `COPY --from=builder /app/config.yaml` failed — only `pyproject.toml`, `uv.lock`, `README.md`, and
+>   `src/` are copied into the builder. The config holds no secrets (spec §6), so it is copied from the
+>   build context instead.
+> - The container started then died with `ModuleNotFoundError: free_router`. `uv sync` installs the
+>   project as a `.pth` pointing at `/app/src`, which only resolves because the source happens to be
+>   in the builder image. Copying only the venv discards `/app/src`. Fixed with `--no-editable`, which
+>   makes it a real install that survives the venv copy.
+>
+> Verified by building and running, not assumed: runs as uid 10001; `/health` returns 200 and the
+> container reports `healthy`; migrations run on a fresh volume and are **skipped** on restart; the
+> database lands in the mounted volume with WAL active; `uvloop` is the configured loop. Runtime image
+> is 300MB, of which the venv is 74MB.
+
+> **Completed in T015 (Batch 4):** compose stack using a **named volume**, not a bind mount. The
+> container runs as uid 10001 and a bind mount inherits host directory ownership, so a non-root
+> container cannot write to it unless the host directory happens to match. The bind-mount case was
+> tested and only worked because the test host directory was already owned by the invoking user — it
+> would fail on a host that is not.
+>
+> The port is bound to `127.0.0.1` only. The MVP has no authentication layer (CONSTITUTION §3.4), so
+> publishing on all interfaces would expose an unauthenticated proxy to the network. `GEMINI_API_KEY`
+> is required at interpolation time, so `docker compose up` fails with a clear message instead of
+> starting a container that will crash on startup.
+>
+> A live request through the container reached the real Gemini API and returned
+> `provider_validation_error` / 400 — the pipeline works end to end and the provider genuinely rejected
+> the placeholder key. T019 remains open with a real key.
 
 **Verification & Stop:**
 
