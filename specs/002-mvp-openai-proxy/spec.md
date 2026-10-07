@@ -37,6 +37,22 @@ M1 makes the router survive that. It adds a key pool, quota awareness with coold
 - The number of keys a provider accepts must be capped at whatever the compliance evaluation (Issue #51) concludes, and the cap must be **enforced by configuration validation**, not by convention.
 - Key aliases must appear in operational logs in place of key material (CONSTITUTION §9.1).
 
+> **Finding (Issue #51): key pooling is a credential-rotation mechanism, not a capacity
+> mechanism, for Google.** Google's rate-limits documentation states that *"Rate limits are applied
+> per project, not per API key"*, and Google staff confirm that all keys within a project share one
+> quota pool. Two keys in one Google project are therefore two credentials against a **single** quota
+> bucket, not two buckets. Independent quota on Google requires separate **projects**, which is a
+> larger change than a key pool and is out of scope for M1.
+>
+> Consequences for this specification:
+>
+> - Key pooling is still required, for credential rotation, for Mistral (whose limits may be
+>   per-key — unconfirmed), and as the foundation for per-project quotas later.
+> - **It must not be treated as the primary reliability lever for Google.** Requirement 5 (retry on
+>   transient faults) carries that role instead. See *Risk Assessment*.
+> - Any claim that a second key doubles available capacity is incorrect for Google and must not
+>   appear in configuration, logs, or documentation.
+
 ### 3. Key Selection (LRU)
 
 - Selection must be deterministic: among eligible keys, the router must select the one least recently used.
@@ -47,14 +63,37 @@ M1 makes the router survive that. It adds a key pool, quota awareness with coold
 ### 4. Level 1 Quota & Cooldown
 
 - The quota model must use a generic internal representation so that additional dimensions can be added later without rewriting the routing engine (ROADMAP §3.5).
-- Level 1 dimensions are static configuration values, **verified against current provider documentation** rather than assumed (ROADMAP §2). These are produced by Issue #51.
+- Level 1 dimensions are static configuration values. **For Google these values are deliberately conservative placeholders, not published figures** — see the finding below. They must be tuned from measured success rate rather than asserted as authoritative.
+- Where a provider publishes authoritative limits, the value must match that documentation. Where it does not, the configuration must be treated as a tunable estimate.
 - Every dispatch must follow the reservation cycle: estimate → reserve → dispatch → reconcile (CONSTITUTION §8.2).
 - Token estimation must include a configurable safety margin so provider-side context rejections are avoided.
 - On a hard provider rejection indicating context-length overflow, the router must mark that model as degraded for large-context requests (CONSTITUTION §8.2 circuit breaker).
 - A `429` must place the affected key into cooldown. Cooldown duration must be configurable per provider/model rather than globally hard-coded.
 - **Quota and cooldown state is in-memory for M1.** This is a recorded deviation from CONSTITUTION §8.3 — see *Recorded Deviations*.
 
+> **Finding (Issue #51): provider free-tier limits are not published.**
+>
+> - **Google** defers the numeric rate-limit table to *"View your active rate limits in AI Studio"*,
+>   behind sign-in. There is **no authoritative published RPM/TPM/RPD for
+>   `gemini-3.5-flash-lite`**. Third-party figures conflict (5–15 RPM, ~250k TPM, 1,000–1,500 RPD
+>   depending on model and vintage).
+> - **Mistral** likewise publishes no free-tier numbers; live values are visible only in the console
+>   under Admin → Limits. Third-party estimates conflict by an order of magnitude (1 RPS vs 1 RPM vs
+>   30 RPM).
+>
+> ROADMAP §2 requires quota values be "verified against current provider documentation rather than
+> hard-coded assumptions." That cannot be satisfied for either provider from published sources. M1
+> therefore ships **conservative placeholder values marked as unverified**, tunes them from measured
+> success rate, and treats the published figures as unavailable rather than guessed. Populating them
+> precisely would require measuring against the live API, consuming free quota to do so — rejected
+> for M1 as a poor trade against the ~1 RPS free-tier ceiling.
+>
+> The requirement this most directly qualifies is ROADMAP §2's verification clause. It is recorded
+> here rather than quietly unmet.
+
 ### 5. Retry & Failover
+
+**This section carries the primary reliability load for M1.** Key pooling cannot: Google's quota is per-project, so a second key adds no capacity (§2). Retry against transient faults is the main mechanism by which the success rate rises from M0's ~50–60% toward ≥80%.
 
 - A `429` or transient `5xx` occurring **before any bytes are written to the client** must permit failover to another eligible key for the **same** model.
 - Cross-model failover is **prohibited** for an explicitly requested model (CONSTITUTION §7.2).
@@ -261,9 +300,33 @@ This deviation is accepted deliberately, with the Constitution treated as the de
 
 ADR-001 §2.4 still records a 400 ms `asyncio.timeout` for the provider envelope. The M0 specification was amended to a 5 s configurable budget after live measurement showed provider headers alone routinely exceed 400 ms. ADR-001 is corrected as part of this milestone's planning so that a future reader does not reintroduce the defect.
 
+### ROADMAP §2 — verification of provider quota values
+
+ROADMAP §2 requires that exact provider quota values be "verified against current provider documentation rather than hard-coded assumptions."
+
+This **cannot be satisfied for either provider**, as Issue #51 established: Google defers its rate-limit table to a signed-in console, and Mistral publishes no free-tier figures at all. M1 ships conservative placeholders marked unverified and tunes from measurement.
+
+The deviation is recorded rather than papered over with third-party figures that conflict.
+
 ### ROADMAP §4 — success target
 
 The "~50% successful requests" MVP figure was set when a single key and no retry existed. It is superseded by the **≥80%** target in this specification. ROADMAP §4 is updated to match.
+
+## Risk Assessment
+
+### The ≥80% target may not be reachable by the assumed means
+
+M1 was planned expecting key pooling to contribute materially to the success rate. **It does not, for Google** — Google's quota is per-project, so additional keys share one bucket. Retry on transient faults is therefore the load-bearing mechanism, and it is bounded by the provider's actual failure modes.
+
+If the measured rate lands materially below 80%, the honest response is to record the measurement and its conditions rather than to keep retrying more aggressively — CONSTITUTION §6.1's pacing requirement exists precisely to prevent unbounded retries from looking like abuse. A shortfall is information for M2's planning, not a target to be met by defeating the compliance mode.
+
+### Quota constants start unverified
+
+Both providers hide free-tier limits behind a console. M1 ships conservative placeholders. The consequence is that counters may under- or over-estimate true capacity, and a tuned value may be wrong for a different account or region. This is accepted for M1 and is a known quality gap, not an oversight.
+
+### Key pooling may be inert for Google
+
+Two keys in one Google project provide credential redundancy but no additional capacity. The M0 deployment target of "~1 key per provider" is therefore unchanged in practice, and the two-key scenario is exercised mainly against Mistral.
 
 ## Definition of Done
 
@@ -273,7 +336,9 @@ Per `docs/SDD_WORKFLOW.md` §21, and with CONSTITUTION as the governing standard
 - [ ] Relevant unit and integration tests pass
 - [ ] Issue #51 closed — compliance evaluation and quota research complete
 - [ ] ADR-0003 and ADR-0004 recorded
-- [ ] Measured success rate recorded against the ≥80% target
+- [ ] Measured success rate recorded against the ≥80% target, with conditions stated
+- [ ] Quota configuration values marked as unverified placeholders, not presented as published figures
+- [ ] No claim appears anywhere that a second Google key adds quota capacity
 - [ ] No secrets in source, configuration, or logs
 - [ ] No out-of-scope functionality introduced
 - [ ] The recorded §8.3 deviation is still accurate, or has been closed out

@@ -20,10 +20,18 @@
 **Maps to GitHub Issue:** `#51 Provider Compliance Evaluation & Free-Tier Quota Research`
 
 - [ ] **T020: Provider compliance research.** Produce the written CONSTITUTION §6.1 evaluation for Google and Mistral, citing current source documentation with retrieval dates. Determine per provider whether key pooling is permitted, prohibited, or silent-and-therefore-capped at 2 keys. Determine whether mandatory request pacing is required and, if so, its parameters. Record the result as configuration data, not as constants.
-- [ ] **T021: Free-tier quota research.** Document Google and Mistral free-tier dimensions — RPM, TPM, daily request limits, and reset behaviour (rolling vs daily) — verified against current provider documentation. Produce concrete configuration values with their provenance.
+- [ ] **T021: Free-tier quota research — REVISED, completed by investigation.** Neither provider publishes authoritative free-tier numbers: Google defers its rate-limit table to a signed-in AI Studio console, and Mistral shows live values only under Admin → Limits. Third-party figures conflict by an order of magnitude. **T020 also established that Google's quota is per-project, not per-key**, so pooling adds no capacity there.
+  **Revised outcome:** ship **conservative placeholder quota values marked unverified**, tune them from measured success rate, and do not populate figures that cannot be sourced. Measuring against the live API to obtain precise numbers is rejected for M1 as a poor trade against a ~1 RPS ceiling.
+  **Remaining work:** record the placeholder values, their provenance-as-unverified, and the published-figure sources that were checked and found silent.
 - [ ] **T022: ADR-0003 and ADR-0004.** Record the key-pool configuration mechanism (ADR-0003) and the in-memory quota state decision with its M2 path (ADR-0004). Also correct ADR-001 §2.4, which still states the superseded 400 ms timeout.
 
-> **Critical dependency:** T020–T022 determine the key cap and whether pacing is mandatory. The key manager in Batch 2 is written against those conclusions, not against assumptions.
+> **Investigation outcome (2026-10-06).** Three findings, now recorded in `spec.md` and ADR-0003:
+>
+> 1. **Google's quota is per-project, not per-key** — *"Rate limits are applied per project, not per API key."* Two keys in one project share one quota bucket. Key pooling is therefore a credential-rotation facility for Google, **not** a capacity lever, and Batch 2 must not be justified on that basis.
+> 2. **Neither provider publishes free-tier limits.** Placeholder values ship marked unverified (T021).
+> 3. **Pacing is not required** by either provider's terms, so §6.1's pacing requirement is not triggered and T039 is skipped with the reasoning recorded.
+>
+> **Consequence for the ≥80% target:** with key pooling downgraded as a reliability lever, **retry on transient faults carries that role**, and Batch 4 is the load-bearing batch. See `spec.md` § *Risk Assessment*.
 
 **Verification & Stop:**
 
@@ -116,7 +124,7 @@
 **Maps to GitHub Issue:** `#6 [M1 Epic] MVP OpenAI-Compatible Proxy`
 
 - [ ] **T038: Opt-in debug payload logging.** Implement full request/response logging behind explicit environment configuration, written to an **isolated** stream. When disabled, the existing structural guarantee holds unchanged (CONSTITUTION §9.1). This is a ROADMAP M1 deliverable that M0 skipped and no other issue owned.
-- [ ] **T039: Request pacing.** If T020 concluded pacing is mandatory, enforce the minimum interval per provider using the injected clock. Skip if the evaluation found it unnecessary, and record that decision.
+- [ ] **T039: Request pacing — SKIPPED, decision recorded.** Issue #51 found that neither Google's nor Mistral's documented terms impose mandatory request pacing, so CONSTITUTION §6.1's pacing requirement is **not triggered** for M1. No pacing is implemented. This stands as the recorded outcome rather than an open task; revisit only if a provider's terms change or Issue #51 is reopened.
 - [ ] **T040: Milestone verification.** Re-verify the specification end to end, measure the achieved success rate against the ≥80% target, confirm Issue #51 remains closed, and confirm the recorded CONSTITUTION §8.3 deviation is still accurate.
 
 **Verification & Stop:**
@@ -132,6 +140,8 @@
 ## Ordering Rationale
 
 Failover is built before the second provider because CONSTITUTION §7.2 forbids cross-model failover for an explicitly requested model. A Mistral adapter therefore does not improve reliability for a client asking for a Google model — it only adds capability. The key pool, quota, and failover chain is what moves the success rate, so it ships first.
+
+**Revised after Issue #51.** Because Google's quota is per-project, the key pool does not add capacity there either. Retry (Batch 4) is now the primary reliability mechanism, which strengthens rather than weakens this ordering — the failover chain still ships before the second provider.
 
 Batch 1 precedes everything because its conclusions — the key cap and whether pacing is required — are inputs to the key manager's contract, not documentation written afterwards.
 
