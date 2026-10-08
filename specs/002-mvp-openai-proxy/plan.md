@@ -74,7 +74,9 @@ src/free_router/
 
 Issue #51 established that **Google's rate limits are per-project, not per-API-key**. Multiple keys in one Google project share a single quota bucket; independent quota requires separate projects, which is out of scope for M1.
 
-This changes what the key manager is *for*. It provides credential redundancy and a place to attach cooldown state — not extra throughput. The planning assumption that a second key would roughly double available capacity is withdrawn, and Batch 4 (retry) rather than Batch 2 (key pool) carries the reliability load against the ≥80% target.
+This changes what the key manager is *for*. It provides credential redundancy and a place to attach cooldown state — not extra throughput. The planning assumption that a second key would roughly double available capacity is withdrawn, and Batch 4 (retry) rather than Batch 5 (key pool) carries the reliability load against the ≥80% target.
+
+It also drove a resequencing: **Batch 2 (Mistral adapter) now runs before Batch 5 (key pool)**. A second key on one Google project can only test credential redundancy, whereas a genuinely independent provider can fail on its own, making quota and failover behaviour observable.
 
 The design is otherwise unchanged: the pool, aliases, and LRU are still correct and still needed. What changes is the justification, and the implementation must not encode a capacity assumption that is false.
 

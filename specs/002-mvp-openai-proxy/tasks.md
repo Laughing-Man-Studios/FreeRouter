@@ -11,7 +11,7 @@
 - Use `gh` to update the corresponding GitHub Issue status.
 - Do not proceed to the next batch until the current batch is verified and human review is complete.
 
-**Task IDs continue from M0** (which used T001–T019). Ordering follows the agreed sequence: fix the failure rate first (key pool → quota → failover), then add the second provider.
+**Task IDs continue from M0** (which used T001–T019). **Task IDs are stable identifiers, not execution order** — the sequence below was revised on 2026-10-08 and Batch 2's tasks are T035–T037 while Batch 5's are T023–T026. Follow the batch numbers, not the ID range.
 
 ---
 
@@ -42,22 +42,20 @@
 
 ---
 
-## Batch 2: Key Pool & Identity Registry
+## Batch 2: Mistral Provider Adapter & Identity Registry
 
-**Maps to GitHub Issue:** `#8 Key Pool Manager & Simple LRU Key Selection`
+**Maps to GitHub Issue:** `#7 Mistral Provider Adapter & Identity Registry`
 
-- [ ] **T023: Configuration schema.** Extend `config.yaml` handling for pooled keys per ADR-0003, enforcing the cap concluded in T020 as a **configuration validation error**, not a convention. Key material remains environment-only; the loader must continue to reject any secret-named field or `${VAR}` reference in `config.yaml` (ADR-0002).
-- [ ] **T024: Identity registry.** Introduce `provider/model` identity distinct from the external OpenAI identifier, supporting multiple providers without routing-core changes. Unknown models resolve to `UnsupportedModelError` as in M0.
-- [ ] **T025: Key manager.** Implement the pool and deterministic LRU selection over eligible keys, with `KeyRef` carrying a loggable alias and a `SecretStr`. Inject a clock; do not read wall time.
-- [ ] **T026: Eligibility and concurrency guard.** Exclude cooling and exhausted keys from selection. Guard selection and state mutation with an `asyncio.Lock` held only across in-memory updates — never across provider I/O. Log `key_alias` and `selection_reason`.
+- [ ] **T035: Mistral API verification.** Verify the endpoint, authentication scheme, request/response shape, and error taxonomy against current Mistral documentation. **Do not assume** — Google's invalid key returns `400`, not `401`. Confirm free-tier models and their identifiers.
+- [ ] **T036: Mistral adapter.** Implement the adapter against the revised protocol, with bi-directional translation and error normalization into the existing exception hierarchy. Register it so it is selectable purely through configuration.
+- [ ] **T037: Translation tests.** `respx` tests for success, auth failure, rate limit, server error, and timeout, using fixture shapes verified in T035.
 
 **Verification & Stop:**
 
-1. `pytest tests/test_key_manager.py tests/test_config.py`
-2. `ruff check .`, `ruff format --check .`, `mypy --strict src/`
-3. Confirm no test or log output contains key material — assert the alias appears and the secret does not.
-4. Confirm a cooling key is never selected, and that concurrent requests cannot both take the last eligible key.
-5. **STOP**, review, then close Issue #8.
+1. `pytest tests/test_mistral_adapter.py`
+2. `ruff check .`, `mypy --strict src/`
+3. Confirm a Mistral model is served without modification to ingress, routing core, or the Google adapter.
+4. **STOP**, review, then close Issue #7.
 
 ---
 
@@ -102,24 +100,26 @@
 
 ---
 
-## Batch 5: Mistral Provider Adapter
+## Batch 5: Key Pool & Identity Registry
 
-**Maps to GitHub Issue:** `#7 Mistral Provider Adapter & Identity Registry`
+**Maps to GitHub Issue:** `#8 Key Pool Manager & Simple LRU Key Selection`
 
-- [ ] **T035: Mistral API verification.** Verify the endpoint, authentication scheme, request/response shape, and error taxonomy against current Mistral documentation. **Do not assume** — Google's invalid key returns `400`, not `401`. Confirm free-tier models and their identifiers.
-- [ ] **T036: Mistral adapter.** Implement the adapter against the revised protocol, with bi-directional translation and error normalization into the existing exception hierarchy. Register it so it is selectable purely through configuration.
-- [ ] **T037: Translation tests.** `respx` tests for success, auth failure, rate limit, server error, and timeout, using fixture shapes verified in T035.
+- [ ] **T023: Configuration schema.** Extend `config.yaml` handling for pooled keys per ADR-0003, enforcing the cap concluded in T020 as a **configuration validation error**, not a convention. Key material remains environment-only; the loader must continue to reject any secret-named field or `${VAR}` reference in `config.yaml` (ADR-0002).
+- [ ] **T024: Identity registry.** Introduce `provider/model` identity distinct from the external OpenAI identifier, supporting multiple providers without routing-core changes. Unknown models resolve to `UnsupportedModelError` as in M0.
+- [ ] **T025: Key manager.** Implement the pool and deterministic LRU selection over eligible keys, with `KeyRef` carrying a loggable alias and a `SecretStr`. Inject a clock; do not read wall time.
+- [ ] **T026: Eligibility and concurrency guard.** Exclude cooling and exhausted keys from selection. Guard selection and state mutation with an `asyncio.Lock` held only across in-memory updates — never across provider I/O. Log `key_alias` and `selection_reason`.
 
 **Verification & Stop:**
 
-1. `pytest tests/test_mistral_adapter.py`
-2. `ruff check .`, `mypy --strict src/`
-3. Confirm a Mistral model is served without modification to ingress, routing core, or the Google adapter.
-4. **STOP**, review, then close Issue #7.
+1. `pytest tests/test_key_manager.py tests/test_config.py`
+2. `ruff check .`, `ruff format --check .`, `mypy --strict src/`
+3. Confirm no test or log output contains key material — assert the alias appears and the secret does not.
+4. Confirm a cooling key is never selected, and that concurrent requests cannot both take the last eligible key.
+5. **STOP**, review, then close Issue #8.
 
 ---
 
-## Batch 6: Debug Logging, Pacing & Milestone Verification
+## Batch 6: Debug Logging & Milestone Verification
 
 **Maps to GitHub Issue:** `#6 [M1 Epic] MVP OpenAI-Compatible Proxy`
 
