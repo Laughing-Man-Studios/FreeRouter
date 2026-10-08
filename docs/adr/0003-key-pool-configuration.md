@@ -58,7 +58,32 @@ The loader derives the variable name from the provider and alias rather than acc
 - An environment variable matching the convention but not declared in configuration is ignored, so an unrelated `GOOGLE_KEY_...` variable in a developer's shell cannot silently join the pool.
 - `key_aliases` is added to the loader's vocabulary as a permitted structural field. It names slots, not secrets, and the ADR-0002 rejection of `keys`/`api_key`/`api_keys` is retained unchanged.
 
-## 3. Reasoning
+## 3. Compliance Evaluation Findings (Issue #51, 2026-10-06)
+
+Research against current provider documentation produced two findings that constrain this ADR.
+
+### Google's quota is per-project, not per-key
+
+Google's rate-limits documentation states, twice:
+
+> "Rate limits are applied per project, not per API key."
+> "Requests per day (RPD) quotas reset at midnight Pacific time."
+
+Google staff confirm the consequence on the developer forum: all keys within the same Google Cloud project share one quota pool. Independent quota requires **separate projects**, which is materially larger than a key pool and is out of scope for M1.
+
+**Consequence:** for Google, this mechanism provides **credential redundancy, not additional capacity**. It must not be justified, configured, or documented as a capacity multiplier. The M0 two-key target ("~1 key per provider") is unchanged in practice.
+
+### Mistral permits multiple keys
+
+Mistral supports multiple API keys per organization as a first-class capability — users and service accounts each manage their own, with optional org-wide expiration for rotation. No prohibition on pooling appears in the terms.
+
+**Consequence:** under CONSTITUTION §6.1 Conservative Compliance Mode, Mistral is classified **permitted**, so the 2-key cap does not apply to it. Whether Mistral's *rate limits* are per-key or per-organization is **not documented**; if per-organization, pooling is equally inert there and M1's reliability gains come from retry rather than capacity.
+
+### Pacing
+
+Neither provider's documentation imposes mandatory request pacing. §6.1's pacing requirement is therefore **not triggered** for M1, and T039 is skipped with the reasoning recorded rather than implemented speculatively.
+
+## 4. Reasoning
 
 **Aliases separate identity from material.** The pool needs a stable identifier to rank by LRU, record cooldown against, and write to `request_logs`. That identifier must be loggable. A key cannot serve both roles without either leaking or becoming unrankable.
 
@@ -68,7 +93,7 @@ The loader derives the variable name from the provider and alias rather than acc
 
 **The cap is enforced, not documented.** CONSTITUTION §6.1's key limit exists to reduce account-suspension risk. A limit honoured by convention fails exactly when it is under pressure.
 
-## 4. Alternatives Considered
+## 5. Alternatives Considered
 
 **`${VAR}` placeholders in `config.yaml`** (ROADMAP §3.15's illustrative shape). Rejected by ADR-0002 and actively blocked by the loader. Restoring it would reverse an accepted ADR to gain ergonomics that `.env` already provides.
 
@@ -78,7 +103,7 @@ The loader derives the variable name from the provider and alias rather than acc
 
 **A single comma-separated environment variable** holding several keys. Rejected: positional identity is not stable enough to rank, log, or attach cooldown state to.
 
-## 5. Consequences
+## 6. Consequences
 
 ### Positive
 
@@ -86,6 +111,13 @@ The loader derives the variable name from the provider and alias rather than acc
 - Aliases are safe to log, giving the key manager and `request_logs` a usable identifier.
 - Adding a key is a configuration change; no code change.
 - The §6.1 cap is testable.
+- For Google, it provides credential redundancy, so a compromised or revoked key does not stop the router.
+
+### Neutral
+
+- **It does not add capacity on Google.** Per §3, Google's quota is per-project. This mechanism is a
+  credential-management facility; the reliability gain in M1 comes from retry, not from having more
+  keys. Any future expectation that adding keys raises throughput is incorrect.
 
 ### Negative / Trade-offs
 
@@ -94,11 +126,11 @@ The loader derives the variable name from the provider and alias rather than acc
 - Requiring declaration makes bulk setup slightly more verbose than discovery would.
 - Two providers with the same alias produce distinct variables by construction (`<PROVIDER>_KEY_<ALIAS>`), so no collision, but the names must be remembered per provider.
 
-## 6. Constitutional Compliance Check
+## 7. Constitutional Compliance Check
 
 | Constitution Directive | Compliance Validation |
 | :--- | :--- |
 | **9.2 Key Management** | **Pass:** Key material is environment-only. `config.yaml` names slots, never secrets. ADR-0002's rejection of `${VAR}` and secret-named fields is retained. |
-| **6.1 Conservative Compliance Mode** | **Pass:** The key cap is enforced by configuration validation, failing startup when exceeded. |
+| **6.1 Conservative Compliance Mode** | **Pass:** The key cap is enforced by configuration validation, failing startup when exceeded. Mistral is classified permitted (§3), so the 2-key cap does not apply to it. Neither provider mandates pacing, so that requirement is not triggered. |
 | **2.3 Incremental Complexity** | **Pass:** One naming convention and one new structural field. No secret store is introduced. |
 | **9.1 Privacy by Default** | **Pass:** Only aliases are exposed to logs and persistence. |

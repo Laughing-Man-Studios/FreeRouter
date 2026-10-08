@@ -24,7 +24,9 @@ CONSTITUTION §4 requires architectural isolation, and ROADMAP §11 identifies k
 
 ### Configuration is the policy surface
 
-Every value that could reasonably differ per provider or per model — quota limits, cooldown durations, retry budgets, pacing intervals, and the key cap — is a **configuration value**. The routing engine contains no provider-specific constants. This is required by ROADMAP §2 ("Exact provider quota values should be treated as configuration data and verified against current provider documentation rather than hard-coded assumptions") and keeps adding a provider to a configuration change rather than a code change.
+Every value that could reasonably differ per provider or per model — quota limits, cooldown durations, retry budgets, and the key cap — is a **configuration value**. The routing engine contains no provider-specific constants. This keeps adding a provider to a configuration change rather than a code change.
+
+ROADMAP §2 additionally asks that these values be "verified against current provider documentation." **Issue #51 could not satisfy that for either provider** — see "Quota constants start unverified" below. The requirement is recorded as qualified rather than met.
 
 ### In-memory state, deliberately
 
@@ -61,12 +63,28 @@ src/free_router/
   │   ├── google/adapter.py    # authenticate with a pooled key
   │   └── mistral/
   │       └── adapter.py       # NEW
-  └── pacing.py                # NEW: conditional minimum-interval enforcement (Issue #51)
+  └── pacing.py                # NOT BUILT — see "Pacing is not implemented" above
 ```
 
-`core/models.py` and `keys/`, `quota/` are new packages. Each exists because a distinct concern needs a narrow interface; none is speculative — every one is exercised by this milestone.
+`core/models.py` and `keys/`, `quota/` are new packages. Each exists because a distinct concern needs a narrow interface; none is speculative — every one is exercised by this milestone. `pacing.py` appears in the tree for completeness only and is **not** created.
 
 ## Interfaces
+
+### Key pooling is a credential mechanism, not a capacity mechanism
+
+Issue #51 established that **Google's rate limits are per-project, not per-API-key**. Multiple keys in one Google project share a single quota bucket; independent quota requires separate projects, which is out of scope for M1.
+
+This changes what the key manager is *for*. It provides credential redundancy and a place to attach cooldown state — not extra throughput. The planning assumption that a second key would roughly double available capacity is withdrawn, and Batch 4 (retry) rather than Batch 2 (key pool) carries the reliability load against the ≥80% target.
+
+The design is otherwise unchanged: the pool, aliases, and LRU are still correct and still needed. What changes is the justification, and the implementation must not encode a capacity assumption that is false.
+
+### Quota constants start unverified
+
+Neither provider publishes free-tier numbers — Google defers to a signed-in console, Mistral to its admin UI. M1 ships **conservative placeholder values marked unverified** and tunes them from measured success rate, rather than populating third-party figures that conflict by an order of magnitude. Measuring against the live API to obtain precise values is rejected as a poor trade against a ~1 RPS ceiling.
+
+### Pacing is not implemented
+
+Neither provider's documented terms require request pacing, so CONSTITUTION §6.1's pacing requirement is not triggered. `pacing.py` in the component map below is therefore **not built**; the plan's §8 requirement is recorded as skipped with its reasoning.
 
 ### Key identity
 
@@ -175,7 +193,7 @@ Manual verification against live providers is reserved for translation correctne
 
 ### Retry multiplies quota consumption
 
-Retrying on failure increases request volume against a free tier that is already the bottleneck. Mitigations: a hard attempt budget, no retry into `429`, and pacing where §6.1 requires it. Residual risk accepted.
+Retrying on failure increases request volume against a free tier that is already the bottleneck — and it is now the *primary* reliability mechanism, since key pooling adds no capacity on Google. Mitigations: a hard attempt budget and no retry into `429`. Pacing would be a further brake but is not required by either provider's terms (§6.1 not triggered). Residual risk accepted.
 
 ### The ≥80% target is a hypothesis, not a forecast
 
@@ -197,8 +215,10 @@ LRU by definition concentrates. That is correct (CONSTITUTION §2.5 forbids even
 
 1. **The adapter interface gains a key parameter and nothing else.** Keeps the normalization boundary intact and makes Mistral a configuration change.
 2. **Key/quota layer sits between the route and the adapter.** The narrowest seam that satisfies CONSTITUTION §4 and ROADMAP §11.
-3. **All provider-specific values are configuration.** Quota limits, cooldowns, pacing, budgets, and the key cap are never constants in the routing engine.
+3. **All provider-specific values are configuration.** Quota limits, cooldowns, budgets, and the key cap are never constants in the routing engine. Quota values ship as unverified placeholders because no provider publishes free-tier figures.
 4. **State is in-memory for M1**, with the deviation recorded rather than absorbed. `QuotaTracker` is defined now so M2 can persist behind it.
 5. **Retry recovers failures, never rate limits.** A direct consequence of §6.1 Conservative Compliance Mode.
 6. **Failover stays within one model.** CONSTITUTION §7.2, and a consequence of not yet having capability filtering (M3).
-7. **ADR-0003 defines the key-pool configuration mechanism.** ADR-0002 explicitly requires a deliberate, reviewed mechanism; the existing loader actively rejects the shape the ROADMAP shows.
+7. **ADR-0003 defines the key-pool configuration mechanism.** ADR-0002 explicitly requires a deliberate, reviewed mechanism; the existing loader actively rejects the shape the ROADMAP shows. Issue #51 recorded the compliance findings that constrain it.
+8. **Key pooling is justified as credential redundancy, not capacity.** Google's quota is per-project, so a second key adds no throughput. This is recorded so no future change re-introduces a capacity assumption that is factually wrong.
+9. **No pacing module is built.** §6.1's pacing requirement is not triggered by either provider's terms, and building it speculatively would be unused code.
