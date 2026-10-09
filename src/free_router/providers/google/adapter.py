@@ -5,20 +5,13 @@ Translates the router's internal normalized models to and from the Gemini
 
 Two details are worth knowing before changing this file.
 
-**The timeout covers provider I/O, not routing decisions.** Spec 8 originally
-wrapped connection and response headers in ``asyncio.timeout(0.4)``, on the
-theory that this protected the <500 ms routing envelope. It does not. Measured
-live, provider headers alone take p50 743 ms and up to 2893 ms, so a 400 ms
-window failed almost every real request with a 504. The router's own decision
-path is 0.003 ms, so the <500 ms target (CONSTITUTION 2.5, ROADMAP section 4)
-has ample headroom and is now documented rather than enforced. Spec 8 has been
-amended accordingly.
-
-The window still bounds *connection and headers*, not generation: a model's
-actual generation can take many seconds, so the body must be read *after* it
-closes. That is why dispatch uses ``stream=True`` and reads with ``aread()``
-rather than ``client.post()``, which reads the entire body inside the timeout
-and would turn every real completion into a 504.
+**The timeout is shared, not local.** ``PROVIDER_TIMEOUT_SECONDS`` is resolved
+in :mod:`free_router.providers.timeout` and re-exported here, because it is a
+cross-provider policy read from a single environment variable. Resolving it
+per-adapter would leave two sources of truth that drift the first time the
+default is retuned from measurement. See that module for why the window covers
+provider I/O rather than routing decisions, and why it bounds headers but not
+generation.
 
 **Only the messages the normalizer kept are sent.** M0 honours ``model`` and
 ``messages`` exclusively; ``temperature`` and ``max_tokens`` were already
@@ -43,6 +36,7 @@ import httpx
 
 from free_router.core.exceptions import (
     ProviderAuthError,
+    ProviderRateLimitError,
     ProviderServerError,
     ProviderTimeoutError,
     ProviderValidationError,
@@ -51,6 +45,10 @@ from free_router.core.normalization import (
     FinishReason,
     NormalizedRequest,
     NormalizedResponse,
+)
+from free_router.providers.timeout import (
+    DEFAULT_PROVIDER_TIMEOUT_SECONDS,
+    PROVIDER_TIMEOUT_SECONDS,
 )
 
 __all__ = [
@@ -67,55 +65,6 @@ GOOGLE_API_BASE = "https://generativelanguage.googleapis.com"
 
 API_VERSION = "v1beta"
 """REST path segment. Pinned because the API is versioned independently."""
-
-DEFAULT_PROVIDER_TIMEOUT_SECONDS = 5.0
-"""Default budget for provider connection and response receipt, in seconds.
-
-Sized from live measurement, not from the routing-overhead target. Fifteen live
-calls to ``gemini-3.5-flash-lite`` measured p50 743 ms, p90 2332 ms, and
-2893 ms maximum, so the previous 400 ms window failed real traffic roughly seven
-times out of eight.
-
-That 400 ms came from spec 8, which wrapped the provider call in the same
-budget that CONSTITUTION 2.5 and ROADMAP section 4 set for *routing decisions*.
-Those are different things: the router's own decision path measures 0.003 ms
-(0.015 ms worst case over 2000 iterations), leaving roughly 190,000x headroom
-against its 500 ms target, while every millisecond of the old window was being
-spent on provider network I/O the router does not control. Spec 8 has been
-amended to say so.
-
-The window still covers only connection and response headers, not generation:
-see the module docstring. Overridable via ``ROUTER_PROVIDER_TIMEOUT`` so M1 can
-give each failover attempt its own budget without editing this constant.
-
-``ROUTER_ROUTING_OVERHEAD_BUDGET_MS`` is deliberately *not* wired up. The
-routing path is far too fast for a 500 ms assertion to ever fire, and the
-mechanism would be dead code. Reintroduce it when routing logic is real.
-"""
-
-
-def _resolve_provider_timeout() -> float:
-    """Read ``ROUTER_PROVIDER_TIMEOUT``, falling back to the default.
-
-    Raises:
-        ValueError: If the override is not a positive number. Failing here is
-            better than silently accepting a zero or negative budget, which
-            would time out every request immediately.
-    """
-    raw = os.environ.get("ROUTER_PROVIDER_TIMEOUT")
-    if raw is None:
-        return DEFAULT_PROVIDER_TIMEOUT_SECONDS
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise ValueError(f"ROUTER_PROVIDER_TIMEOUT must be a number, got '{raw}'.") from exc
-    if value <= 0:
-        raise ValueError(f"ROUTER_PROVIDER_TIMEOUT must be positive, got {value}.")
-    return value
-
-
-PROVIDER_TIMEOUT_SECONDS = _resolve_provider_timeout()
-"""Effective provider timeout, in seconds."""
 
 _FINISH_REASON_MAP: Mapping[str, FinishReason] = {
     "STOP": "stop",
@@ -375,6 +324,11 @@ def _raise_for_status_sync(status: int, raw: bytes) -> httpx.Response:
     """Raise the exception matching ``status``, using ``raw`` for classification."""
     if status in (401, 403):
         raise ProviderAuthError("The upstream provider rejected the API credentials.")
+    if status == 429:
+        # A rate limit is a capacity signal, not a malformed request. Mapping it
+        # to the generic 4xx branch reported it to the client as
+        # 400 invalid_request_error, which reads as "your payload is wrong".
+        raise ProviderRateLimitError("The upstream provider is rate limiting this key.")
     if status == 400:
         # Google reports an invalid API key as 400 INVALID_ARGUMENT rather than
         # 401, with the message "API key not valid. Please pass a valid API key."

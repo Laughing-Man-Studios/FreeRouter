@@ -54,7 +54,7 @@ class ProviderAdapter(Protocol):
 
 def supported_providers() -> frozenset[str]:
     """Return the provider names this build can dispatch to."""
-    return frozenset({"google"})
+    return frozenset({"google", "mistral"})
 
 
 def build_adapter(provider: str, http_client: httpx.AsyncClient) -> ProviderAdapter:
@@ -82,6 +82,10 @@ def build_adapter(provider: str, http_client: httpx.AsyncClient) -> ProviderAdap
             # handler and passed to chat_completion, so the adapter itself stays
             # provider-agnostic about which model it serves.
             return GoogleAdapter(http_client=http_client)
+        case "mistral":
+            from free_router.providers.mistral.adapter import MistralAdapter
+
+            return MistralAdapter(http_client=http_client)
 
     raise UnsupportedModelError(
         f"No adapter is registered for provider '{provider}'. "
