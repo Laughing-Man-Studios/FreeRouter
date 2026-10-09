@@ -46,16 +46,25 @@
 
 **Maps to GitHub Issue:** `#7 Mistral Provider Adapter & Identity Registry`
 
-- [ ] **T035: Mistral API verification.** Verify the endpoint, authentication scheme, request/response shape, and error taxonomy against current Mistral documentation. **Do not assume** — Google's invalid key returns `400`, not `401`. Confirm free-tier models and their identifiers.
-- [ ] **T036: Mistral adapter.** Implement the adapter against the revised protocol, with bi-directional translation and error normalization into the existing exception hierarchy. Register it so it is selectable purely through configuration.
-- [ ] **T037: Translation tests.** `respx` tests for success, auth failure, rate limit, server error, and timeout, using fixture shapes verified in T035.
+- [x] **T035: Mistral API verification — complete.** Verified against Mistral's published OpenAPI spec (`docs.mistral.ai/openapi.yaml`, fetched directly) and the error glossary, not from memory. Confirmed: `POST /v1/chat/completions`; `Authorization: Bearer`; required fields `model` + `messages`; roles `system`/`user`/`assistant`/`tool` each `const`-typed; response `choices[0].message.content` with OpenAI-vocabulary `finish_reason`; error envelope `{object, message, type, param, code}`; retryable statuses 429/500/502/503/504.
+  **Three findings changed the implementation:**
+  1. `system` is a *native* role inside `messages`, so nothing is hoisted out the way Gemini's `systemInstruction` requires — the adapter is near-identity.
+  2. **No bad-key-versus-bad-payload heuristic is needed.** Google's requires one because Gemini returns `400 INVALID_ARGUMENT` for a bad key; Mistral documents `401`/`403`. Copying Google's heuristic would be a branch Mistral's taxonomy can never reach.
+  3. Free-tier quota was **read from the workspace console** (see `spec.md` §4). Requests-per-second is a dimension the quota model did not represent, and some models permit **less than 1 RPS**.
+- [x] **T036: Mistral adapter — complete.** `providers/mistral/adapter.py`, registered in `build_adapter` so it is selectable purely through configuration. Translation is close to identity; there is no finish-reason mapping table and no error-body parsing.
+  **Two changes outside the adapter, both deliberate:**
+  - `ProviderRateLimitError` added. `spec.md` § *Error Behaviour* already specified `429 → provider_rate_limited`, but the hierarchy had no such type, so M0 mapped every 4xx — including rate limits — to `ProviderValidationError`. A rate limit was therefore reported to clients as `400 invalid_request_error`. Both providers now map `429` correctly.
+  - Provider timeout resolution extracted to `providers/timeout.py`, shared by both adapters. One environment variable must have one resolved value; a per-adapter copy would be two sources of truth that drift on the first retune.
+- [x] **T037: Translation tests — complete.** `tests/test_mistral_adapter.py` plus integration coverage in `tests/test_integration.py`. Fixture shapes are taken from the OpenAPI spec, including the `422` case, which returns FastAPI's `{detail: [...]}` rather than the documented envelope and so cannot be classified by parsing the body.
 
 **Verification & Stop:**
 
-1. `pytest tests/test_mistral_adapter.py`
-2. `ruff check .`, `mypy --strict src/`
-3. Confirm a Mistral model is served without modification to ingress, routing core, or the Google adapter.
+1. `pytest tests/test_mistral_adapter.py` — 39 tests.
+2. `ruff check .`, `ruff format --check .`, `mypy --strict src/` — all clean. Full suite: 226 passing.
+3. **Seam confirmed.** `api/routes.py`, `core/normalization.py`, and `core/config.py` are **unmodified**. `test_mistral_model_serves_through_the_unchanged_route` proves a Mistral model serves through the identical ingress route, and `test_both_providers_serve_from_one_running_router` proves both coexist in one process. The Google adapter changed only for the two reasons listed above; neither alters how a Google request is dispatched.
 4. **STOP**, review, then close Issue #7.
+
+> **Known gap, deferred to Batch 5 (T024).** `gemini_api_key` remains a **required** configuration field, so a Mistral-only deployment fails at startup. Making provider credentials individually optional belongs with the key-pool configuration work, not here.
 
 ---
 

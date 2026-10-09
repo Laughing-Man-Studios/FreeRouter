@@ -15,6 +15,7 @@ from __future__ import annotations
 __all__ = [
     "ProviderAuthError",
     "ProviderBaseError",
+    "ProviderRateLimitError",
     "ProviderServerError",
     "ProviderTimeoutError",
     "ProviderValidationError",
@@ -107,6 +108,23 @@ class ProviderValidationError(ProviderBaseError):
 
     error_type = "invalid_request_error"
     code = "provider_validation_error"
+
+
+class ProviderRateLimitError(ProviderBaseError):
+    """The provider refused the request for rate-limit reasons; maps to HTTP 429.
+
+    Distinct from :class:`ProviderValidationError` because the two demand
+    opposite responses. A rate limit is a *capacity* signal: retrying the same
+    request immediately makes it worse, and spec "Retry & Failover" forbids
+    retrying into one. A validation error is a request the provider will never
+    accept, so it must not be retried at all. Collapsing the two — as M0 did,
+    mapping every 4xx to a validation error — reports a rate limit to the
+    client as ``400 invalid_request_error``, which reads as "the client sent
+    something wrong" and sends an operator to debug their payload.
+    """
+
+    error_type = "rate_limit_error"
+    code = "provider_rate_limited"
 
 
 class ProviderServerError(ProviderBaseError):

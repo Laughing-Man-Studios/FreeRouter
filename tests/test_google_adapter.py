@@ -75,11 +75,16 @@ def test_supported_providers_includes_google() -> None:
 
 
 def test_build_adapter_rejects_unknown_provider(http_client: httpx.AsyncClient) -> None:
-    """An unregistered provider is refused rather than silently dispatched."""
-    with pytest.raises(UnsupportedModelError) as excinfo:
-        build_adapter("mistral", http_client)
+    """An unregistered provider is refused rather than silently dispatched.
 
-    assert "mistral" in excinfo.value.message
+    The name used to be ``mistral``, back when it was the obvious example of a
+    provider that did not exist yet. It is registered now, so using it here
+    would have quietly stopped testing anything.
+    """
+    with pytest.raises(UnsupportedModelError) as excinfo:
+        build_adapter("anthropic", http_client)
+
+    assert "anthropic" in excinfo.value.message
 
 
 # --- Request translation (T011) ---

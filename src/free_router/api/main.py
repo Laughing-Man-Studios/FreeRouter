@@ -31,6 +31,7 @@ from free_router.core.config import Config, ConfigError, load_config
 from free_router.core.exceptions import (
     ProviderAuthError,
     ProviderBaseError,
+    ProviderRateLimitError,
     ProviderServerError,
     ProviderTimeoutError,
     ProviderValidationError,
@@ -54,6 +55,7 @@ PROVIDER_ERROR_STATUS_MAP: dict[type[RouterBaseError], int] = {
     # by. ProviderValidationError must precede ProviderBaseError's 502 fallback,
     # and ProviderAuthError must precede ProviderValidationError's 400.
     ProviderTimeoutError: 504,
+    ProviderRateLimitError: 429,
     ProviderAuthError: 401,
     ProviderValidationError: 400,
     ProviderServerError: 502,

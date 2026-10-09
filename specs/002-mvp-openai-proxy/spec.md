@@ -63,6 +63,7 @@ M1 makes the router survive that. It adds a key pool, quota awareness with coold
 ### 4. Level 1 Quota & Cooldown
 
 - The quota model must use a generic internal representation so that additional dimensions can be added later without rewriting the routing engine (ROADMAP §3.5).
+- **The dimensions are per-minute token rate, per-second request rate, and token budget.** Per-second request rate is included because Mistral enforces it as a distinct ceiling that a client can exceed without ever breaching a per-minute limit — see the finding below.
 - Level 1 dimensions are static configuration values. **For Google these values are deliberately conservative placeholders, not published figures** — see the finding below. They must be tuned from measured success rate rather than asserted as authoritative.
 - Where a provider publishes authoritative limits, the value must match that documentation. Where it does not, the configuration must be treated as a tunable estimate.
 - Every dispatch must follow the reservation cycle: estimate → reserve → dispatch → reconcile (CONSTITUTION §8.2).
@@ -77,19 +78,54 @@ M1 makes the router survive that. It adds a key pool, quota awareness with coold
 >   behind sign-in. There is **no authoritative published RPM/TPM/RPD for
 >   `gemini-3.5-flash-lite`**. Third-party figures conflict (5–15 RPM, ~250k TPM, 1,000–1,500 RPD
 >   depending on model and vintage).
-> - **Mistral** likewise publishes no free-tier numbers; live values are visible only in the console
->   under Admin → Limits. Third-party estimates conflict by an order of magnitude (1 RPS vs 1 RPM vs
->   30 RPM).
+> - **Mistral** publishes no free-tier figures either. Its console lists them per model, and those
+>   values were **read directly from the workspace console** (Issue #7) — see below.
 >
 > ROADMAP §2 requires quota values be "verified against current provider documentation rather than
-> hard-coded assumptions." That cannot be satisfied for either provider from published sources. M1
-> therefore ships **conservative placeholder values marked as unverified**, tunes them from measured
-> success rate, and treats the published figures as unavailable rather than guessed. Populating them
-> precisely would require measuring against the live API, consuming free quota to do so — rejected
-> for M1 as a poor trade against the ~1 RPS free-tier ceiling.
+> hard-coded assumptions." That cannot be satisfied for either provider from published sources.
+>
+> **Mistral's values are measured, not published.** Read from the free-tier workspace console
+> (2026-10-08), they are authoritative *for that workspace* and are recorded as such — a genuine
+> improvement on placeholders, but not a claim of provider authority. They can differ per account,
+> region, or plan and can change without notice.
+>
+> | Model | TPM | RPS |
+> | --- | --- | --- |
+> | `ministral-3b-2512` | 1,300,000 | 12.50 |
+> | `ministral-8b-2512` | 625,000 | 3.13 |
+> | `ministral-14b-2512` | 937,500 | **0.50** |
+> | `labs-leanstral-1-5-1` | 5,000,000 | 0.63 |
+> | `mistral-large-2512` | 250,000 | 1.00 |
+> | `mistral-medium-latest` | 20,000 | 1.00 |
+> | `mistral-small-2603` | 20,000 | 1.00 |
+> | `mistral-large-4` | 20,000 | 0.83 |
+>
+> **Google's values remain conservative placeholders.** The two providers are therefore in different
+> evidentiary positions, and the configuration must record which is which rather than presenting them
+> uniformly.
 >
 > The requirement this most directly qualifies is ROADMAP §2's verification clause. It is recorded
 > here rather than quietly unmet.
+>
+> **Finding (Issue #7): Mistral's quota is expressed per *second*, not per minute — and some models
+> permit less than one request per second.**
+>
+> `ministral-14b-2512` allows **0.50 RPS** and `labs-leanstral-1-5-1` **0.63 RPS**. A client issuing
+> one request per second overshoots those ceilings by 2× and 1.6× respectively and is rate-limited
+> immediately.
+>
+> The quota model here was written around per-minute dimensions with a daily reset — Google's shape.
+> **Requests-per-second is a dimension it does not currently represent.** The tracker must handle it,
+> or cooldown arithmetic that counts only per-minute will let these models through at double their
+> real ceiling.
+>
+> This is emphatically **not** grounds for building the pacing module T039 skipped. Pacing is still
+> not required by Mistral's terms; this is the opposite obligation — stay *under* a limit the router
+> can compute, rather than throttling to a policy it was never given.
+>
+> **No daily (requests-per-day) limit is shown** for Mistral. The console displays only TPM and RPS.
+> Absence from that table is not evidence that no daily ceiling exists, so Mistral's daily budget
+> remains **unverified** and is not modelled as unlimited.
 
 ### 5. Retry & Failover
 
@@ -272,6 +308,24 @@ All failures continue to return the OpenAI-compatible error envelope established
 - **Payload exclusion remains absolute** for operational logs and databases (CONSTITUTION §9.1). Debug payload logging is opt-in and isolated.
 - **No prompts or completions in `request_logs`.** The M0 schema has no such columns and none may be added.
 - **Compliance Mode is a security control, not paperwork.** The key cap and pacing requirement exist to reduce the risk of account suspension. They must be enforced in code, not merely documented.
+
+> **Prerequisite, not code: Mistral's free tier trains on prompts unless told not to.**
+>
+> Mistral's help centre states that *"Customers with pay-as-you-go enabled are opted out of training
+> by default"* and that *"Users in **Free mode** may opt out of data training for Mistral Studio and
+> related API services"* via **Admin → Privacy → Anonymous improvement data**. The opt-out is
+> something a free-mode user *performs*; it is not a default.
+>
+> This project is strictly $0 (CONSTITUTION §1), so the paid tier's default opt-out is not
+> available. Sending prompts to the Mistral adapter therefore **requires** that toggle to be off,
+> or CONSTITUTION §9.1 is violated at the provider rather than at the router. The router not logging
+> prompts does not compensate for the provider training on them.
+>
+> **This is a workspace console setting, not a property of the provider, and nothing in this
+> repository can enforce or verify it.** A new workspace defaults back to opted-in. It is recorded
+> here as a documented manual prerequisite rather than implemented, because Mistral exposes no API to
+> query the setting — without this note the toggle is one workspace-clone away from being silently
+> lost. Confirmed off for the development workspace on 2026-10-08.
 
 ## Explicit Non-Goals
 
