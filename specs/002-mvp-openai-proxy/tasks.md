@@ -11,7 +11,7 @@
 - Use `gh` to update the corresponding GitHub Issue status.
 - Do not proceed to the next batch until the current batch is verified and human review is complete.
 
-**Task IDs continue from M0** (which used T001–T019). **Task IDs are stable identifiers, not execution order** — the sequence below was revised on 2026-10-08 and Batch 2's tasks are T035–T037 while Batch 5's are T023–T026. Follow the batch numbers, not the ID range.
+**Task IDs continue from M0** (which used T001–T019). **Task IDs are stable identifiers, not execution order** — the sequence has been revised twice, so ID ranges no longer track batch numbers. Batch 2 holds T035–T037, Batch 4 holds T023–T026, and Batch 5 holds T031–T034. Follow the batch numbers, not the ID range.
 
 ---
 
@@ -88,7 +88,26 @@
 
 ---
 
-## Batch 4: Error Handling, Retries & Failover
+## Batch 4: Key Pool & Identity Registry
+
+**Maps to GitHub Issue:** `#8 Key Pool Manager & Simple LRU Key Selection`
+
+- [ ] **T023: Configuration schema.** Extend `config.yaml` handling for pooled keys per ADR-0003, enforcing the cap concluded in T020 as a **configuration validation error**, not a convention. Key material remains environment-only; the loader must continue to reject any secret-named field or `${VAR}` reference in `config.yaml` (ADR-0002).
+- [ ] **T024: Identity registry.** Introduce `provider/model` identity distinct from the external OpenAI identifier, supporting multiple providers without routing-core changes. Unknown models resolve to `UnsupportedModelError` as in M0.
+- [ ] **T025: Key manager.** Implement the pool and deterministic LRU selection over eligible keys, with `KeyRef` carrying a loggable alias and a `SecretStr`. Inject a clock; do not read wall time.
+- [ ] **T026: Eligibility and concurrency guard.** Exclude cooling and exhausted keys from selection. Guard selection and state mutation with an `asyncio.Lock` held only across in-memory updates — never across provider I/O. Log `key_alias` and `selection_reason`.
+
+**Verification & Stop:**
+
+1. `pytest tests/test_key_manager.py tests/test_config.py`
+2. `ruff check .`, `ruff format --check .`, `mypy --strict src/`
+3. Confirm no test or log output contains key material — assert the alias appears and the secret does not.
+4. Confirm a cooling key is never selected, and that concurrent requests cannot both take the last eligible key.
+5. **STOP**, review, then close Issue #8.
+
+---
+
+## Batch 5: Error Handling, Retries & Failover
 
 **Maps to GitHub Issue:** `#10 Error Handling, 429/5xx Retries & Failover Policies`
 
@@ -106,25 +125,6 @@
 5. Confirm an explicit model request never fails over to another model.
 6. Confirm no eligible key yields a normalized `503` without dispatching.
 7. **STOP**, review, then close Issue #10.
-
----
-
-## Batch 5: Key Pool & Identity Registry
-
-**Maps to GitHub Issue:** `#8 Key Pool Manager & Simple LRU Key Selection`
-
-- [ ] **T023: Configuration schema.** Extend `config.yaml` handling for pooled keys per ADR-0003, enforcing the cap concluded in T020 as a **configuration validation error**, not a convention. Key material remains environment-only; the loader must continue to reject any secret-named field or `${VAR}` reference in `config.yaml` (ADR-0002).
-- [ ] **T024: Identity registry.** Introduce `provider/model` identity distinct from the external OpenAI identifier, supporting multiple providers without routing-core changes. Unknown models resolve to `UnsupportedModelError` as in M0.
-- [ ] **T025: Key manager.** Implement the pool and deterministic LRU selection over eligible keys, with `KeyRef` carrying a loggable alias and a `SecretStr`. Inject a clock; do not read wall time.
-- [ ] **T026: Eligibility and concurrency guard.** Exclude cooling and exhausted keys from selection. Guard selection and state mutation with an `asyncio.Lock` held only across in-memory updates — never across provider I/O. Log `key_alias` and `selection_reason`.
-
-**Verification & Stop:**
-
-1. `pytest tests/test_key_manager.py tests/test_config.py`
-2. `ruff check .`, `ruff format --check .`, `mypy --strict src/`
-3. Confirm no test or log output contains key material — assert the alias appears and the secret does not.
-4. Confirm a cooling key is never selected, and that concurrent requests cannot both take the last eligible key.
-5. **STOP**, review, then close Issue #8.
 
 ---
 
@@ -148,11 +148,28 @@
 
 ## Ordering Rationale
 
-Failover is built before the second provider because CONSTITUTION §7.2 forbids cross-model failover for an explicitly requested model. A Mistral adapter therefore does not improve reliability for a client asking for a Google model — it only adds capability. The key pool, quota, and failover chain is what moves the success rate, so it ships first.
+**Revised 2026-10-11: Batches 4 and 5 were swapped.** The key pool now runs before retry and failover.
 
-**Revised after Issue #51.** Because Google's quota is per-project, the key pool does not add capacity there either. Retry (Batch 4) is now the primary reliability mechanism, which strengthens rather than weakens this ordering — the failover chain still ships before the second provider.
+The original order was unimplementable. T033 — *"on `429` or a retryable fault, move to the next eligible key"* — requires a pool of eligible keys to move **to**, and that pool did not exist until the following batch. Failover was specified against a component that had not been built yet.
 
-Batch 1 precedes everything because its conclusions — the key cap and whether pacing is required — are inputs to the key manager's contract, not documentation written afterwards.
+The corrected sequence:
+
+```text
+Batch 1  Compliance evaluation & policy foundation   ✅ #51 closed
+Batch 2  Mistral adapter & identity registry         ✅ #7 closed
+Batch 3  Quota & cooldown                            #9
+Batch 4  Key pool & identity registry                #8
+Batch 5  Error handling, retries & failover          #10
+Batch 6  Debug logging & milestone verification      #6
+```
+
+Each batch now depends only on what precedes it. Batch 3 supplies the cooldown state that Batch 4's eligibility filter reads; Batch 4 supplies the eligible keys that Batch 5's failover moves between.
+
+**Why the Mistral adapter moved ahead of the key pool (Issue #51).** Google's rate limits are **per-project, not per-API-key**: all keys in a project share one quota bucket. Two keys on one project therefore cannot fail independently, and so cannot exercise the paths the key pool exists to test. A genuinely independent provider can.
+
+**What still carries the success rate.** Because Google's quota is per-project, the key pool adds **credential redundancy, not capacity**, and retry (Batch 5) is the primary reliability mechanism against the ≥80% target. Batch 1 precedes everything because its conclusions — the per-provider key cap and whether pacing is required — are inputs to the key manager's contract, not documentation written afterwards.
+
+CONSTITUTION §7.2 continues to forbid cross-model failover for an explicitly requested model, so the Mistral adapter adds capability and independent-provider testing, not automatic failover for a client that named a Google model.
 
 ## Non-Goals for M1
 
