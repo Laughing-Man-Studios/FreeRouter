@@ -1,8 +1,14 @@
 """Provider timeout configuration.
 
-The budget is resolved from the environment at import. These tests re-import the
-module rather than patching the constant, because resolution happens at import
-time and a test that patches the attribute would not exercise that at all.
+The budget is resolved from the environment at import, in
+:mod:`free_router.providers.timeout`. These tests re-import that module rather
+than patching the constant, because resolution happens at import time and a test
+that patches the attribute would not exercise that at all.
+
+The tests target the timeout module rather than an adapter because resolution is
+shared: it was extracted out of the Google adapter when the Mistral adapter
+needed the same value, so that one environment variable has one source of truth
+instead of two that drift.
 """
 
 import importlib
@@ -10,7 +16,9 @@ from collections.abc import Iterator
 
 import pytest
 
-from free_router.providers.google import adapter as adapter_module
+from free_router.providers import timeout as adapter_module
+from free_router.providers.google import adapter as google_adapter
+from free_router.providers.mistral import adapter as mistral_adapter
 
 
 @pytest.fixture
@@ -86,3 +94,14 @@ def test_module_exposes_both_names() -> None:
     """
     assert hasattr(adapter_module, "DEFAULT_PROVIDER_TIMEOUT_SECONDS")
     assert hasattr(adapter_module, "PROVIDER_TIMEOUT_SECONDS")
+
+
+def test_both_adapters_share_one_resolved_value() -> None:
+    """Adapters must not each resolve the budget independently.
+
+    A per-adapter copy would be two sources of truth for one environment
+    variable, and the first retune of the default from measurement would leave
+    one provider on the old value.
+    """
+    assert google_adapter.PROVIDER_TIMEOUT_SECONDS == adapter_module.PROVIDER_TIMEOUT_SECONDS
+    assert mistral_adapter.PROVIDER_TIMEOUT_SECONDS == adapter_module.PROVIDER_TIMEOUT_SECONDS

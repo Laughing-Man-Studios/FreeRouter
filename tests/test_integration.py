@@ -11,6 +11,8 @@ between layers without touching the network or spending quota.
 
 import json
 import sqlite3
+from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -19,7 +21,9 @@ import respx
 from conftest import LogRecorder
 from fastapi.testclient import TestClient
 
+from free_router.core.config import load_config
 from free_router.providers.google.adapter import GOOGLE_API_BASE
+from free_router.providers.mistral.adapter import MISTRAL_API_BASE, MISTRAL_CHAT_PATH
 
 GENERATE_URL = f"{GOOGLE_API_BASE}/v1beta/models/gemini-3.5-flash-lite:generateContent"
 
@@ -238,6 +242,7 @@ def test_multi_part_response_is_joined(client: TestClient) -> None:
     ("exception_name", "expected_status"),
     [
         ("ProviderAuthError", 401),
+        ("ProviderRateLimitError", 429),
         ("ProviderValidationError", 400),
         ("ProviderServerError", 502),
         ("ProviderTimeoutError", 504),
@@ -629,3 +634,209 @@ def test_network_error_maps_to_a_client_error(client: TestClient) -> None:
     error = response.json()["error"]
     assert error["code"].startswith("provider_")
     assert error["type"] in ("api_error", "timeout_error")
+
+
+# --- Second provider: the seam holds (T036) ---
+
+
+MISTRAL_MODEL = "ministral-3b-2512"
+"""Per Issue #7, the most permissive model on the free tier by a wide margin."""
+
+MISTRAL_CONFIG = f"""\
+models:
+  - id: "google/gemini-3.5-flash-lite"
+    provider: "google"
+    provider_id: "gemini-3.5-flash-lite"
+  - id: "mistral/{MISTRAL_MODEL}"
+    provider: "mistral"
+    provider_id: "{MISTRAL_MODEL}"
+"""
+
+MISTRAL_CHAT_URL = f"{MISTRAL_API_BASE}{MISTRAL_CHAT_PATH}"
+
+
+def mistral_response(text: str = "hello from mistral") -> dict[str, Any]:
+    """Build a realistic ``chat.completions`` success body."""
+    return {
+        "id": "cmpl-e5cc70bb28c444948073e77776eb30ef",
+        "object": "chat.completion",
+        "created": 1702256327,
+        "model": MISTRAL_MODEL,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7},
+    }
+
+
+@pytest.fixture
+def mistral_client(
+    workdir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[TestClient]:
+    """A started app configured with both providers.
+
+    ``gemini_api_key`` is still a required configuration field, so a Mistral-only
+    deployment is not expressible yet. That is a Batch 5 (key pool) concern; the
+    tests here use both providers so the constraint does not hide the behaviour
+    being verified.
+    """
+    from free_router.api.main import create_app
+
+    (workdir / "config.yaml").write_text(MISTRAL_CONFIG, encoding="utf-8")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-mistral-key")
+    monkeypatch.setenv("ROUTER_DB_PATH", str(tmp_path / "router.db"))
+
+    with TestClient(create_app()) as started:
+        yield started
+
+
+@respx.mock
+def test_mistral_model_serves_through_the_unchanged_route(mistral_client: TestClient) -> None:
+    """T036: a second provider is a configuration change, not a code change.
+
+    This is the acceptance criterion for the adapter. Both providers are in one
+    config, only the Mistral one is requested, and the identical ingress route
+    returns an identical OpenAI response envelope. Nothing in the ingress layer,
+    the routing core, or the Google adapter is exercised differently.
+    """
+    route = respx.post(MISTRAL_CHAT_URL).mock(
+        return_value=httpx.Response(200, json=mistral_response())
+    )
+
+    response = mistral_client.post(
+        "/v1/chat/completions",
+        json={"model": f"mistral/{MISTRAL_MODEL}", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["object"] == "chat.completion"
+    assert body["model"] == f"mistral/{MISTRAL_MODEL}"
+    assert body["choices"][0]["message"]["content"] == "hello from mistral"
+    assert body["choices"][0]["finish_reason"] == "stop"
+
+    # The Google endpoint was never touched: dispatch followed the config. Only
+    # the Mistral route is mocked, and respx.mock asserts every outbound request
+    # matches a route, so a call to Gemini would have failed this test outright.
+    assert route.call_count == 1
+
+    # The provider-native id is what was sent, not the router's external id.
+    sent = json.loads(route.calls[0].request.content)
+    assert sent["model"] == MISTRAL_MODEL
+
+
+@respx.mock
+def test_both_providers_serve_from_one_running_router(mistral_client: TestClient) -> None:
+    """Google and Mistral coexist in one process, selected purely by model id.
+
+    The point of the adapter seam is that a second provider costs a config
+    entry. If this needed anything beyond a different model id in the request,
+    the seam would not be doing its job.
+    """
+    google_route = respx.post(GENERATE_URL).mock(
+        return_value=httpx.Response(200, json=gemini_response())
+    )
+    mistral_route = respx.post(MISTRAL_CHAT_URL).mock(
+        return_value=httpx.Response(200, json=mistral_response("hello from mistral"))
+    )
+
+    google_response = mistral_client.post(
+        "/v1/chat/completions",
+        json={"model": MODEL, "messages": [{"role": "user", "content": "hi"}]},
+    )
+    mistral_http_response = mistral_client.post(
+        "/v1/chat/completions",
+        json={"model": f"mistral/{MISTRAL_MODEL}", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert google_response.status_code == 200
+    assert mistral_http_response.status_code == 200
+    assert google_response.json()["choices"][0]["message"]["content"] == "hello from gemini"
+    assert mistral_http_response.json()["choices"][0]["message"]["content"] == "hello from mistral"
+    assert google_route.called
+    assert mistral_route.called
+
+
+@respx.mock
+def test_mistral_rate_limit_surfaces_as_429_not_400(mistral_client: TestClient) -> None:
+    """A rate limit is capacity, not a malformed request.
+
+    Reporting it as 400 invalid_request_error tells the client operator that
+    their payload is wrong, which sends them to debug the wrong thing entirely.
+    """
+    respx.post(MISTRAL_CHAT_URL).mock(
+        return_value=httpx.Response(429, json={"object": "error", "type": "rate_limit_error"})
+    )
+
+    response = mistral_client.post(
+        "/v1/chat/completions",
+        json={"model": f"mistral/{MISTRAL_MODEL}", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 429
+    error = response.json()["error"]
+    assert error["code"] == "provider_rate_limited"
+    assert error["type"] == "rate_limit_error"
+
+
+@respx.mock
+def test_google_rate_limit_surfaces_as_429_not_400(client: TestClient) -> None:
+    """The same fix applies to the provider that shipped in M0.
+
+    M0 routed every 4xx to ProviderValidationError, so a Google 429 was
+    reported to the client as a 400 payload error.
+    """
+    respx.post(GENERATE_URL).mock(
+        return_value=httpx.Response(429, json={"error": {"status": "RESOURCE_EXHAUSTED"}})
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": MODEL, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 429
+    assert response.json()["error"]["code"] == "provider_rate_limited"
+
+
+@respx.mock
+def test_mistral_auth_failure_surfaces_as_401(mistral_client: TestClient) -> None:
+    respx.post(MISTRAL_CHAT_URL).mock(
+        return_value=httpx.Response(401, json={"object": "error", "type": "authentication_error"})
+    )
+
+    response = mistral_client.post(
+        "/v1/chat/completions",
+        json={"model": f"mistral/{MISTRAL_MODEL}", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "provider_auth_error"
+
+
+def test_mistral_model_requires_no_schema_change(
+    workdir: Path, set_api_key: Callable[[], str]
+) -> None:
+    """A Mistral entry is accepted by the existing model configuration unchanged.
+
+    T024 introduces a general provider/model identity registry. Until then this
+    asserts what is true now: ``ModelConfig`` already carries provider and
+    provider_id, so a second provider is a config entry rather than a change to
+    the configuration schema.
+    """
+    set_api_key()
+    path = workdir / "config.yaml"
+    path.write_text(MISTRAL_CONFIG, encoding="utf-8")
+
+    config = load_config()
+
+    assert [entry.id for entry in config.models] == [
+        "google/gemini-3.5-flash-lite",
+        f"mistral/{MISTRAL_MODEL}",
+    ]
+    assert config.models[1].provider == "mistral"
