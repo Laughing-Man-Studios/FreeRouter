@@ -72,7 +72,15 @@
 
 **Maps to GitHub Issue:** `#9 Static Quota Counters & Conservative Cooldown State`
 
-- [ ] **T027: Generic quota dimensions.** Implement the Level 1 dimension representation (requests per window, tokens per window, daily requests) as configuration, so a new dimension requires no tracker change.
+- [x] **T027: Generic quota dimensions — complete.** `quota/dimensions.py` plus a `quota` block on `ModelConfig` and a router-wide `QuotaConfig`. A dimension is `(resource, limit, window_seconds, reset, provenance)`, so adding a provider's limits is a config change rather than a code change.
+  **Three decisions, each made against a rejected alternative:**
+  1. **Requests-per-second and requests-per-minute are the same resource over different windows.** Making RPS a separate kind would have put a provider-specific branch through the reservation cycle, which is the thing T027 exists to prevent.
+  2. **No way to express "unlimited".** `limit` is a required positive number. RPD is unverified for both providers, and an optional limit meaning unlimited would convert *"we do not know this limit"* into *"this limit is infinite"* — the router would sail past a real ceiling while reporting full headroom. An unknown dimension is **omitted**, which is a visible gap rather than a false guarantee.
+  3. **`provenance` is required, not defaulted** — `published` / `measured` / `placeholder`. Google's values are placeholders and Mistral's were measured; neither is provider-published, and a defaulted field would let a guess read as an authority.
+
+  **A real bug the tests caught before it shipped.** `limit` was first typed `int`, which cannot express Mistral's `ministral-14b-2512` ceiling of **0.50 requests/second** (nor `labs-leanstral-1-5-1` at 0.63). Rounding 0.5 up to 1 would dispatch at **twice** the permitted rate against a provider that enforces the ceiling per second. `limit` is now a `float`, with a configuration-level regression test.
+
+  **Also rejected during implementation.** A `from_mapping` classmethod on the dimension, written against a stdlib dataclass. Pydantic auto-converted the dataclass, which made the classmethod unreachable and turned `reset` into a mandatory field. The representation is now a pydantic model, matching the rest of the codebase.
 - [ ] **T028: Reservation cycle.** Implement estimate → reserve → dispatch → reconcile (CONSTITUTION §8.2) with a configurable safety margin on token estimation. Reconciliation must tolerate providers that report no usage.
 - [ ] **T029: Cooldown state.** Implement cooldown entry with per-provider/model configurable duration. A `429` marks the key cooling; it must never be retried immediately (CONSTITUTION §6.1).
 - [ ] **T030: Context-overload circuit breaker.** On a hard context-length-exceeded response, mark the model degraded for large-context requests rather than retrying it.

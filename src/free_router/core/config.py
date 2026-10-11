@@ -25,6 +25,8 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
+from free_router.quota.dimensions import QuotaDimension
+
 DEFAULT_CONFIG_FILENAME = "config.yaml"
 """Filename looked up in the current working directory when no path is given."""
 
@@ -70,6 +72,32 @@ class ModelConfig(BaseModel):
     id: str
     provider: str
     provider_id: str
+    quota: list[QuotaDimension] = Field(default_factory=list)
+    """Level 1 quota limits for this model.
+
+    Deliberately keyed on ``(provider, provider_id)`` rather than on a key
+    alias: Google's limits apply per *project*, so two keys in one project share
+    one bucket and a per-key counter would report headroom that does not exist.
+    See :mod:`free_router.quota.dimensions`.
+
+    Empty means no dimensions are enforced. An unverified limit is omitted
+    rather than declared infinite, because an omitted dimension is a visible gap
+    while an infinite one would be a false guarantee.
+    """
+
+
+class QuotaConfig(BaseModel):
+    """Router-wide quota behaviour shared by every provider."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    estimation_safety_margin: float = Field(default=1.1, gt=1.0)
+    """Multiplier applied to estimated tokens before reserving (CONSTITUTION §8.2).
+
+    Must exceed 1.0. An estimate below the true figure reserves less capacity
+    than the request will consume, which is precisely the overshoot the
+    reservation cycle exists to prevent.
+    """
 
 
 class Config(BaseSettings):
@@ -87,6 +115,7 @@ class Config(BaseSettings):
 
     models: list[ModelConfig] = Field(min_length=1)
     gemini_api_key: SecretStr
+    quota: QuotaConfig = Field(default_factory=QuotaConfig)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
     @classmethod
