@@ -689,6 +689,8 @@ The service can reliably pass requests between OpenHands/another OpenAI-compatib
 
 *Added at M1 planning (`specs/002-mvp-openai-proxy`): the achieved success rate must also be **measured and recorded** against the ≥80% MVP criterion, with the measurement conditions stated. A measured rate materially below target is treated as information informing M2's priorities, not as milestone failure — but it must never be left unmeasured.*
 
+*Added 2026-10-12, after measured free-tier limits were obtained: "conditions stated" explicitly includes **request volume**, total and per model per day. A success rate is uninterpretable without it — measured against `gemini-3.5-flash-lite`'s 500 RPD, a 60% rate at 40 requests/day and a 60% rate at 600 requests/day are different findings. Above the daily ceiling the shortfall is partly provider capacity rather than router defect, and the two must not be conflated by the reader. The full recording requirement lives in `specs/002-mvp-openai-proxy/spec.md` § *Measuring the success rate*.*
+
 ---
 
 ## Milestone 2: Persistent & Interactive MVP

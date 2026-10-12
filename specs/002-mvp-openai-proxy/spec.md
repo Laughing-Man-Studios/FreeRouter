@@ -480,7 +480,46 @@ The free tier's actual size is far smaller than assumed — see *Google's free t
 
 Two keys in one Google project provide credential redundancy but no additional capacity. The M0 deployment target of "~1 key per provider" is therefore unchanged in practice, and the two-key scenario is exercised mainly against Mistral.
 
-## Definition of Done
+## Measuring the success rate
+
+**Decided 2026-10-12, after the measured Google limits were obtained.** One metric, not two, plus
+request volume as a recorded condition.
+
+**A single success rate is kept.** A second "dispatchable" rate — successes among requests that
+occurred while quota remained — was considered and **rejected**. With 500 RPD per Lite model the daily
+ceiling rarely binds at single-user volumes, so the raw rate is normally informative; the split adds
+instrumentation and a second number to interpret in exchange for little. If a future measurement shows
+the ceiling binding regularly, the split is the right response and is recorded here as the change to
+make at that point.
+
+**Request volume is recorded alongside the rate, because the rate is uninterpretable without it.**
+A 60% success rate means something entirely different at 40 requests/day than at 600. The relevant
+arithmetic is in *Risk Assessment*:
+
+| Requests/day | Ceiling on success rate |
+| --- | --- |
+| 500 | 100% |
+| **625** | **80%** |
+| 1,000 | 50% |
+
+At or below 500/day the provider imposes no ceiling at all, so any shortfall is the router's. Above
+that, part of the shortfall is capacity and the two must not be conflated by the reader.
+
+### What must be recorded at close-out
+
+- **The success rate**, and the number of requests it was measured over.
+- **Request volume**, in total and per model per day.
+- **The provider and model** served, since the limits differ by 25× between Lite and non-Lite.
+- **The conditions**: whether the quota tracker was active, whether retry and failover were enabled,
+  and whether any measurement window coincided with a known console-reported usage figure.
+- **Any request volume approaching the daily ceiling**, called out explicitly, so a shortfall is not
+  read as a router defect when it is capacity.
+
+ROADMAP §4 already requires the achieved rate to be measured and recorded with its conditions stated,
+and explicitly treats a rate materially below target as information for M2 rather than milestone
+failure. **This section makes "conditions" concrete rather than restating the obligation.**
+
+</newString>## Definition of Done
 
 Per `docs/SDD_WORKFLOW.md` §21, and with CONSTITUTION as the governing standard:
 
@@ -488,8 +527,8 @@ Per `docs/SDD_WORKFLOW.md` §21, and with CONSTITUTION as the governing standard
 - [ ] Relevant unit and integration tests pass
 - [ ] Issue #51 closed — compliance evaluation and quota research complete
 - [ ] ADR-0003 and ADR-0004 recorded
-- [ ] Measured success rate recorded against the ≥80% target, with conditions stated
-- [ ] Quota configuration values marked as unverified placeholders, not presented as published figures
+- [ ] **Measured success rate recorded against the ≥80% target as a single metric**, with conditions stated — including **request volume**, which is what makes the rate interpretable
+- [ ] Quota configuration values carry their measured provenance, and any dimension that remains unverified is **omitted rather than guessed**
 - [ ] No claim appears anywhere that a second Google key adds quota capacity
 - [ ] No secrets in source, configuration, or logs
 - [ ] No out-of-scope functionality introduced
