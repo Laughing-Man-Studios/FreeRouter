@@ -97,7 +97,16 @@
   **`reconcile` cannot fail a request that already succeeded.** A provider reporting *more* tokens than estimated is recorded as genuine over-spend and `available()` goes False from then on. Unwinding would let the router keep dispatching against a limit it has demonstrably passed.
 
   Verified empirically, not only by unit test: 200 concurrent racers against a 7 RPS limit admit exactly 7.
-- [ ] **T029: Cooldown state.** Implement cooldown entry with per-provider/model configurable duration. A `429` marks the key cooling; it must never be retried immediately (CONSTITUTION §6.1).
+- [x] **T029: Cooldown state — complete.** `quota/cooldown.py`, plus `cooldown_seconds` on `ModelConfig`.
+  **Cooldown is keyed on `(provider, model)`, not on a key.** Cooling one Google key would move the same request to a sibling key drawing on the same exhausted project bucket. Google's own quota identifier — `GenerateRequestsPerMinutePerProjectPerModel`, dimensions `{location: 'global', model: ...}` — confirms the granularity. **This deviates from `plan.md`,** whose `KeyManager` interface has `enter_cooldown(key, ...)`.
+  **The wait is the maximum of the provider hint and the configured floor, never the minimum.** Google's quota errors carry `google.rpc.RetryInfo` with `retryDelay` such as `"16s"`, and the standard `Retry-After` header is parsed in both documented forms. A hint of 5s against a 60s floor yields 60s: shortening the wait is exactly the retry-into-a-rate-limit that CONSTITUTION §6.1 prohibits.
+  **No exponential backoff, by decision.** Backing off and retrying the same bucket is retrying into a rate limit with extra steps.
+  **Expiry is evaluated lazily on read**, so there is no timer task to be a second source of truth or to cancel on shutdown.
+  **`enter_until` exists because a duration is the wrong shape for the dominant failure.** With a ~20 RPD free tier, a daily budget exhausted at 23:50 cannot be retried in sixty seconds.
+
+  **Research finding recorded in `spec.md` § *Risk Assessment* — this one is large.** Google's free tier is now **~20 requests per day per model**, reduced from 50 RPD in February 2026 and confirmed by Google staff: *"The main goal of the free tier is to try and give people a sense of what the model can do for early testing. It was not designed to be a long term solution to build things on top of."* The 1,000–1,500 RPD figures this project had been carrying are **stale by two orders of magnitude**. At 20 RPD the **≥80% success target is unreachable by any router improvement** — the ceiling is the provider's. Three options are recorded for the operator; none is applied silently.
+
+  Also recorded: Google names the metric and limit in the error body, so the provider's authoritative numbers are readable at the moment of refusal. That is an M2 opportunity, not M1 work.
 - [ ] **T030: Context-overload circuit breaker.** On a hard context-length-exceeded response, mark the model degraded for large-context requests rather than retrying it.
 
 **Verification & Stop:**

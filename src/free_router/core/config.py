@@ -72,6 +72,17 @@ class ModelConfig(BaseModel):
     id: str
     provider: str
     provider_id: str
+    cooldown_seconds: float = Field(default=60.0, gt=0)
+    """How long to wait after a rate limit before this model may be dispatched again.
+
+    Per provider/model rather than global (spec "Configuration is the source of
+    non-secret policy"): a provider whose window rolls over in a minute and one
+    whose daily budget resets at midnight Pacific must not share a value.
+
+    This is a **floor**. A provider that states its own retry delay wins when it
+    asks for longer, never when it asks for less -- CONSTITUTION §6.1 forbids
+    retrying into a rate limit, and shortening the wait is precisely that.
+    """
     quota: list[QuotaDimension] = Field(default_factory=list)
     """Level 1 quota limits for this model.
 

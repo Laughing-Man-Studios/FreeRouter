@@ -76,8 +76,13 @@ M1 makes the router survive that. It adds a key pool, quota awareness with coold
 >
 > - **Google** defers the numeric rate-limit table to *"View your active rate limits in AI Studio"*,
 >   behind sign-in. There is **no authoritative published RPM/TPM/RPD for
->   `gemini-3.5-flash-lite`**. Third-party figures conflict (5–15 RPM, ~250k TPM, 1,000–1,500 RPD
+>   `gemini-3.5-flash-lite`**. Third-party figures conflicted (5–15 RPM, ~250k TPM, 1,000–1,500 RPD
 >   depending on model and vintage).
+>
+>   **Corrected at T029.** The RPD figures are stale by roughly two orders of magnitude. Google's
+>   free tier is now approximately **20 requests per day per model**, reduced from 50 RPD in
+>   February 2026 and confirmed by Google staff. See *Risk Assessment*. The 1,000–1,500 RPD figures
+>   must not be used as placeholders.
 > - **Mistral** publishes no free-tier figures either. Its console lists them per model, and those
 >   values were **read directly from the workspace console** (Issue #7) — see below.
 >
@@ -368,6 +373,36 @@ The "~50% successful requests" MVP figure was set when a single key and no retry
 
 ## Risk Assessment
 
+### Google's free tier may be too small for the ≥80% target to be reachable at all
+
+**Found while implementing T029 (2026-10-11). This is the most consequential finding in the project and it was not known when M1 was planned.**
+
+Google has **reduced the Gemini free tier to approximately 20 requests per day**, per model. This is not a third-party estimate — it appears in Google's own error responses as the quota metric `generativelanguage.googleapis.com/generate_content_free_tier_requests`, and Google staff confirmed the reduction on the developer forum:
+
+> "yeah the limits on the free tier were lowered. There is a huge amount of growing demand for 3.0 Pro and Nano Banana Pro so we had to shuffle compute there."
+>
+> "The main goal of the free tier is to try and give people a sense of what the model can do for early testing. **It was not designed to be a long term solution to build things on top of.**"
+
+The reduction is recent and moving: 50 RPD was reported in February 2026, and 20 RPD after. Third-party figures of "1,000–1,500 RPD" circulating earlier in this project are **stale by roughly two orders of magnitude**.
+
+**What this means for the milestone:**
+
+- At ~20 RPD, Google's free tier admits at most **20 successful requests per day** per model. M0's measured ~50% success rate is consistent with exhausting a daily cap.
+- A **≥80% success rate is not achievable against a 20-per-day ceiling** by any amount of retry, failover, or key pooling. The router can succeed at most 20 times a day; every additional attempt that day is a failure.
+- The target is therefore measuring something different from what it was written to measure. It cannot be met by improving the router, because the ceiling is the provider's, not ours.
+
+**This is a direct consequence of CONSTITUTION §1** — a strictly $0 router on free tiers. The constitution and the success target are in tension, and the tension is now quantified rather than theoretical.
+
+**What this specification does about it:** nothing silently. The honest options are recorded below and the decision is the operator's:
+
+1. **Keep ≥80% and record the shortfall with its cause.** The measured rate, the daily cap, and the arithmetic that makes them incompatible are stated. M2 plans against the real number.
+2. **Measure success rate against *dispatchable* requests** — requests that occurred when quota remained — alongside the raw rate. This separates router quality from provider capacity, which are currently conflated in one metric.
+3. **Add a paid tier**, which CONSTITUTION §1 forbids and which would end the $0 property.
+
+Option 2 is the one worth considering seriously, because as written the single metric cannot distinguish "the router failed" from "the free tier ran out", and those need completely different responses.
+
+**Independently: the free tier is explicitly documented as not intended for sustained use.** That is a statement about the platform's intent, and it sits awkwardly beside CONSTITUTION §6.1's Conservative Compliance Mode, which exists to reduce the risk of account suspension. The mode is not optional, and neither is the observation.
+
 ### The ≥80% target may not be reachable by the assumed means
 
 M1 was planned expecting key pooling to contribute materially to the success rate. **It does not, for Google** — Google's quota is per-project, so additional keys share one bucket. Retry on transient faults is therefore the load-bearing mechanism, and it is bounded by the provider's actual failure modes.
@@ -377,6 +412,12 @@ If the measured rate lands materially below 80%, the honest response is to recor
 ### Quota constants start unverified
 
 Both providers hide free-tier limits behind a console. M1 ships conservative placeholders. The consequence is that counters may under- or over-estimate true capacity, and a tuned value may be wrong for a different account or region. This is accepted for M1 and is a known quality gap, not an oversight.
+
+**Partial correction (T029, 2026-10-11).** Google's limits are not *entirely* hidden: quota errors name the metric and the limit in the response body, and carry the provider's own retry hint — `google.rpc.RetryInfo` with a `retryDelay` such as `"16s"`, or a message reading `Please retry in 45.06576809s.` Google's own quota identifier is `GenerateRequestsPerMinutePerProjectPerModel`, dimensions `{location: 'global', model: ...}`, which independently confirms the per-project finding from #51 and adds that limits are per model as well.
+
+So the router can read the provider's authoritative numbers at the moment it is refused, rather than only guessing them from a console. **That is recorded as an M2 opportunity, not M1 work**: acting on it means reconciling a self-reported limit into configuration at runtime, and CONSTITUTION §2 keeps provider-specific policy in configuration rather than the routing engine.
+
+The free tier's actual size is far smaller than assumed — see *Google's free tier may be too small for the ≥80% target*, above.
 
 ### Key pooling may be inert for Google
 
