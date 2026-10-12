@@ -81,7 +81,22 @@
   **A real bug the tests caught before it shipped.** `limit` was first typed `int`, which cannot express Mistral's `ministral-14b-2512` ceiling of **0.50 requests/second** (nor `labs-leanstral-1-5-1` at 0.63). Rounding 0.5 up to 1 would dispatch at **twice** the permitted rate against a provider that enforces the ceiling per second. `limit` is now a `float`, with a configuration-level regression test.
 
   **Also rejected during implementation.** A `from_mapping` classmethod on the dimension, written against a stdlib dataclass. Pydantic auto-converted the dataclass, which made the classmethod unreachable and turned `reset` into a mandatory field. The representation is now a pydantic model, matching the rest of the codebase.
-- [ ] **T028: Reservation cycle.** Implement estimate → reserve → dispatch → reconcile (CONSTITUTION §8.2) with a configurable safety margin on token estimation. Reconciliation must tolerate providers that report no usage.
+- [x] **T028: Reservation cycle — complete.** `quota/tracker.py` implements estimate → reserve → dispatch → reconcile (CONSTITUTION §8.2). Check-and-reserve is atomic under a single `asyncio.Lock` held only across in-memory updates, never across provider I/O. Clock is injected.
+
+  **Five bugs the tests and a manual probe caught, all fixed:**
+  1. **The safety margin over-reserved by one token.** `100 * 1.1` is `110.00000000000001` in binary floating point, so `ceil()` yielded 111. Reproducible, but for an arithmetic reason rather than a policy one. The margin is now a `Decimal`, so the configured margin is the applied margin.
+  2. **Reconciliation settled only the last window.** A reservation touches one entry *per dimension*, but the pending map held a single entry, so each reserve overwrote the previous one and **token-dimension reconciliations were silently dropped**. Now one identifier maps to all its entries.
+  3. **The min-spacing fallback leaked to token dimensions.** A token budget smaller than a request was being deferred rather than refused — waiting cannot make a budget cover a request. Now restricted to request-rate semantics.
+  4. **`available()` reported "available" against a fully spent token budget**, because it asked the token dimension whether it had room for *zero* tokens. Now checks the smallest useful dispatch.
+  5. **A fractional limit admitted a request early.** The 0.5 RPS spacing is 2s, which is longer than the 1s window; looking back only a window found nothing to wait for by 1.9s. Caught by an out-of-test probe, not the unit tests — the lookback is now the minimum spacing.
+
+  **Fractional request limits are a token-bucket-plus-spacing model, not a smaller window.** `has_room` has two regimes: where the limit can hold a request, it is a token-bucket check; where it cannot — `ministral-14b-2512` at 0.50 RPS — summing would refuse every request forever, so the real constraint is a minimum spacing of `window / limit` seconds.
+
+  **`reserve` returns `None` when exhausted rather than raising.** `NoAvailableCapacityError` is T031's, and Batch 5 attaches cooldown and failover semantics to it; introducing it here would pre-empt that. **This deviates from `plan.md`,** which types the return as `Reservation`.
+
+  **`reconcile` cannot fail a request that already succeeded.** A provider reporting *more* tokens than estimated is recorded as genuine over-spend and `available()` goes False from then on. Unwinding would let the router keep dispatching against a limit it has demonstrably passed.
+
+  Verified empirically, not only by unit test: 200 concurrent racers against a 7 RPS limit admit exactly 7.
 - [ ] **T029: Cooldown state.** Implement cooldown entry with per-provider/model configurable duration. A `429` marks the key cooling; it must never be retried immediately (CONSTITUTION §6.1).
 - [ ] **T030: Context-overload circuit breaker.** On a hard context-length-exceeded response, mark the model degraded for large-context requests rather than retrying it.
 
