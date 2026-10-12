@@ -107,7 +107,25 @@
   **Research finding recorded in `spec.md` § *Risk Assessment* — this one is large.** Google's free tier is now **~20 requests per day per model**, reduced from 50 RPD in February 2026 and confirmed by Google staff: *"The main goal of the free tier is to try and give people a sense of what the model can do for early testing. It was not designed to be a long term solution to build things on top of."* The 1,000–1,500 RPD figures this project had been carrying are **stale by two orders of magnitude**. At 20 RPD the **≥80% success target is unreachable by any router improvement** — the ceiling is the provider's. Three options are recorded for the operator; none is applied silently.
 
   Also recorded: Google names the metric and limit in the error body, so the provider's authoritative numbers are readable at the moment of refusal. That is an M2 opportunity, not M1 work.
-- [ ] **T030: Context-overload circuit breaker.** On a hard context-length-exceeded response, mark the model degraded for large-context requests rather than retrying it.
+- [x] **T030: Context-overload circuit breaker — complete.** `quota/breaker.py`.
+  **Degradation is size-conditional, not total.** A model that rejects a 900k-token prompt can still serve a 200-token one, and §8.2's purpose is to protect remaining quota, not to disable the model. `blocks()` returns False below the learned threshold.
+  **The threshold is learned from the failure, never from a configured context window.** Neither provider publishes per-model context lengths (#51) and they change. It only ever **tightens**: a later, smaller failure lowers it.
+  **The threshold is in *our* estimated tokens, not the provider's.** Google's message carries real counts — *"The input token count (5911388) exceeds the maximum number of tokens allowed (1048576)"* — but comparing those against a chars/4 estimate would compare two tokenizers. The provider figure is recorded for diagnostics and explicitly never used in a comparison.
+  **The default is deliberately short (300s).** Google's context refusals are **intermittent** — the same model and project have been observed serving larger requests seconds after a 32,768-token refusal, which Google was investigating. A long breaker would turn a transient backend limit into an outage.
+  **An unrecognised `400` does not trip the breaker.** Failing closed would degrade a working model on any malformed request. Mistral's wording has **not** been observed and is deliberately not guessed; an unmatched body behaves as in M0.
+
+  **Known gap — this is not yet wired into dispatch.** Nothing calls `is_context_length_error` or `record_failure` yet: the adapters raise a generic `ProviderValidationError` on `400`, and the dispatch assembly is Batch 5 (#8) plus T034 (#10). The state machine and classifier are complete and tested, but **until that wiring lands the breaker cannot fire.** Recorded here rather than left to be discovered.
+
+**Batch 3 verification gate (2026-10-11):**
+
+1. `pytest tests/test_quota.py` — 25 passed.
+2. `ruff check .`, `ruff format --check .`, `mypy --strict src/` — clean.
+3. No over-commit under concurrent load — **verified empirically, not only by test.** 500 racers against 7 RPS admit exactly 7; against 3 RPS + 500 TPM admit exactly 3; against 1000 TPM admit 9 (each reserving 111 with the safety margin).
+4. A `429` never results in an immediate retry — the dispatch gate `is_cooling` returns True, and a provider hint *shorter* than the configured floor loses to the floor.
+5. The in-memory limitation is documented in code where a reader would expect persistence — `ADR-0004` referenced in the module docstring of all three stateful modules (`tracker`, `cooldown`, `breaker`).
+6. **STOP**, review, then close Issue #9.
+
+**Full suite: 345 passing**, up from 226 at the start of Batch 3.
 
 **Verification & Stop:**
 
