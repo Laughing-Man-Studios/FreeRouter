@@ -17,7 +17,11 @@ import httpx
 from fastapi import APIRouter, Depends, Request
 
 from free_router.core.config import Config
-from free_router.core.exceptions import UnsupportedModelError, ValidationError
+from free_router.core.exceptions import (
+    NoAvailableCapacityError,
+    UnsupportedModelError,
+    ValidationError,
+)
 from free_router.core.logging import log_context
 from free_router.core.normalization import (
     NormalizedRequest,
@@ -25,12 +29,14 @@ from free_router.core.normalization import (
     normalize_chat_completion_request,
     to_openai_completion,
 )
+from free_router.keys.manager import KeyManager
 from free_router.providers.base import build_adapter
 
 __all__ = [
     "chat_completions",
     "get_config",
     "get_http_client",
+    "get_key_manager",
     "resolve_model",
     "router",
 ]
@@ -48,6 +54,11 @@ def get_config(request: Request) -> Config:
 def get_http_client(request: Request) -> httpx.AsyncClient:
     """Return the shared ``httpx.AsyncClient`` singleton."""
     return cast("httpx.AsyncClient", request.app.state.http_client)
+
+
+def get_key_manager(request: Request) -> KeyManager:
+    """Return the key manager built during startup."""
+    return cast("KeyManager", request.app.state.key_manager)
 
 
 def resolve_model(config: Config, model: str) -> tuple[str, str]:
@@ -83,6 +94,7 @@ async def chat_completions(
     request: Request,
     config: Config = Depends(get_config),
     http_client: httpx.AsyncClient = Depends(get_http_client),
+    key_manager: KeyManager = Depends(get_key_manager),
 ) -> dict[str, Any]:
     """Handle an OpenAI-compatible chat completion request.
 
@@ -96,6 +108,7 @@ async def chat_completions(
         ValidationError: If the payload is not a JSON object, or fails ingress
             normalization.
         UnsupportedModelError: If the requested model is not configured.
+        NoAvailableCapacityError: If no credential is eligible for the model.
     """
     payload: Any = await _read_json_object(request)
     normalized = normalize_chat_completion_request(payload)
@@ -111,15 +124,43 @@ async def chat_completions(
     request.state.model = normalized.model
     request.state.provider = provider
 
+    # Credential selection happens before the adapter is built, so a model with
+    # no eligible key never reaches the network. The reason is logged with the
+    # alias, never the material (CONSTITUTION 9.1).
+    selection = await key_manager.select(provider, provider_id)
+    if selection.key is None:
+        logger.info(
+            "key_selection_failed",
+            extra={
+                "event": "key_selection_failed",
+                "key_alias": "none",
+                "selection_reason": selection.reason.value,
+            },
+        )
+        raise NoAvailableCapacityError(
+            f"No eligible credential is available for model '{normalized.model}'."
+        )
+
     started = time.perf_counter()
     adapter = build_adapter(provider, http_client)
-    with log_context(model=normalized.model, provider=provider):
-        logger.info("provider_dispatched", extra={"event": "provider_dispatched"})
-        response: NormalizedResponse = await adapter.chat_completion(normalized, provider_id)
+    with log_context(model=normalized.model, provider=provider, key_alias=selection.key.alias):
+        logger.info(
+            "provider_dispatched",
+            extra={
+                "event": "provider_dispatched",
+                "key_alias": selection.key.alias,
+                "selection_reason": selection.reason.value,
+            },
+        )
+        response: NormalizedResponse = await adapter.chat_completion(
+            normalized, provider_id, selection.key
+        )
+        await key_manager.mark_used(selection.key)
         logger.info(
             "provider_responded",
             extra={
                 "event": "provider_responded",
+                "key_alias": selection.key.alias,
                 "latency_ms": round((time.perf_counter() - started) * 1000, 3),
             },
         )

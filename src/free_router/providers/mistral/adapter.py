@@ -37,7 +37,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 from typing import Any
 
 import httpx
@@ -54,7 +53,9 @@ from free_router.core.normalization import (
     NormalizedRequest,
     NormalizedResponse,
 )
+from free_router.keys.manager import KeyRef
 from free_router.providers.timeout import PROVIDER_TIMEOUT_SECONDS
+from free_router.quota.breaker import is_context_length_error
 
 __all__ = [
     "MISTRAL_API_BASE",
@@ -100,7 +101,7 @@ class MistralAdapter:
         self._http_client = http_client
 
     async def chat_completion(
-        self, request: NormalizedRequest, provider_model_id: str
+        self, request: NormalizedRequest, provider_model_id: str, key: KeyRef
     ) -> NormalizedResponse:
         """Send one request to Mistral and normalise the reply.
 
@@ -108,6 +109,8 @@ class MistralAdapter:
             request: The internal normalized request.
             provider_model_id: The Mistral-side model id, e.g.
                 ``ministral-3b-2512``, as resolved from configuration.
+            key: The credential to dispatch with. The material comes from the key
+                pool, not from the environment, so no variable name is handled here.
 
         Returns:
             The internal normalized response.
@@ -124,7 +127,7 @@ class MistralAdapter:
             # Bearer, per Mistral's documented curl example. The key travels in
             # a header rather than a query parameter so it cannot appear in
             # URLs, proxy logs, or access logs.
-            "Authorization": f"Bearer {_api_key()}",
+            "Authorization": f"Bearer {key.secret.get_secret_value()}",
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
@@ -305,6 +308,27 @@ def from_mistral_response(raw: dict[str, Any], provider_model_id: str) -> Normal
     )
 
 
+def body_indicates_context_length_error(raw: bytes) -> bool:
+    """True when a ``400`` body is a context-length refusal rather than a bad payload.
+
+    CONSTITUTION §8.2 requires a context-length refusal to degrade the model for
+    large-context requests rather than be retried, and the classification must
+    happen where the body is read, because the exception path discards it.
+
+    **Mistral's wording has not been observed.** Unlike Google, no observed
+    Mistral message is matched, so this currently returns False for every
+    response. It is present so the two adapters offer the same seam, and so
+    recording a real Mistral shape later is a one-line change rather than a
+    restructuring. Aware of the risk of a function that always returns False: it
+    fails *open*, so the breaker simply never trips and behaviour matches M0.
+    """
+    try:
+        decoded: Any = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return False
+    return is_context_length_error(decoded) is not None
+
+
 async def _raise_for_status(response: httpx.Response) -> httpx.Response:
     """Translate a provider status code into the matching router exception.
 
@@ -352,20 +376,3 @@ async def _raise_for_status(response: httpx.Response) -> httpx.Response:
             f"The upstream provider rejected the request with status {status}."
         )
     raise ProviderServerError(f"The upstream provider returned status {status}.")
-
-
-def _api_key() -> str:
-    """Read the API key from the process environment.
-
-    Reads the environment directly rather than taking a ``Config`` argument so
-    the adapter stays independent of the configuration layer, matching the
-    interface described in the plan and the existing Google adapter.
-
-    Raises:
-        ProviderAuthError: If the key is unset. Startup already fails fast on
-            this, so reaching here means the environment changed mid-run.
-    """
-    key = os.environ.get("MISTRAL_API_KEY")
-    if not key:
-        raise ProviderAuthError("MISTRAL_API_KEY is not set.")
-    return key

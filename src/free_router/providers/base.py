@@ -20,6 +20,7 @@ import httpx
 
 from free_router.core.exceptions import UnsupportedModelError
 from free_router.core.normalization import NormalizedRequest, NormalizedResponse
+from free_router.keys.manager import KeyRef
 
 __all__ = ["ProviderAdapter", "build_adapter", "supported_providers"]
 
@@ -29,7 +30,7 @@ class ProviderAdapter(Protocol):
     """The interface every provider adapter implements."""
 
     async def chat_completion(
-        self, request: NormalizedRequest, provider_model_id: str
+        self, request: NormalizedRequest, provider_model_id: str, key: KeyRef
     ) -> NormalizedResponse:
         """Translate, dispatch, and normalise one chat completion.
 
@@ -41,6 +42,10 @@ class ProviderAdapter(Protocol):
             request: The provider-agnostic request.
             provider_model_id: The provider-native model id resolved from
                 configuration, e.g. ``gemini-3.5-flash-lite``.
+            key: The credential to dispatch with. Adapters read the material from
+                this rather than from the environment, so the key pool is the
+                only thing that decides which credential is used and no variable
+                name reaches an adapter.
 
         Returns:
             The provider-agnostic response.

@@ -162,7 +162,10 @@ models:
 """
     )
 
-    config = load_config()
+    # These tests are about dimension parsing, not credentials, and they name a
+    # Mistral model while `set_api_key` provisions Google's slot. resolve_keys=False
+    # skips the credential requirement rather than this test setting an unrelated key.
+    config = load_config(resolve_keys=False)
     dimensions = config.models[0].quota
 
     assert len(dimensions) == 2
@@ -230,7 +233,7 @@ models:
 """
     )
 
-    config = load_config()
+    config = load_config(resolve_keys=False)
     dimension = config.models[0].quota[0]
 
     assert dimension.limit == 0.5

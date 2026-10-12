@@ -18,7 +18,18 @@ from fastapi.testclient import TestClient
 
 from free_router.core.logging import NORMALISED_LOGGERS, JsonFormatter
 
-MANAGED_ENV_VARS = ("GEMINI_API_KEY", "LOG_LEVEL", "ROUTER_CONFIG_PATH", "ROUTER_DB_PATH")
+MANAGED_ENV_VARS = (
+    "GOOGLE_KEY_PRIMARY",
+    "GOOGLE_KEY_SECONDARY",
+    "MISTRAL_KEY_PRIMARY",
+    "LOG_LEVEL",
+    "ROUTER_CONFIG_PATH",
+    "ROUTER_DB_PATH",
+)
+"""Environment variables that must not leak into a test.
+
+Covers every ``<PROVIDER>_KEY_<ALIAS>`` slot the shipped configuration can name,
+so a developer shell with real credentials cannot influence a result."""
 """Environment variables that must not leak into a test."""
 
 MINIMAL_CONFIG = """\
@@ -61,10 +72,18 @@ def write_config(workdir: Path) -> Callable[..., Path]:
 
 @pytest.fixture
 def set_api_key(monkeypatch: pytest.MonkeyPatch) -> Callable[..., str]:
-    """Set a dummy ``GEMINI_API_KEY`` for the duration of a test."""
+    """Set a dummy key in the slot the shipped configuration declares.
 
-    def _set(value: str = "test-gemini-key") -> str:
-        monkeypatch.setenv("GEMINI_API_KEY", value)
+    The variable name is derived by ``key_env_var("google", "primary")``, so a
+    change to the derivation breaks these fixtures loudly rather than silently
+    leaving every test without a credential.
+    """
+    from free_router.core.config import key_env_var
+
+    variable = key_env_var("google", "primary")
+
+    def _set(value: str = "test-google-key-primary") -> str:
+        monkeypatch.setenv(variable, value)
         return value
 
     return _set

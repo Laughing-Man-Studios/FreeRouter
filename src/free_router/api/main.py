@@ -29,6 +29,7 @@ from free_router.api.health import health_router
 from free_router.api.routes import router
 from free_router.core.config import Config, ConfigError, load_config
 from free_router.core.exceptions import (
+    NoAvailableCapacityError,
     ProviderAuthError,
     ProviderBaseError,
     ProviderRateLimitError,
@@ -41,6 +42,7 @@ from free_router.core.exceptions import (
 )
 from free_router.core.logging import configure_logging, log_context
 from free_router.db.engine import DatabaseInitializationError, init_db_engine
+from free_router.keys.manager import KeyManager
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +58,7 @@ PROVIDER_ERROR_STATUS_MAP: dict[type[RouterBaseError], int] = {
     # and ProviderAuthError must precede ProviderValidationError's 400.
     ProviderTimeoutError: 504,
     ProviderRateLimitError: 429,
+    NoAvailableCapacityError: 503,
     ProviderAuthError: 401,
     ProviderValidationError: 400,
     ProviderServerError: 502,
@@ -81,6 +84,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     configure_logging(os.environ.get("LOG_LEVEL", "INFO"))
 
     app.state.config = await _startup_step("config_invalid", _load_config)
+    app.state.key_manager = _build_key_manager(app.state.config)
     app.state.db_engine = await _startup_step("database_init_failed", _init_database)
 
     app.state.http_client = httpx.AsyncClient(timeout=HTTP_CLIENT_TIMEOUT)
@@ -102,6 +106,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 async def _load_config() -> Config:
     """Load configuration. Exists to give every startup step one signature."""
     return load_config()
+
+
+def _build_key_manager(config: Config) -> KeyManager:
+    """Resolve key material and build the pool.
+
+    Runs after configuration so a declared alias with no credential has already
+    failed startup: an unusable key is discovered before the process serves
+    traffic, not as a 401 on the first request.
+    """
+    return KeyManager(config.resolve_key_material())
 
 
 async def _init_database() -> AsyncEngine:

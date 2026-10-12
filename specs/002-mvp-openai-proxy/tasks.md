@@ -142,10 +142,54 @@
 
 **Maps to GitHub Issue:** `#8 Key Pool Manager & Simple LRU Key Selection`
 
-- [ ] **T023: Configuration schema.** Extend `config.yaml` handling for pooled keys per ADR-0003, enforcing the cap concluded in T020 as a **configuration validation error**, not a convention. Key material remains environment-only; the loader must continue to reject any secret-named field or `${VAR}` reference in `config.yaml` (ADR-0002).
-- [ ] **T024: Identity registry.** Introduce `provider/model` identity distinct from the external OpenAI identifier, supporting multiple providers without routing-core changes. Unknown models resolve to `UnsupportedModelError` as in M0.
-- [ ] **T025: Key manager.** Implement the pool and deterministic LRU selection over eligible keys, with `KeyRef` carrying a loggable alias and a `SecretStr`. Inject a clock; do not read wall time.
-- [ ] **T026: Eligibility and concurrency guard.** Exclude cooling and exhausted keys from selection. Guard selection and state mutation with an `asyncio.Lock` held only across in-memory updates — never across provider I/O. Log `key_alias` and `selection_reason`.
+- [x] **T023: Configuration schema — complete, with one deliberate design decision and one migration.**
+
+  **The §6.1 key cap is code, not configuration.** `key_cap_for(provider)` returns 2 for Google, `None` for Mistral, and **2 for any unrecognised provider**. CONSTITUTION §2 makes configuration the source of non-secret *policy*, but this limit is a compliance constraint: exposing it in `config.yaml` would mean anyone who can edit the file can raise a constitutional limit, which defeats the point of having one. What legitimately changes is a provider's *classification* when its terms change, and that is a reviewed code change recorded in an ADR. The default of 2 for an unknown provider is fail-safe — CONSTITUTION §6.1 permits uncapped pooling only where terms *explicitly* permit it, so nobody gets the benefit of the doubt.
+
+  **`KeyRef` gains `model_id`** beyond `plan.md`'s `(alias, provider, secret)`. A key is pooled per `(provider, model)`, and without the model on the reference `mark_used` had to search every pool to find which one this key belonged to. The field is non-secret.
+
+  **⚠️ BREAKING CHANGE: credentials moved from a config field to derived environment variables.** `gemini_api_key` is gone; `key_aliases` replaces it and material resolves from `<PROVIDER>_KEY_<ALIAS>`. **`GEMINI_API_KEY` must become `GOOGLE_KEY_PRIMARY`, and `MISTRAL_API_KEY` must become `MISTRAL_KEY_PRIMARY`.** This is inherent to ADR-0003 rather than incidental: accepting a variable name from configuration would let `config.yaml` direct the router at any environment variable on the host, which is the capability ADR-0002 exists to withhold.
+
+  **A regression was caught and fixed while doing this.** `resolve_key_material` reads `os.environ` directly, which silently bypassed the `.env` fallback `pydantic-settings` provides — so a developer's usual local-secret store would have stopped working for keys. `.env` is now consulted explicitly, with the process environment still winning (ADR-001 precedence), because the derived names are not declared pydantic fields. `python-dotenv` is now a **declared** dependency rather than a transitive one.
+
+  Carried from #7: `gemini_api_key` was required, so a Mistral-only deployment failed at startup. **Provider credentials are now per model**, and a Mistral-only configuration starts.
+
+- [x] **T024: Identity registry — assessed, and deliberately NOT built.**
+
+  `ModelConfig` already carries `id` / `provider` / `provider_id`, `resolve_model` maps an external id to a `(provider, provider_id)` pair and raises `UnsupportedModelError` for anything unconfigured, and PR #55 proved two providers work through the unmodified route. **The requirement is already satisfied.** Introducing `core/models.py` as `plan.md` intended would be a refactor with no behavioural gain, and CONSTITUTION §2's "prefer the simplest implementation that satisfies the current milestone" argues against speculative structure.
+
+  What the measured limits *do* change is that **model selection is now a capacity lever** — `gemini-3.5-flash-lite` and `gemini-3.1-flash-lite` each carry 500 RPD, so ~1,000/day combined. Making the router *choose* between models is M3 territory (ROADMAP's capability-aware router) and is explicitly out of M1's scope. **Recorded as satisfied, not skipped.**
+
+- [x] **T025: Key manager — complete.** `keys/manager.py`. `KeyRef` carries a loggable alias, a `SecretStr`, and a redacting `__repr__`. Selection is least-recently-used and **does not mark a key used** — a request that then fails must not leave a working credential looking cold, which is exactly when you want to keep using it.
+
+  **A bug the tests caught: LRU ordering silently collapsed to alphabetical.** `last_used` was stamped with the injected clock and ties broke on alias. With any clock coarser than the request rate — routine on some platforms, and exactly what a fake clock looks like — every mark lands on the same instant, so "least recently used" became "alphabetically first" and all traffic pinned to one alias while *appearing* to work. Ordering now uses a **monotonic ordinal**, exact and immune to clock resolution; the clock stamps a diagnostic timestamp only. Pinned by `test_lru_ordering_survives_a_clock_that_never_advances`.
+
+- [x] **T026: Eligibility and concurrency guard — complete, with a correction to the task's own wording.**
+
+  The task says *"exclude cooling and exhausted keys from selection."* **Per-key cooldown would be actively wrong**, given #51: a rate limit on one Google key applies to its sibling too, because both draw on one project bucket. Cooling only one would send the very next request into the same exhausted bucket. Cooldown and quota are therefore **model-level** (`quota/cooldown.py`, `quota/tracker.py`), and the dispatch path composes them before selection. The key manager's eligibility is **suspension only** — the credential itself being unusable, i.e. rejected authentication or revoked. That is the only per-key state, and it is the only state a key carries.
+
+  The `asyncio.Lock` is held **only across in-memory updates**. `test_the_lock_is_not_hold_across_provider_io` proves a second coroutine proceeds during a simulated slow dispatch — holding it across an `await` of provider I/O would serialise every request behind the slowest upstream response.
+
+  Dispatch now selects a credential **before** building the adapter, logs `key_alias` and `selection_reason` (never material), and raises `NoAvailableCapacityError` → `503` when nothing is eligible. **`503` is new**: "no capacity" is a real outcome on free tiers and was previously indistinguishable from a provider fault, which invites exactly the retry the cooldown exists to prevent.
+
+  **Adapters no longer read the environment.** `chat_completion` takes a `KeyRef`, so no variable name reaches an adapter and a test cannot make one by exporting a variable. Both adapter test suites gained a decoy-variable test for this.
+
+  **`body_indicates_context_length_error` was added to both adapters, which closes the Batch 3 wiring gap** — the breaker can now be tripped once dispatch composes it in Batch 5. Mistral's version matches nothing yet, documented, and fails *open*.
+
+**Batch 4 verification gate (2026-10-12):**
+
+1. `pytest tests/test_key_manager.py tests/test_config.py` — 66 passed.
+2. `ruff check .`, `ruff format --check .`, `mypy --strict src/` — clean.
+3. No key material in any output — verified structurally, not just by grep. `KeyRef.describe()` emits `key_alias=primary`; `KeyRef.__repr__` and `KeySelection.describe()` were each checked against a sentinel secret and none leak. Real selection output: `key_alias=primary selection_reason=least_recently_used`.
+4. A suspended key is never selected under load — 200 concurrent selections with `primary` suspended returned only `secondary`, with no spurious exhaustion.
+5. The lock is never held across provider I/O — proved **structurally**, by walking the AST for `async with` blocks containing an `await`. Zero. Holding it across a network call would serialise every dispatch behind the slowest provider response.
+6. **Full suite: 390 passing**, up from 345 at the start of Batch 4.
+
+## ⚠️ Operator action required: credentials have moved
+
+**`GEMINI_API_KEY` must become `GOOGLE_KEY_PRIMARY`, and `MISTRAL_API_KEY` must become `MISTRAL_KEY_PRIMARY`.**
+
+The shipped `config.yaml` needs no change — a model with no `key_aliases` declares one key, called `primary`. A deployment that has not renamed its variables **will fail at startup** with a message naming the alias and the expected variable. That is deliberate: a missing credential is a startup failure, not a 401 on the first request.
 
 **Verification & Stop:**
 

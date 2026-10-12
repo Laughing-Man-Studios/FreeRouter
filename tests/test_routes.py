@@ -66,7 +66,7 @@ def test_request_reaches_google_with_translated_body(client: TestClient) -> None
     sent = json.loads(request.content)
     assert sent["contents"] == [{"role": "user", "parts": [{"text": "hello"}]}]
     assert "generationConfig" not in sent
-    assert request.headers["x-goog-api-key"] == "test-gemini-key"
+    assert request.headers["x-goog-api-key"] == "test-google-key-primary"
     assert "test-gemini-key" not in str(request.url)
 
 
