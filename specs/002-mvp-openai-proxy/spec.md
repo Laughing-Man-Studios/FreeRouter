@@ -76,8 +76,27 @@ M1 makes the router survive that. It adds a key pool, quota awareness with coold
 >
 > - **Google** defers the numeric rate-limit table to *"View your active rate limits in AI Studio"*,
 >   behind sign-in. There is **no authoritative published RPM/TPM/RPD for
->   `gemini-3.5-flash-lite`**. Third-party figures conflict (5–15 RPM, ~250k TPM, 1,000–1,500 RPD
+>   `gemini-3.5-flash-lite`**. Third-party figures conflicted (5–15 RPM, ~250k TPM, 1,000–1,500 RPD
 >   depending on model and vintage).
+>
+>   **Measured (2026-10-12) from the Google AI Studio rate-limits page for the project.** These are
+>   authoritative for this workspace and are no longer placeholders. Values vary enormously by
+>   model, and **the Lite models are the permissive ones**:
+>
+>   | Model | RPM | TPM | RPD |
+>   | --- | --- | --- | --- |
+>   | **`gemini-3.5-flash-lite`** (in use since M0) | 15 | 250,000 | **500** |
+>   | `gemini-3.1-flash-lite` | 15 | 250,000 | **500** |
+>   | `gemini-2.5-flash-lite` | 10 | 250,000 | 20 |
+>   | `gemini-2.5-flash` | 5 | 250,000 | 20 |
+>   | `gemini-3-flash` … `gemini-3.8-flash` | 5 | 250,000 | 20 |
+>
+>   **Correction to an earlier finding in this document.** T029 recorded Google's free tier as
+>   "~20 RPD, reduced from 50", inferred from error messages and a developer-forum thread. That is
+>   true of the **non-Lite** models only. `gemini-3.5-flash-lite` — the model this router has used
+>   since M0 — allows **500 RPD**, 25× the figure recorded. The over-statement is withdrawn.
+>
+>   Models at `0 / 0` are unavailable on this account and must never be configured.
 > - **Mistral** publishes no free-tier figures either. Its console lists them per model, and those
 >   values were **read directly from the workspace console** (Issue #7) — see below.
 >
@@ -100,9 +119,11 @@ M1 makes the router survive that. It adds a key pool, quota awareness with coold
 > | `mistral-small-2603` | 20,000 | 1.00 |
 > | `mistral-large-4` | 20,000 | 0.83 |
 >
-> **Google's values remain conservative placeholders.** The two providers are therefore in different
-> evidentiary positions, and the configuration must record which is which rather than presenting them
-> uniformly.
+> **Google's values are now measured** (2026-10-12, from the AI Studio rate-limits page for this
+> project) — see the table above. **Both providers' Level 1 values are therefore measured rather than
+> placeholder**, which substantially closes the ROADMAP §2 deviation recorded below. The two differ in
+> what remains unverified: Google's **RPD is now known per model**, while Mistral's **RPD is still
+> absent from its console** and remains unenforced.
 >
 > The requirement this most directly qualifies is ROADMAP §2's verification clause. It is recorded
 > here rather than quietly unmet.
@@ -358,15 +379,86 @@ ADR-001 §2.4 still records a 400 ms `asyncio.timeout` for the provider envelope
 
 ROADMAP §2 requires that exact provider quota values be "verified against current provider documentation rather than hard-coded assumptions."
 
-This **cannot be satisfied for either provider**, as Issue #51 established: Google defers its rate-limit table to a signed-in console, and Mistral publishes no free-tier figures at all. M1 ships conservative placeholders marked unverified and tunes from measurement.
+**Substantially satisfied as of 2026-10-12.** Neither provider publishes free-tier figures, so neither is verifiable from public documentation — but both now have **authoritative workspace-sourced** values read from their own consoles:
 
-The deviation is recorded rather than papered over with third-party figures that conflict.
+| Provider | RPM | TPM | RPD | Source |
+| --- | --- | --- | --- | --- |
+| Google (`gemini-3.5-flash-lite`) | 15 | 250,000 | 500 | AI Studio rate-limits page |
+| Mistral (`ministral-3b-2512`) | 750 | 1,300,000 | **unknown** | Console Admin → Limits |
+
+Every dimension is `provenance: measured` except **Mistral RPD, which is absent and therefore omitted rather than guessed**.
+
+**What remains of the deviation:** ROADMAP §2 says *provider documentation*. These values come from a workspace console, which is authoritative for this account but is neither published documentation nor portable to another. The requirement is met in substance — no value is an assumption — but not in the letter, since no public source exists to verify against.
 
 ### ROADMAP §4 — success target
 
 The "~50% successful requests" MVP figure was set when a single key and no retry existed. It is superseded by the **≥80%** target in this specification. ROADMAP §4 is updated to match.
 
 ## Risk Assessment
+
+### ~~Google's free tier may be too small for the ≥80% target to be reachable at all~~ — WITHDRAWN
+
+> **This section previously argued that ≥80% was unreachable.** That was wrong, and it is withdrawn
+> rather than left to be found later. The claim rested on a measured-looking figure of "~20 RPD"
+> inferred from provider error messages and a forum thread. The AI Studio page shows that figure
+> applies to the **non-Lite** models; `gemini-3.5-flash-lite`, the model actually in use, allows
+> **500 RPD**. **The error was mine — a partial source presented with more confidence than it
+> earned.**
+
+### The success target is reachable, but only within a per-day envelope
+
+Measured for `gemini-3.5-flash-lite`: **15 RPM, 250,000 TPM, 500 RPD.**
+
+Those three limits are not equally binding, and conflating them is how the wrong answer above was
+reached:
+
+- **RPM (15/min) binds bursts.** An agent firing requests in a tight loop hits it within seconds.
+- **RPD (500/day) binds sustained load.** Sustaining 15 RPM would exhaust the day in **33 minutes**,
+  so the sustainable *average* is **0.35 requests/minute** — 500 ÷ 1,440.
+- **TPM (250K/min) is slack** at this workload; 500 requests/day cannot approach it.
+
+The success-rate ceiling therefore depends on daily volume:
+
+| Requests/day | Ceiling on success rate |
+| --- | --- |
+| 500 | 100% |
+| **625** | **80%** — the target |
+| 1,000 | 50% |
+
+**≥80% is reachable at single-user volumes and unreachable on a heavy day.** That is a real
+constraint worth engineering against, not the structural impossibility first claimed.
+
+**Two consequences that are genuinely useful:**
+
+1. **Daily capacity is per-model, so model selection is a capacity lever.** The two Lite models each
+   carry their own 500 RPD, giving ~1,000/day combined. This is consistent with Google's documented
+   per-minute quota identifier `GenerateRequestsPerMinutePerProjectPerModel`. #51's per-*project*
+   finding is about **keys**, not models — both hold and they are not in conflict.
+2. **M0 already selected the best available model.** `gemini-3.5-flash-lite` has the joint-highest RPM
+   and by far the highest RPD. The non-Lite models are 5 RPM / 20 RPD — 25× worse on the daily axis.
+
+### A quota limit on the console does not prove a model is callable
+
+Reported by the operator 2026-10-12: some Gemini 2.5 models shown with active limits returned errors
+from the API, with those limits still displayed.
+
+**The rate-limits page is an upper bound on capacity, not proof of availability.** A model can carry
+a limit and still be unusable to a given project. Two consequences:
+
+- **Configuration must be verified by dispatch, not by appearance.** A model added to `config.yaml`
+  on the strength of its console row is unverified until a request to it has succeeded.
+- **An unavailable model must fail as `503` with a distinct reason**, not as a `400` or `502` that
+  reads like a payload or transport fault. That distinction is Batch 5's work.
+
+### Mistral's daily ceiling is now the open question, not Google's
+
+Mistral's measured limits (12.5 RPS, 1.3M TPM on `ministral-3b-2512`) look permissive beside Google's,
+and **no RPD is visible** on Mistral's console.
+
+Before M1 that read as "Mistral is the roomier provider". It now reads the other way: **Google's limits
+are measured and generous; Mistral's are measured on every axis except the daily one, where they are
+unknown.** An unknown daily cap is a risk, not an advantage. **No provider reordering is warranted on
+current evidence.**
 
 ### The ≥80% target may not be reachable by the assumed means
 
@@ -378,11 +470,56 @@ If the measured rate lands materially below 80%, the honest response is to recor
 
 Both providers hide free-tier limits behind a console. M1 ships conservative placeholders. The consequence is that counters may under- or over-estimate true capacity, and a tuned value may be wrong for a different account or region. This is accepted for M1 and is a known quality gap, not an oversight.
 
+**Partial correction (T029, 2026-10-11).** Google's limits are not *entirely* hidden: quota errors name the metric and the limit in the response body, and carry the provider's own retry hint — `google.rpc.RetryInfo` with a `retryDelay` such as `"16s"`, or a message reading `Please retry in 45.06576809s.` Google's own quota identifier is `GenerateRequestsPerMinutePerProjectPerModel`, dimensions `{location: 'global', model: ...}`, which independently confirms the per-project finding from #51 and adds that limits are per model as well.
+
+So the router can read the provider's authoritative numbers at the moment it is refused, rather than only guessing them from a console. **That is recorded as an M2 opportunity, not M1 work**: acting on it means reconciling a self-reported limit into configuration at runtime, and CONSTITUTION §2 keeps provider-specific policy in configuration rather than the routing engine.
+
+The free tier's actual size is far smaller than assumed — see *Google's free tier may be too small for the ≥80% target*, above.
+
 ### Key pooling may be inert for Google
 
 Two keys in one Google project provide credential redundancy but no additional capacity. The M0 deployment target of "~1 key per provider" is therefore unchanged in practice, and the two-key scenario is exercised mainly against Mistral.
 
-## Definition of Done
+## Measuring the success rate
+
+**Decided 2026-10-12, after the measured Google limits were obtained.** One metric, not two, plus
+request volume as a recorded condition.
+
+**A single success rate is kept.** A second "dispatchable" rate — successes among requests that
+occurred while quota remained — was considered and **rejected**. With 500 RPD per Lite model the daily
+ceiling rarely binds at single-user volumes, so the raw rate is normally informative; the split adds
+instrumentation and a second number to interpret in exchange for little. If a future measurement shows
+the ceiling binding regularly, the split is the right response and is recorded here as the change to
+make at that point.
+
+**Request volume is recorded alongside the rate, because the rate is uninterpretable without it.**
+A 60% success rate means something entirely different at 40 requests/day than at 600. The relevant
+arithmetic is in *Risk Assessment*:
+
+| Requests/day | Ceiling on success rate |
+| --- | --- |
+| 500 | 100% |
+| **625** | **80%** |
+| 1,000 | 50% |
+
+At or below 500/day the provider imposes no ceiling at all, so any shortfall is the router's. Above
+that, part of the shortfall is capacity and the two must not be conflated by the reader.
+
+### What must be recorded at close-out
+
+- **The success rate**, and the number of requests it was measured over.
+- **Request volume**, in total and per model per day.
+- **The provider and model** served, since the limits differ by 25× between Lite and non-Lite.
+- **The conditions**: whether the quota tracker was active, whether retry and failover were enabled,
+  and whether any measurement window coincided with a known console-reported usage figure.
+- **Any request volume approaching the daily ceiling**, called out explicitly, so a shortfall is not
+  read as a router defect when it is capacity.
+
+ROADMAP §4 already requires the achieved rate to be measured and recorded with its conditions stated,
+and explicitly treats a rate materially below target as information for M2 rather than milestone
+failure. **This section makes "conditions" concrete rather than restating the obligation.**
+
+</newString>## Definition of Done
 
 Per `docs/SDD_WORKFLOW.md` §21, and with CONSTITUTION as the governing standard:
 
@@ -390,8 +527,8 @@ Per `docs/SDD_WORKFLOW.md` §21, and with CONSTITUTION as the governing standard
 - [ ] Relevant unit and integration tests pass
 - [ ] Issue #51 closed — compliance evaluation and quota research complete
 - [ ] ADR-0003 and ADR-0004 recorded
-- [ ] Measured success rate recorded against the ≥80% target, with conditions stated
-- [ ] Quota configuration values marked as unverified placeholders, not presented as published figures
+- [ ] **Measured success rate recorded against the ≥80% target as a single metric**, with conditions stated — including **request volume**, which is what makes the rate interpretable
+- [ ] Quota configuration values carry their measured provenance, and any dimension that remains unverified is **omitted rather than guessed**
 - [ ] No claim appears anywhere that a second Google key adds quota capacity
 - [ ] No secrets in source, configuration, or logs
 - [ ] No out-of-scope functionality introduced

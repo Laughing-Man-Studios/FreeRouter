@@ -1,0 +1,392 @@
+"""Quota accounting: estimate, reserve, dispatch, reconcile (CONSTITUTION §8.2).
+
+Every dispatch follows the same four steps. **Estimate** what the request will
+cost, **reserve** that capacity locally before anything is sent, **dispatch**,
+then **reconcile** the reservation against what the provider actually reported.
+Reserving first is the whole point: a check-then-send sequence lets N concurrent
+requests each observe the same headroom and each proceed, and the limit is
+exceeded by exactly N.
+
+Three decisions here are load-bearing.
+
+**Usage is tracked per ``(provider, model)``, never per key.** Google's limits
+apply per *project*, so two keys in one project share one bucket. A per-key
+counter would report headroom that does not exist -- two keys each reading 40%
+while the shared bucket sits at 80%. See :mod:`free_router.quota.dimensions`.
+
+**A reservation counts at its estimate until reconciled.** Entries carry
+``reserved`` and an optional ``actual``. Effective usage is ``actual`` when the
+provider reported one and ``reserved`` otherwise, so an in-flight request
+occupies capacity immediately and a provider that reports nothing leaves the
+estimate standing. Reconciliation never *reduces* usage below what was reserved
+unless the provider said so, and never double-counts: it overwrites one entry
+rather than appending another.
+
+**Reconciliation cannot fail a request that already succeeded.** If a provider
+reports more tokens than estimated, the window is recorded as genuinely full and
+``available()`` reports False from then on. The overshoot is not hidden and not
+unwound -- the tokens were spent. Unwinding would let the router keep dispatching
+against a limit it has demonstrably passed.
+
+**State is in memory and will not survive a restart** (ADR-0004, a recorded
+deviation from CONSTITUTION §8.3). A reader expecting persistence should look
+here first: after a restart this tracker reports an empty window, so it may
+briefly exceed a limit it had already reached. Persistence is M2, and lands
+*behind this interface* -- callers do not change.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import math
+import time
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
+from decimal import ROUND_CEILING, Decimal
+from typing import Any
+
+from free_router.quota.dimensions import DimensionResource, QuotaDimension, WindowReset
+
+__all__ = [
+    "QuotaTracker",
+    "Reservation",
+    "estimate_tokens",
+]
+
+# Rough characters-per-token for English text. Deliberately a constant rather
+# than a tokenizer dependency: adding a tokenizer would pull a model-specific
+# vocabulary into the router core, and the safety margin exists precisely to
+# absorb the error an estimate makes. CONSTITUTION §8.2 asks for an estimate
+# with a buffer, not an exact count.
+_CHARS_PER_TOKEN = 4
+
+_PRUNE_THRESHOLD = 256
+"""Entry count above which a window is scanned for expired entries."""
+
+
+def estimate_tokens(request: Any) -> int:
+    """Estimate the prompt tokens a request will consume.
+
+    Args:
+        request: A :class:`~free_router.core.normalization.NormalizedRequest`, or
+            any object exposing a ``messages`` list of ``{role, content}`` dicts.
+
+    Returns:
+        A token estimate. Never zero for a request with any content.
+    """
+    characters = 0
+    for message in getattr(request, "messages", []) or []:
+        content = message.get("content", "") if isinstance(message, dict) else ""
+        if isinstance(content, str):
+            characters += len(content)
+    return max(1, math.ceil(characters / _CHARS_PER_TOKEN))
+
+
+@dataclass(frozen=True, slots=True)
+class Reservation:
+    """Capacity held for one in-flight request.
+
+    Attributes:
+        identifier: Correlates this reservation with its reconciliation.
+        provider: The provider whose capacity was reserved.
+        model_id: The provider-native model id.
+        estimated_tokens: The raw estimate, before the safety margin.
+        reserved_tokens: What was actually reserved, after the margin.
+        window_start: Monotonic timestamp at which the reservation was made.
+    """
+
+    identifier: int
+    provider: str
+    model_id: str
+    estimated_tokens: int
+    reserved_tokens: int
+    window_start: float
+
+    def describe(self) -> str:
+        """Render the reservation for a log line.
+
+        Carries no prompt or completion content (CONSTITUTION §9.1); only
+        counts, which are already visible in the provider's own usage reporting.
+        """
+        return (
+            f"reservation={self.identifier} estimated_tokens={self.estimated_tokens} "
+            f"reserved_tokens={self.reserved_tokens}"
+        )
+
+
+@dataclass(slots=True)
+class _Entry:
+    """One reserved use of a window."""
+
+    at: float
+    reserved: float
+    actual: float | None = None
+
+    @property
+    def effective(self) -> float:
+        """Usage this entry contributes: the actual figure once known."""
+        return self.reserved if self.actual is None else self.actual
+
+
+@dataclass(slots=True)
+class _Window:
+    """Usage against one :class:`QuotaDimension`."""
+
+    dimension: QuotaDimension
+    entries: list[_Entry] = field(default_factory=list)
+
+    def used(self, now: float) -> float:
+        """Total usage inside the window containing ``now``.
+
+        A rolling window counts everything within the trailing period. A fixed
+        window counts only the current bucket, so its usage drops to zero the
+        moment the boundary passes rather than decaying. That difference is
+        real: at a boundary a request can be admitted immediately after one
+        admitted a moment before.
+        """
+        if self.dimension.reset is WindowReset.FIXED:
+            bucket = self._bucket(now)
+            return sum(e.effective for e in self.entries if self._bucket(e.at) == bucket)
+
+        window = self.dimension.window_seconds
+        return sum(e.effective for e in self.entries if now - e.at < window)
+
+    def has_room(self, now: float, additional: float) -> bool:
+        """True when ``additional`` more can be consumed without exceeding the limit.
+
+        Two regimes, because a fractional ceiling is a genuinely different
+        constraint rather than a smaller version of the same one.
+
+        When the limit can hold ``additional``, this is a token-bucket check: a
+        full bucket permits a burst up to the limit and refills continuously, so
+        summing usage inside the trailing window gives the same answer.
+
+        When the limit is *smaller* than a single request -- Mistral's
+        ``ministral-14b-2512`` permits 0.50 requests/second, meaning one request
+        every two seconds -- the bucket can never hold a whole request, so
+        summing would refuse every request forever. The real constraint is a
+        minimum spacing of ``additional * window / limit`` seconds between
+        requests, which is what a sub-one-per-second rate limit means in
+        practice.
+
+        That fallback is **request-rate semantics only**. A token dimension whose
+        limit is smaller than a single request is a different situation: the
+        budget genuinely cannot cover the request and no amount of waiting
+        changes that, so it is refused. Applying spacing to tokens would let an
+        over-budget request through after a pause.
+        """
+        limit = self.dimension.limit
+        if additional <= limit:
+            return self.used(now) + additional <= limit
+
+        if not self.dimension.is_requests:
+            return False
+
+        window = self.dimension.window_seconds
+        minimum_spacing = additional * window / limit
+        # The lookback is the minimum spacing, which is longer than the window
+        # whenever the limit is below one. Filtering by the window instead let a
+        # request through at 1.9s under a 2s spacing: the only prior entry had
+        # already aged out of the 1s window, so the check saw nothing to wait for.
+        recent = [e.at for e in self.entries if now - e.at < minimum_spacing]
+        if not recent:
+            return True
+        return (now - max(recent)) >= minimum_spacing
+
+    def reserve(self, at: float, amount: float) -> _Entry:
+        """Record a reservation and return its entry."""
+        entry = _Entry(at=at, reserved=amount)
+        self.entries.append(entry)
+        return entry
+
+    def prune(self, now: float) -> None:
+        """Drop entries that can no longer affect any future window.
+
+        Bounded rather than aggressive: the list is scanned only once it has
+        grown past a threshold, because the usual case is a handful of live
+        entries and pruning on every reservation would be wasted work on the
+        latency-sensitive dispatch path.
+        """
+        if len(self.entries) < _PRUNE_THRESHOLD:
+            return
+        keep_from = now - self.dimension.window_seconds
+        self.entries = [e for e in self.entries if e.at >= keep_from]
+
+    def _bucket(self, at: float) -> int:
+        return int(at // self.dimension.window_seconds)
+
+
+class QuotaTracker:
+    """In-memory Level 1 quota accounting.
+
+    Not thread-safe by design and not meant to be: it is guarded by a single
+    ``asyncio.Lock`` so that check-and-reserve is atomic with respect to other
+    coroutines. The lock is held only across in-memory updates and is released
+    before anything awaits provider I/O (CONSTITUTION §8.3 forbids the database
+    blocking the event loop; the same discipline applies to this lock).
+    """
+
+    def __init__(
+        self,
+        dimensions_by_model: dict[tuple[str, str], Sequence[QuotaDimension]],
+        *,
+        safety_margin: float = 1.1,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        """Build a tracker over the configured dimensions.
+
+        Args:
+            dimensions_by_model: Quota dimensions keyed by ``(provider, model_id)``.
+                The key is the **shared capacity unit**, not a credential -- see
+                the module docstring.
+            safety_margin: Multiplier applied to the token estimate before
+                reserving. Must exceed 1.0; CONSTITUTION §8.2 gives
+                ``estimated_tokens * 1.1`` as its example.
+            clock: Monotonic time source, injected so tests do not sleep and so
+                a future implementation is not tied to wall time.
+
+        Raises:
+            ValueError: If ``safety_margin`` is not greater than 1.0.
+        """
+        if safety_margin <= 1.0:
+            raise ValueError(
+                f"safety_margin must exceed 1.0, got {safety_margin}. A margin at or "
+                "below 1 reserves less than the request will consume, which is the "
+                "overshoot the reservation cycle exists to prevent (CONSTITUTION 8.2)."
+            )
+        self._dimensions = {
+            key: [_Window(dimension) for dimension in dimensions]
+            for key, dimensions in dimensions_by_model.items()
+        }
+        # Held as Decimal, not float. CONSTITUTION 8.2's example margin of 1.1 is
+        # not representable in binary floating point, so 100 * 1.1 evaluates to
+        # 110.00000000000001 and ceil() yields 111 -- one token of phantom
+        # over-reservation, reproducible but for the wrong reason. Decimal keeps
+        # the arithmetic exact so the configured margin is the applied margin.
+        self._safety_margin = Decimal(str(safety_margin))
+        self._clock = clock
+        self._lock = asyncio.Lock()
+        self._next_identifier = 0
+        self._pending: dict[int, list[tuple[_Window, _Entry]]] = {}
+
+    def dimensions_for(self, provider: str, model_id: str) -> tuple[QuotaDimension, ...]:
+        """The configured dimensions for a model, empty when none are declared."""
+        return tuple(window.dimension for window in self._windows_for(provider, model_id))
+
+    def available(self, provider: str, model_id: str) -> bool:
+        """True when the model plausibly has room for another request.
+
+        Advisory, and deliberately coarse. It asks whether each dimension can
+        absorb the *smallest useful* dispatch -- one request and one token --
+        rather than the cost of the request actually in hand, which is not known
+        until :meth:`reserve`.
+
+        The token check uses ``1.0``, not ``0.0``. Asking a token dimension
+        whether it has room for zero tokens is true whenever the window is not
+        over its limit, which made this report "available" while the budget was
+        fully spent.
+
+        It is a read without the lock, so a caller must still handle
+        :meth:`reserve` returning ``None`` when concurrent requests took the
+        remaining capacity between the check and the reservation.
+        """
+        now = self._clock()
+        return all(window.has_room(now, 1.0) for window in self._windows_for(provider, model_id))
+
+    async def reserve(
+        self, provider: str, model_id: str, estimated_tokens: int
+    ) -> Reservation | None:
+        """Reserve capacity for one request, or return ``None`` if none is free.
+
+        Args:
+            provider: The provider owning the capacity.
+            model_id: The provider-native model id.
+            estimated_tokens: Raw token estimate; the safety margin is applied
+                here so a caller cannot forget to.
+
+        Returns:
+            The :class:`Reservation`, or ``None`` when a dimension is exhausted.
+            ``None`` rather than an exception because the exhaustion exception
+            (``NoAvailableCapacityError``) belongs to Batch 5, which attaches
+            cooldown and failover semantics to it.
+        """
+        reserved_tokens = max(
+            1,
+            int(
+                (Decimal(estimated_tokens) * self._safety_margin).to_integral_value(
+                    rounding=ROUND_CEILING
+                )
+            ),
+        )
+        async with self._lock:
+            now = self._clock()
+            windows = self._windows_for(provider, model_id)
+
+            for window in windows:
+                additional = 1.0 if window.dimension.is_requests else float(reserved_tokens)
+                if not window.has_room(now, additional):
+                    return None
+
+            identifier = self._next_identifier
+            self._next_identifier += 1
+
+            # One entry per window, all under a single identifier. Reconciliation
+            # settles every entry for the reservation, so the request and token
+            # dimensions cannot drift apart.
+            entries: list[tuple[_Window, _Entry]] = []
+            for window in windows:
+                amount = 1.0 if window.dimension.is_requests else float(reserved_tokens)
+                entries.append((window, window.reserve(now, amount)))
+                window.prune(now)
+            self._pending[identifier] = entries
+
+        return Reservation(
+            identifier=identifier,
+            provider=provider,
+            model_id=model_id,
+            estimated_tokens=estimated_tokens,
+            reserved_tokens=reserved_tokens,
+            window_start=now,
+        )
+
+    async def reconcile(self, reservation: Reservation, actual_tokens: int | None) -> None:
+        """Settle a reservation against what the provider reported.
+
+        Args:
+            reservation: The reservation returned by :meth:`reserve`.
+            actual_tokens: Tokens the provider actually consumed, or ``None``
+                when it reported no usage. ``None`` leaves the estimate standing
+                rather than releasing capacity that may well have been used.
+        """
+        async with self._lock:
+            entries = self._pending.get(reservation.identifier)
+            if entries is None:
+                # Already reconciled, or never reserved. Idempotent by design so
+                # a retry of the reconcile step cannot double-count.
+                return
+            if actual_tokens is not None:
+                for _window, entry in entries:
+                    entry.actual = float(actual_tokens)
+            del self._pending[reservation.identifier]
+
+    def used(self, provider: str, model_id: str, resource: DimensionResource) -> float:
+        """Current usage for one resource, for logging and diagnostics.
+
+        Counts every configured dimension of that resource summed. Diagnostic
+        only -- enforcement goes through :meth:`reserve`.
+        """
+        now = self._clock()
+        return sum(
+            window.used(now)
+            for window in self._windows_for(provider, model_id)
+            if window.dimension.resource is resource
+        )
+
+    def _windows_for(self, provider: str, model_id: str) -> list[_Window]:
+        """Windows for a model, created empty on first touch.
+
+        An unconfigured model has no windows, so it is always available. That is
+        the deliberate encoding for an unverified limit: unenforced, not
+        unlimited.
+        """
+        return self._dimensions.setdefault((provider, model_id), [])
