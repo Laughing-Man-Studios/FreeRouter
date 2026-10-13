@@ -83,17 +83,26 @@ jobs:
           uv sync --frozen --dev
 
       - name: pytest
-        # No GEMINI_API_KEY is set. The suite must pass without one, which
+        # No provider credential is set. The suite must pass without one, which
         # proves it is fully mocked and cannot reach a provider.
         run: uv run pytest -v
 
       - name: Assert no provider credential is required
         if: success()
         run: |
-          if [ -n "${GEMINI_API_KEY:-}" ]; then
-            echo "::error::GEMINI_API_KEY is set in CI; the test suite must not need one"
-            exit 1
-          fi
+          # Checked for every <PROVIDER>_KEY_<ALIAS> shape ADR-0003 derives, not
+          # just one name, so renaming a slot cannot quietly reintroduce a real
+          # credential into CI.
+          leaked=0
+          for name in GOOGLE_KEY_PRIMARY GOOGLE_KEY_SECONDARY \
+                      MISTRAL_KEY_PRIMARY MISTRAL_KEY_SECONDARY \
+                      GEMINI_API_KEY MISTRAL_API_KEY; do
+            if [ -n "${!name:-}" ]; then
+              echo "::error::$name is set in CI; the test suite must not need one"
+              leaked=1
+            fi
+          done
+          [ "$leaked" -eq 0 ] || exit 1
           echo "Confirmed: suite runs with no provider credential."
 
   docker:
@@ -153,11 +162,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          # A placeholder key: startup validates presence and format, never
+          # A placeholder key: startup validates presence only, never
           # authenticity, so this exercises the real startup path with no
-          # provider access.
+          # provider access. The variable name is DERIVED by ADR-0003 from the
+          # provider and the alias, not chosen here.
           docker run -d --name router -p 8000:8000 \
-            -e GEMINI_API_KEY=ci-placeholder-key \
+            -e GOOGLE_KEY_PRIMARY=ci-placeholder-key \
             free-router:ci
 
           # Poll rather than sleep a fixed amount, so a slow runner does not
