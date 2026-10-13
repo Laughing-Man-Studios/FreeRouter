@@ -16,7 +16,6 @@ from pathlib import Path
 
 import httpx
 import pytest
-from pydantic import ValidationError
 
 from free_router.core.config import CONFIG_PATH_ENV_VAR, ConfigError, load_config
 
@@ -38,12 +37,12 @@ def _free_port() -> int:
 def _server_env(config_path: Path, api_key: str | None) -> dict[str, str]:
     """Environment for a server subprocess, isolated from the developer's shell."""
     env = dict(os.environ)
-    for name in ("GEMINI_API_KEY", "LOG_LEVEL"):
+    for name in ("GOOGLE_KEY_PRIMARY", "LOG_LEVEL"):
         env.pop(name, None)
     env[CONFIG_PATH_ENV_VAR] = str(config_path)
     env["PYTHONUNBUFFERED"] = "1"
     if api_key is not None:
-        env["GEMINI_API_KEY"] = api_key
+        env["GOOGLE_KEY_PRIMARY"] = api_key
     return env
 
 
@@ -92,7 +91,12 @@ def test_loads_minimal_config_yaml(
 
     config = load_config()
 
-    assert config.gemini_api_key.get_secret_value() == key
+    assert (
+        config.resolve_key_material()[("google", "gemini-3.5-flash-lite")][
+            "primary"
+        ].get_secret_value()
+        == key
+    )
     assert len(config.models) == 1
     model = config.models[0]
     assert model.id == "google/gemini-3.5-flash-lite"
@@ -132,9 +136,15 @@ def test_dotenv_value_used_when_env_absent(
 ):
     """A local .env supplies the key, matching the .env.example workflow."""
     write_config()
-    (workdir / ".env").write_text("GEMINI_API_KEY=key-from-dotenv\n", encoding="utf-8")
+    (workdir / ".env").write_text("GOOGLE_KEY_PRIMARY=key-from-dotenv\n", encoding="utf-8")
 
-    assert load_config().gemini_api_key.get_secret_value() == "key-from-dotenv"
+    config = load_config()
+    assert (
+        config.resolve_key_material()[("google", "gemini-3.5-flash-lite")][
+            "primary"
+        ].get_secret_value()
+        == "key-from-dotenv"
+    )
 
 
 def test_unrelated_dotenv_keys_are_ignored(
@@ -143,22 +153,38 @@ def test_unrelated_dotenv_keys_are_ignored(
 ):
     """An unrelated variable in .env must not break startup."""
     write_config()
-    (workdir / ".env").write_text("GEMINI_API_KEY=k\nUNRELATED_VARIABLE=hello\n", encoding="utf-8")
+    (workdir / ".env").write_text(
+        "GOOGLE_KEY_PRIMARY=k\nUNRELATED_VARIABLE=hello\n", encoding="utf-8"
+    )
 
-    assert load_config().gemini_api_key.get_secret_value() == "k"
+    config = load_config()
+    assert (
+        config.resolve_key_material()[("google", "gemini-3.5-flash-lite")][
+            "primary"
+        ].get_secret_value()
+        == "k"
+    )
 
 
 def test_missing_api_key_fails_fast(write_config: Callable[..., Path]):
-    """Scenario 2: the router refuses to start without GEMINI_API_KEY."""
+    """Scenario 2: the router refuses to start without the declared key.
+
+    The failure now names the *alias* and the derived variable rather than a
+    config field, because the credential is no longer a configuration field at
+    all (ADR-0003).
+    """
     write_config()
 
     with pytest.raises(ConfigError) as excinfo:
         load_config()
 
     message = str(excinfo.value)
-    assert "gemini_api_key" in message
-    assert "Field required" in message
-    assert isinstance(excinfo.value.__cause__, ValidationError)
+    assert "primary" in message
+    assert "GOOGLE_KEY_PRIMARY" in message
+    # Not a pydantic ValidationError: the credential is resolved after the
+    # settings model validates, so this is a plain ConfigError with no cause.
+    # Contrast with test_invalid_schema_fails_fast, which does have one.
+    assert excinfo.value.__cause__ is None
 
 
 def test_invalid_schema_fails_fast(
@@ -358,7 +384,7 @@ def test_process_exits_nonzero_without_api_key(write_config: Callable[..., Path]
 
     assert process.returncode != 0
     assert '"startup_failed"' in stdout
-    assert "gemini_api_key" in stdout
+    assert "GOOGLE_KEY_PRIMARY" in stdout
 
 
 def test_process_starts_and_echoes_request_id(write_config: Callable[..., Path]):

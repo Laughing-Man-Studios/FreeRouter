@@ -28,7 +28,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -46,10 +45,12 @@ from free_router.core.normalization import (
     NormalizedRequest,
     NormalizedResponse,
 )
+from free_router.keys.manager import KeyRef
 from free_router.providers.timeout import (
     DEFAULT_PROVIDER_TIMEOUT_SECONDS,
     PROVIDER_TIMEOUT_SECONDS,
 )
+from free_router.quota.breaker import is_context_length_error
 
 __all__ = [
     "DEFAULT_PROVIDER_TIMEOUT_SECONDS",
@@ -86,7 +87,7 @@ class GoogleAdapter:
         self._http_client = http_client
 
     async def chat_completion(
-        self, request: NormalizedRequest, provider_model_id: str
+        self, request: NormalizedRequest, provider_model_id: str, key: KeyRef
     ) -> NormalizedResponse:
         """Send one request to Gemini and normalise the reply.
 
@@ -94,6 +95,9 @@ class GoogleAdapter:
             request: The internal normalized request.
             provider_model_id: The Gemini-side model id, e.g.
                 ``gemini-3.5-flash-lite``, as resolved from configuration.
+            key: The credential to dispatch with. The material comes from the key
+                pool, not from the environment, so the environment variable name
+                is never handled here.
 
         Returns:
             The internal normalized response.
@@ -108,7 +112,7 @@ class GoogleAdapter:
         headers = {
             # The key travels in a header rather than a query parameter so it
             # cannot appear in URLs, proxy logs, or access logs.
-            "x-goog-api-key": _api_key(),
+            "x-goog-api-key": key.secret.get_secret_value(),
             "Content-Type": "application/json",
         }
         payload = to_gemini_request(request)
@@ -345,6 +349,24 @@ def _raise_for_status_sync(status: int, raw: bytes) -> httpx.Response:
     raise ProviderServerError(f"The upstream provider returned status {status}.")
 
 
+def body_indicates_context_length_error(raw: bytes) -> bool:
+    """True when a ``400`` body is a context-length refusal rather than a bad payload.
+
+    CONSTITUTION §8.2 requires a context-length refusal to degrade the model for
+    large-context requests rather than be retried. The classification has to happen
+    where the body is read, because once the exception is raised the body is gone
+    and the breaker (Batch 5) would have nothing to classify.
+
+    The body is inspected only to classify and is never propagated into an error
+    message, since it can echo prompt content.
+    """
+    try:
+        decoded: Any = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return False
+    return is_context_length_error(decoded) is not None
+
+
 def _body_indicates_auth_failure(raw: bytes) -> bool:
     """True when a 400 body indicates a credential problem, not a bad payload.
 
@@ -367,20 +389,3 @@ def _body_indicates_auth_failure(raw: bytes) -> bool:
     if status_flag in ("PERMISSION_DENIED", "UNAUTHENTICATED"):
         return True
     return "api key not valid" in str(error.get("message", "")).lower()
-
-
-def _api_key() -> str:
-    """Read the API key from the process environment.
-
-    Reads the environment directly rather than taking a ``Config`` argument so
-    the adapter stays independent of the configuration layer, matching the
-    interface described in the plan.
-
-    Raises:
-        ProviderAuthError: If the key is unset. Startup already fails fast on
-            this, so reaching here means the environment changed mid-run.
-    """
-    key = os.environ.get("GEMINI_API_KEY")
-    if not key:
-        raise ProviderAuthError("GEMINI_API_KEY is not set.")
-    return key

@@ -113,8 +113,8 @@ def test_auth_header_is_present_and_key_is_not_in_url(client: TestClient) -> Non
     )
 
     request = route.calls[0].request
-    assert request.headers["x-goog-api-key"] == "test-gemini-key"
-    assert "test-gemini-key" not in str(request.url)
+    assert request.headers["x-goog-api-key"] == "test-google-key-primary"
+    assert "test-google-key-primary" not in str(request.url)
     assert "key=" not in str(request.url)
 
 
@@ -679,16 +679,14 @@ def mistral_client(
 ) -> Iterator[TestClient]:
     """A started app configured with both providers.
 
-    ``gemini_api_key`` is still a required configuration field, so a Mistral-only
-    deployment is not expressible yet. That is a Batch 5 (key pool) concern; the
-    tests here use both providers so the constraint does not hide the behaviour
-    being verified.
+    Both providers need a credential, since credentials are now declared per
+    model through ``key_aliases`` (ADR-0003) rather than as one global field.
     """
     from free_router.api.main import create_app
 
     (workdir / "config.yaml").write_text(MISTRAL_CONFIG, encoding="utf-8")
-    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-mistral-key")
+    monkeypatch.setenv("GOOGLE_KEY_PRIMARY", "test-google-key-primary")
+    monkeypatch.setenv("MISTRAL_KEY_PRIMARY", "test-mistral-key-primary")
     monkeypatch.setenv("ROUTER_DB_PATH", str(tmp_path / "router.db"))
 
     with TestClient(create_app()) as started:
@@ -829,11 +827,10 @@ def test_mistral_model_requires_no_schema_change(
     provider_id, so a second provider is a config entry rather than a change to
     the configuration schema.
     """
-    set_api_key()
     path = workdir / "config.yaml"
     path.write_text(MISTRAL_CONFIG, encoding="utf-8")
 
-    config = load_config()
+    config = load_config(resolve_keys=False)
 
     assert [entry.id for entry in config.models] == [
         "google/gemini-3.5-flash-lite",

@@ -13,6 +13,7 @@ OpenAI error envelope requires, so a handler never has to guess them.
 from __future__ import annotations
 
 __all__ = [
+    "NoAvailableCapacityError",
     "ProviderAuthError",
     "ProviderBaseError",
     "ProviderRateLimitError",
@@ -95,6 +96,25 @@ class ProviderBaseError(RouterBaseError):
 
     error_type = "api_error"
     code = "provider_error"
+
+
+class NoAvailableCapacityError(ProviderBaseError):
+    """No eligible credential or no remaining capacity; maps to HTTP 503.
+
+    Distinct from :class:`ProviderServerError` because the two call for opposite
+    responses. A 503 here is the router working correctly -- it refused to
+    dispatch into an exhausted free tier rather than sending a request that
+    could only fail -- and the correct client behaviour is to back off, not
+    retry immediately. Reporting it as a provider fault would suggest a
+    transient upstream problem and invite exactly the retry the cooldown exists
+    to prevent (CONSTITUTION §6.1).
+
+    ``503`` is new in M1 for that reason: "no capacity" is a real and expected
+    outcome on free tiers, and it was previously indistinguishable from a fault.
+    """
+
+    error_type = "rate_limit_error"
+    code = "no_available_capacity"
 
 
 class ProviderAuthError(ProviderBaseError):

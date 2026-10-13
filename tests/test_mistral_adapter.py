@@ -21,6 +21,7 @@ from typing import Any
 import httpx
 import pytest
 import respx
+from pydantic import SecretStr
 
 from free_router.core.exceptions import (
     ProviderAuthError,
@@ -31,6 +32,7 @@ from free_router.core.exceptions import (
     UnsupportedModelError,
 )
 from free_router.core.normalization import NormalizedRequest
+from free_router.keys.manager import KeyRef
 from free_router.providers.base import ProviderAdapter, build_adapter, supported_providers
 from free_router.providers.mistral.adapter import (
     MISTRAL_API_BASE,
@@ -78,22 +80,20 @@ VALIDATION_BODY_422: dict[str, Any] = {
 }
 
 
-@pytest.fixture(autouse=True)
-def api_key(monkeypatch: pytest.MonkeyPatch) -> str:
-    """Provide a dummy key so the adapter can build its auth header."""
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-mistral-key")
-    return "test-mistral-key"
+@pytest.fixture
+def key() -> KeyRef:
+    """A dummy credential. See the Google adapter's equivalent fixture."""
+    return KeyRef(
+        alias="primary",
+        provider="mistral",
+        model_id=MODEL_ID,
+        secret=SecretStr("test-mistral-key-primary"),
+    )
 
 
 @pytest.fixture
 def http_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=httpx.Timeout(10.0))
-
-
-@pytest.fixture
-def no_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Remove the key the autouse fixture set, to exercise the unset path."""
-    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
 
 
 def _request(messages: list[dict[str, Any]] | None = None) -> NormalizedRequest:
@@ -271,10 +271,15 @@ def test_malformed_response_raises_provider_error_not_index_error(
 
 
 @respx.mock
-async def test_success_round_trip(http_client: httpx.AsyncClient) -> None:
+async def test_success_round_trip(
+    http_client: httpx.AsyncClient,
+    key: KeyRef,
+) -> None:
     route = respx.post(CHAT_URL).mock(return_value=httpx.Response(200, json=SUCCESS_BODY))
 
-    response = await MistralAdapter(http_client=http_client).chat_completion(_request(), MODEL_ID)
+    response = await MistralAdapter(http_client=http_client).chat_completion(
+        _request(), MODEL_ID, key
+    )
 
     assert response.content == "hello from mistral"
     sent = json.loads(route.calls[0].request.content)
@@ -284,29 +289,34 @@ async def test_success_round_trip(http_client: httpx.AsyncClient) -> None:
 @respx.mock
 async def test_key_travels_in_a_bearer_header_not_the_url(
     http_client: httpx.AsyncClient,
+    key: KeyRef,
 ) -> None:
     """A key in the URL would reach proxy and access logs."""
     route = respx.post(CHAT_URL).mock(return_value=httpx.Response(200, json=SUCCESS_BODY))
 
-    await MistralAdapter(http_client=http_client).chat_completion(_request(), MODEL_ID)
+    await MistralAdapter(http_client=http_client).chat_completion(_request(), MODEL_ID, key)
 
-    assert route.calls[0].request.headers["Authorization"] == "Bearer test-mistral-key"
-    assert "test-mistral-key" not in str(route.calls[0].request.url)
+    assert route.calls[0].request.headers["Authorization"] == "Bearer test-mistral-key-primary"
+    assert "test-mistral-key-primary" not in str(route.calls[0].request.url)
 
 
 @respx.mock
 @pytest.mark.parametrize("status", [401, 403])
-async def test_auth_failure_maps_to_auth_error(http_client: httpx.AsyncClient, status: int) -> None:
+async def test_auth_failure_maps_to_auth_error(
+    http_client: httpx.AsyncClient, status: int, key: KeyRef
+) -> None:
     respx.post(CHAT_URL).mock(
         return_value=httpx.Response(status, json={**ERROR_BODY, "type": "authentication_error"})
     )
 
     with pytest.raises(ProviderAuthError):
-        await MistralAdapter(http_client=http_client).chat_completion(_request(), MODEL_ID)
+        await MistralAdapter(http_client=http_client).chat_completion(_request(), MODEL_ID, key)
 
 
 @respx.mock
-async def test_rate_limit_maps_to_rate_limit_error(http_client: httpx.AsyncClient) -> None:
+async def test_rate_limit_maps_to_rate_limit_error(
+    http_client: httpx.AsyncClient, key: KeyRef
+) -> None:
     """429 must not be reported as a malformed request.
 
     Collapsing it into the generic 4xx branch makes a capacity problem look like
@@ -317,13 +327,15 @@ async def test_rate_limit_maps_to_rate_limit_error(http_client: httpx.AsyncClien
     )
 
     with pytest.raises(ProviderRateLimitError):
-        await MistralAdapter(http_client=http_client).chat_completion(_request(), MODEL_ID)
+        await MistralAdapter(http_client=http_client).chat_completion(_request(), MODEL_ID, key)
 
 
 @respx.mock
 @pytest.mark.parametrize("status", [400, 404, 422])
 async def test_rejected_payload_maps_to_validation_error(
-    http_client: httpx.AsyncClient, status: int
+    http_client: httpx.AsyncClient,
+    status: int,
+    key: KeyRef,
 ) -> None:
     # 422 uses the FastAPI-shaped body from the OpenAPI spec, not the documented
     # envelope. It must still be classified, and without parsing the body.
@@ -331,22 +343,26 @@ async def test_rejected_payload_maps_to_validation_error(
     respx.post(CHAT_URL).mock(return_value=httpx.Response(status, json=body))
 
     with pytest.raises(ProviderValidationError):
-        await MistralAdapter(http_client=http_client).chat_completion(_request(), MODEL_ID)
+        await MistralAdapter(http_client=http_client).chat_completion(_request(), MODEL_ID, key)
 
 
 @respx.mock
 @pytest.mark.parametrize("status", [500, 502, 503, 504])
 async def test_server_error_maps_to_server_error(
-    http_client: httpx.AsyncClient, status: int
+    http_client: httpx.AsyncClient,
+    status: int,
+    key: KeyRef,
 ) -> None:
     respx.post(CHAT_URL).mock(return_value=httpx.Response(status, json={"message": "oops"}))
 
     with pytest.raises(ProviderServerError):
-        await MistralAdapter(http_client=http_client).chat_completion(_request(), MODEL_ID)
+        await MistralAdapter(http_client=http_client).chat_completion(_request(), MODEL_ID, key)
 
 
 @respx.mock
-async def test_transport_failure_maps_to_server_error(http_client: httpx.AsyncClient) -> None:
+async def test_transport_failure_maps_to_server_error(
+    http_client: httpx.AsyncClient, key: KeyRef
+) -> None:
     """A connection failure is an exception, not a response, so it bypasses status mapping.
 
     Uncaught it reaches the generic handler and is reported as a router fault,
@@ -355,40 +371,52 @@ async def test_transport_failure_maps_to_server_error(http_client: httpx.AsyncCl
     respx.post(CHAT_URL).mock(side_effect=httpx.ConnectError("refused"))
 
     with pytest.raises(ProviderServerError):
-        await MistralAdapter(http_client=http_client).chat_completion(_request(), MODEL_ID)
+        await MistralAdapter(http_client=http_client).chat_completion(_request(), MODEL_ID, key)
 
 
 @respx.mock
-async def test_timeout_maps_to_timeout_error(http_client: httpx.AsyncClient) -> None:
+async def test_timeout_maps_to_timeout_error(http_client: httpx.AsyncClient, key: KeyRef) -> None:
     respx.post(CHAT_URL).mock(side_effect=httpx.ReadTimeout("slow"))
 
     with pytest.raises(ProviderTimeoutError):
-        await MistralAdapter(http_client=http_client).chat_completion(_request(), MODEL_ID)
+        await MistralAdapter(http_client=http_client).chat_completion(_request(), MODEL_ID, key)
 
 
 @respx.mock
-async def test_undecodable_body_maps_to_server_error(http_client: httpx.AsyncClient) -> None:
+async def test_undecodable_body_maps_to_server_error(
+    http_client: httpx.AsyncClient, key: KeyRef
+) -> None:
     respx.post(CHAT_URL).mock(
         return_value=httpx.Response(200, content=b"not json", headers={"Content-Type": "text/html"})
     )
 
     with pytest.raises(ProviderServerError):
-        await MistralAdapter(http_client=http_client).chat_completion(_request(), MODEL_ID)
+        await MistralAdapter(http_client=http_client).chat_completion(_request(), MODEL_ID, key)
 
 
 @respx.mock
-async def test_non_object_body_maps_to_server_error(http_client: httpx.AsyncClient) -> None:
+async def test_non_object_body_maps_to_server_error(
+    http_client: httpx.AsyncClient, key: KeyRef
+) -> None:
     respx.post(CHAT_URL).mock(return_value=httpx.Response(200, json=["a", "list"]))
 
     with pytest.raises(ProviderServerError):
-        await MistralAdapter(http_client=http_client).chat_completion(_request(), MODEL_ID)
+        await MistralAdapter(http_client=http_client).chat_completion(_request(), MODEL_ID, key)
 
 
-@pytest.mark.usefixtures("no_api_key")
-async def test_missing_api_key_raises_auth_error(http_client: httpx.AsyncClient) -> None:
-    """An unset key is an auth failure, and it must not reach the network."""
-    with pytest.raises(ProviderAuthError, match="MISTRAL_API_KEY"):
-        await MistralAdapter(http_client=http_client).chat_completion(_request(), MODEL_ID)
+@respx.mock
+async def test_credential_material_comes_from_the_pool_not_the_environment(
+    http_client: httpx.AsyncClient, key: KeyRef, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No variable name reaches an adapter. See the Google adapter's equivalent."""
+    monkeypatch.setenv("MISTRAL_API_KEY", "a-decoy-that-must-not-be-used")
+    monkeypatch.setenv("MISTRAL_KEY_PRIMARY", "another-decoy")
+    route = respx.post(CHAT_URL).mock(return_value=httpx.Response(200, json=SUCCESS_BODY))
+
+    await MistralAdapter(http_client=http_client).chat_completion(_request(), MODEL_ID, key)
+
+    assert route.calls[0].request.headers["Authorization"] == "Bearer test-mistral-key-primary"
+    assert "decoy" not in str(route.calls[0].request.headers)
 
 
 def test_provider_timeout_is_shared_with_the_google_adapter() -> None:
