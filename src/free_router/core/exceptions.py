@@ -20,6 +20,7 @@ __all__ = [
     "ProviderServerError",
     "ProviderTimeoutError",
     "ProviderValidationError",
+    "RetriesExhaustedError",
     "RouterBaseError",
     "UnsupportedModelError",
     "ValidationError",
@@ -124,10 +125,32 @@ class ProviderAuthError(ProviderBaseError):
 
 
 class ProviderValidationError(ProviderBaseError):
-    """The provider rejected the payload we sent; maps to HTTP 400."""
+    """The provider rejected the payload we sent; maps to HTTP 400.
+
+    ``context_length`` distinguishes a context-length refusal from an ordinary
+    malformed payload. Both are terminal for the attempt -- neither is retried --
+    but they demand different follow-up: CONSTITUTION §8.2 requires the former to
+    degrade the model for large requests, and nothing for the latter.
+
+    The flag is set by the adapter, which is the only place the provider's body is
+    read. Carrying it here rather than re-parsing downstream avoids the body
+    being read twice, and avoids the dispatch path depending on provider shapes.
+    """
 
     error_type = "invalid_request_error"
     code = "provider_validation_error"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        context_length: bool = False,
+        error_type: str | None = None,
+        code: str | None = None,
+        param: str | None = None,
+    ) -> None:
+        super().__init__(message, error_type=error_type, code=code, param=param)
+        self.context_length = context_length
 
 
 class ProviderRateLimitError(ProviderBaseError):
@@ -145,6 +168,44 @@ class ProviderRateLimitError(ProviderBaseError):
 
     error_type = "rate_limit_error"
     code = "provider_rate_limited"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after: float | None = None,
+        error_type: str | None = None,
+        code: str | None = None,
+        param: str | None = None,
+    ) -> None:
+        """Record the provider's own retry hint, when it gave one.
+
+        ``retry_after`` is seconds, parsed from the standard ``Retry-After``
+        header or from Google's ``google.rpc.RetryInfo`` body field. It is a
+        *floor* for the cooldown duration, never a target to beat -- honouring a
+        shorter hint than the configured floor would mean retrying into a rate
+        limit, which CONSTITUTION §6.1 prohibits. See
+        :class:`~free_router.quota.cooldown.CooldownManager`.
+        """
+        super().__init__(message, error_type=error_type, code=code, param=param)
+        self.retry_after = retry_after
+
+
+class RetriesExhaustedError(ProviderBaseError):
+    """Every permitted attempt failed; maps to HTTP 503.
+
+    Distinct from :class:`NoAvailableCapacityError` on purpose. That one means
+    the router *knew* before dispatching that no capacity remained, so nothing
+    was attempted. This one means attempts were made and all of them failed, which
+    is a materially different fact for whoever is reading the log: the first is
+    capacity arithmetic, the second is an upstream that is failing.
+
+    Both are 503 because in both cases the correct client response is to back
+    off rather than retry immediately.
+    """
+
+    error_type = "rate_limit_error"
+    code = "retries_exhausted"
 
 
 class ProviderServerError(ProviderBaseError):

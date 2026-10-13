@@ -357,9 +357,12 @@ async def _raise_for_status(response: httpx.Response) -> httpx.Response:
     try:
         # An async stream requires aread(); response.read() is sync-only and
         # raises "Attempted to call a sync iterator on an async stream".
-        await response.aread()
+        # The bytes are kept so the 4xx branch can classify them. They are never
+        # propagated into an error message -- the body can echo prompt content
+        # (CONSTITUTION 9.1).
+        raw = await response.aread()
     except httpx.HTTPError:
-        pass
+        raw = b""
     finally:
         await response.aclose()
 
@@ -373,6 +376,7 @@ async def _raise_for_status(response: httpx.Response) -> httpx.Response:
         # documented {object, message, type, param, code} envelope, so the body
         # is not parsed for classification.
         raise ProviderValidationError(
-            f"The upstream provider rejected the request with status {status}."
+            f"The upstream provider rejected the request with status {status}.",
+            context_length=body_indicates_context_length_error(raw),
         )
     raise ProviderServerError(f"The upstream provider returned status {status}.")

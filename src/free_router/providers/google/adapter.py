@@ -341,10 +341,14 @@ def _raise_for_status_sync(status: int, raw: bytes) -> httpx.Response:
         # payload instead of their credentials.
         if _body_indicates_auth_failure(raw):
             raise ProviderAuthError("The upstream provider rejected the API credentials.")
-        raise ProviderValidationError("The upstream provider rejected the request payload.")
+        raise ProviderValidationError(
+            "The upstream provider rejected the request payload.",
+            context_length=body_indicates_context_length_error(raw),
+        )
     if 400 <= status < 500:
         raise ProviderValidationError(
-            f"The upstream provider rejected the request with status {status}."
+            f"The upstream provider rejected the request with status {status}.",
+            context_length=body_indicates_context_length_error(raw),
         )
     raise ProviderServerError(f"The upstream provider returned status {status}.")
 

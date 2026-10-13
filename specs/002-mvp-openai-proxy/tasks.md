@@ -205,10 +205,57 @@ The shipped `config.yaml` needs no change — a model with no `key_aliases` decl
 
 **Maps to GitHub Issue:** `#10 Error Handling, 429/5xx Retries & Failover Policies`
 
-- [ ] **T031: Capacity exceptions and 503.** Add `NoAvailableCapacityError`, `RetriesExhaustedError`, and `ProviderRateLimitedError` to the M0 status map, preserving the most-specific-first ordering. Make `503` a first-class outcome for exhausted free capacity.
-- [ ] **T032: Bounded retry.** Implement retry for transient `5xx` and timeouts within an attempt and elapsed-time budget. Increment and log `attempt` on every dispatch.
-- [ ] **T033: Key failover within one model.** On `429` or a retryable fault, move to the next eligible key **for the same model only**. Cross-model failover stays prohibited (CONSTITUTION §7.2).
-- [ ] **T034: Non-retryable classification.** Ensure ordinary `4xx` and auth failures are never blindly retried, and that retrying into a rate limit is structurally impossible.
+- [x] **T031: Capacity exceptions and 503 — complete, and the naming discrepancy settled.**
+
+  `NoAvailableCapacityError` (503) and `ProviderRateLimitError` (429) shipped in Batches 4 and 2; `RetriesExhaustedError` (503) is new here.
+
+  **Naming reconciled.** The three documents disagreed: `spec.md` specifies the code `provider_rate_limited`, this task named the class `ProviderRateLimitedError`, and Batch 2 implemented `ProviderRateLimitError`. **Settled on `ProviderRateLimitError`**, since it is already implemented, tested and in use; the task text is corrected rather than the code renamed. Spec's *code* value is unchanged.
+
+  **`RetriesExhaustedError` is deliberately narrow.** Raised only when **nothing was ever dispatched** — the attempt budget elapsed before a fault. A provider fault that survived its retries is re-raised as *that fault* (5xx → 502, timeout → 504, auth → 401), per spec's error table. Reporting an upstream failure as a capacity problem would send an operator to quota instead of to the provider.
+
+  **`ProviderRateLimitError` now carries `retry_after`**, populated by the adapter from `Retry-After` or Google's `RetryInfo`, so the provider's own answer reaches the cooldown rather than being discarded with the body.
+
+- [x] **T032: Bounded retry — complete.** `core/dispatch.py`, plus a `DispatchConfig` section. Bounded by **both** an attempt count and a wall-clock budget, because they fail differently: the count alone lets a few very slow attempts run past any sensible client timeout.
+
+  **Defaults are deliberately small — `max_attempts: 2`, one retry.** Every retry consumes real quota: the request was sent, so it counts against the 15 RPM and 500 RPD ceilings even though it produced nothing. An aggressive retry policy spends the day's budget on retries rather than answers.
+
+  **The backoff applies to transient faults only, never to a rate limit.** A `5xx` gets `backoff_seconds` as a courtesy to a recovering upstream. A `429` is spaced by the cooldown duration, which is a compliance floor, not a politeness delay.
+
+- [x] **T033: Key failover within one model — complete, and "on `429`" is implemented as a refusal.**
+
+  **A rate limit stops the request rather than failing over.** On a `429` the cooldown marks the whole `(provider, model)` unit and the next iteration's gate refuses to dispatch. Issue #51 established Google's limits are per project, so a second key draws on the same exhausted bucket — failing over would spend another request to learn nothing. CONSTITUTION §6.1 forbids retrying into a rate limit, and **the prohibition is structural rather than a guard someone can forget.**
+
+  **Failover therefore happens for authentication only** — the one genuinely per-key failure, since a rejected credential says nothing about its sibling. The credential is suspended so later requests do not walk into the same wall.
+
+  **Cross-model failover remains impossible, not merely disabled**: the dispatcher's signature takes exactly one `(provider, model)` pair and never varies it across attempts.
+
+- [x] **T034: Non-retryable classification — complete.** A `400` (including `422`) is never retried, verified by a test that offers `max_attempts=5` and counts one provider call. Auth failures move to another credential rather than retrying the same one.
+
+  **Every dispatched attempt consumes quota, including the ones that fail**, so the reservation is reconciled on **every** terminal path and never released on the assumption that a failed call was free. Assuming otherwise would let a run of `5xx` quietly drain a 500-per-day budget.
+
+- [x] **Wiring closed: the pieces M1 built now meet.**
+
+  The dispatcher is the first place the key pool, quota tracker, cooldown manager and circuit breaker interact. Capacity gates run **before** anything is sent, so a request refused for lack of capacity **never reaches the provider and spends no quota**.
+
+  **The context-overload breaker is finally wired.** `ProviderValidationError` now carries `context_length`, set by the adapter where the body is read, and the dispatcher records the failure — **closing Batch 3's known gap.** An ordinary `400` does not degrade the model, and a degraded model still serves small requests.
+
+  `routes.py` is thinner than before: it validates, resolves the model, and hands off. The log context is opened in the route so every dispatcher record still carries the externally-requested `model` (CONSTITUTION §9.1) — an intermediate attempt lost that, and a telemetry test caught it.
+
+**Batch 5 verification gate (2026-10-13):**
+
+1. `pytest tests/test_failover.py tests/test_integration.py` — 71 passed.
+2. `ruff check .`, `ruff format --check .`, `mypy --strict src/` — clean.
+3. Retry budget exhaustion terminates rather than looping — `max_attempts=4` against a
+   persistent `500` produced **exactly 4 calls**, then `ProviderServerError`.
+4. A `400` is never retried and a `429` is never retried — **run, not merely asserted**:
+   a `400` with `max_attempts=5` produced **1 call**; a `429` with **two keys available**
+   produced **1 call**.
+5. An explicit model request never fails over to another model — one `(provider, model)`
+   pair holds for the loop's whole life, asserted against every call's URL and body.
+6. No eligible key yields a normalized `503` without dispatching — **HTTP 503**, code
+   `no_available_capacity`, **provider never called**.
+
+**Full suite: 418 passing**, up from 390 at the start of Batch 5.
 
 **Verification & Stop:**
 
