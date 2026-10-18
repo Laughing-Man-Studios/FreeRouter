@@ -1,8 +1,9 @@
 """OpenAI-compatible HTTP ingress.
 
 Route handlers are thin: they resolve singletons from ``app.state``, validate
-the request, call the adapter, and serialise the result. Routing policy and
-provider translation live elsewhere by design (CONSTITUTION 3).
+the request, hand off to the dispatcher, and serialise the result. Retry,
+failover, capacity gating and provider translation all live elsewhere by design
+(CONSTITUTION 3).
 """
 
 from __future__ import annotations
@@ -13,15 +14,11 @@ import time
 from datetime import UTC, datetime
 from typing import Any, cast
 
-import httpx
 from fastapi import APIRouter, Depends, Request
 
 from free_router.core.config import Config
-from free_router.core.exceptions import (
-    NoAvailableCapacityError,
-    UnsupportedModelError,
-    ValidationError,
-)
+from free_router.core.dispatch import Dispatcher
+from free_router.core.exceptions import UnsupportedModelError, ValidationError
 from free_router.core.logging import log_context
 from free_router.core.normalization import (
     NormalizedRequest,
@@ -29,14 +26,11 @@ from free_router.core.normalization import (
     normalize_chat_completion_request,
     to_openai_completion,
 )
-from free_router.keys.manager import KeyManager
-from free_router.providers.base import build_adapter
 
 __all__ = [
     "chat_completions",
     "get_config",
-    "get_http_client",
-    "get_key_manager",
+    "get_dispatcher",
     "resolve_model",
     "router",
 ]
@@ -51,14 +45,15 @@ def get_config(request: Request) -> Config:
     return cast("Config", request.app.state.config)
 
 
-def get_http_client(request: Request) -> httpx.AsyncClient:
-    """Return the shared ``httpx.AsyncClient`` singleton."""
-    return cast("httpx.AsyncClient", request.app.state.http_client)
+def get_dispatcher(request: Request) -> Dispatcher:
+    """Return the dispatcher built during startup.
 
-
-def get_key_manager(request: Request) -> KeyManager:
-    """Return the key manager built during startup."""
-    return cast("KeyManager", request.app.state.key_manager)
+    The dispatcher owns the key pool, quota tracker, cooldown manager, circuit
+    breaker and HTTP client. Building them once at startup rather than per
+    request matters: every one of them holds in-memory state that would be lost
+    if a request constructed its own, defeating the whole quota reservation cycle.
+    """
+    return cast("Dispatcher", request.app.state.dispatcher)
 
 
 def resolve_model(config: Config, model: str) -> tuple[str, str]:
@@ -93,8 +88,7 @@ def resolve_model(config: Config, model: str) -> tuple[str, str]:
 async def chat_completions(
     request: Request,
     config: Config = Depends(get_config),
-    http_client: httpx.AsyncClient = Depends(get_http_client),
-    key_manager: KeyManager = Depends(get_key_manager),
+    dispatcher: Dispatcher = Depends(get_dispatcher),
 ) -> dict[str, Any]:
     """Handle an OpenAI-compatible chat completion request.
 
@@ -108,7 +102,10 @@ async def chat_completions(
         ValidationError: If the payload is not a JSON object, or fails ingress
             normalization.
         UnsupportedModelError: If the requested model is not configured.
-        NoAvailableCapacityError: If no credential is eligible for the model.
+        NoAvailableCapacityError: If no capacity is available. Raised by the
+            dispatcher *before* anything is dispatched.
+        ProviderRateLimitError: If the provider rate limited the request.
+        RetriesExhaustedError: If attempts were made and all of them failed.
     """
     payload: Any = await _read_json_object(request)
     normalized = normalize_chat_completion_request(payload)
@@ -124,47 +121,25 @@ async def chat_completions(
     request.state.model = normalized.model
     request.state.provider = provider
 
-    # Credential selection happens before the adapter is built, so a model with
-    # no eligible key never reaches the network. The reason is logged with the
-    # alias, never the material (CONSTITUTION 9.1).
-    selection = await key_manager.select(provider, provider_id)
-    if selection.key is None:
-        logger.info(
-            "key_selection_failed",
-            extra={
-                "event": "key_selection_failed",
-                "key_alias": "none",
-                "selection_reason": selection.reason.value,
-            },
-        )
-        raise NoAvailableCapacityError(
-            f"No eligible credential is available for model '{normalized.model}'."
-        )
-
+    # The context is opened here rather than inside the dispatcher so that every
+    # record the dispatcher emits -- provider_dispatched, provider_rate_limited,
+    # credential_suspended, and the rest -- carries the externally-requested
+    # `model` alongside `provider`. The dispatcher knows only the provider-native
+    # id, and CONSTITUTION 9.1 lists both as expected operational metadata.
     started = time.perf_counter()
-    adapter = build_adapter(provider, http_client)
-    with log_context(model=normalized.model, provider=provider, key_alias=selection.key.alias):
+    with log_context(model=normalized.model, provider=provider):
+        outcome = await dispatcher.dispatch(normalized, provider, provider_id)
         logger.info(
-            "provider_dispatched",
+            "dispatch_completed",
             extra={
-                "event": "provider_dispatched",
-                "key_alias": selection.key.alias,
-                "selection_reason": selection.reason.value,
-            },
-        )
-        response: NormalizedResponse = await adapter.chat_completion(
-            normalized, provider_id, selection.key
-        )
-        await key_manager.mark_used(selection.key)
-        logger.info(
-            "provider_responded",
-            extra={
-                "event": "provider_responded",
-                "key_alias": selection.key.alias,
+                "event": "dispatch_completed",
+                "attempt": outcome.attempts,
+                "failovers": outcome.failovers,
                 "latency_ms": round((time.perf_counter() - started) * 1000, 3),
             },
         )
 
+    response = outcome.response
     return to_openai_completion(
         response,
         request_model=normalized.model,

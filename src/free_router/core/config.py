@@ -251,6 +251,44 @@ class QuotaConfig(BaseModel):
     """
 
 
+class DispatchConfig(BaseModel):
+    """Retry budget and failure policy for the dispatch loop.
+
+    Defaults are deliberately small. **Every retry consumes real quota**: the
+    request was sent, so it counts against the provider's per-minute and
+    per-day ceilings even though it produced nothing. Against measured limits of
+    15 RPM and 500 RPD for ``gemini-3.5-flash-lite``, an aggressive retry policy
+    spends the day's budget on retries rather than on answers.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_attempts: int = Field(default=2, ge=1, le=10)
+    """Total dispatches permitted for one request, including the first.
+
+    Two means one retry. Bounded because CONSTITUTION §6.1's Conservative
+    Compliance Mode exists to stop traffic looking automated; an unbounded retry
+    against a failing provider is precisely that pattern.
+    """
+
+    attempt_budget_seconds: float = Field(default=10.0, gt=0)
+    """Wall-clock ceiling for all attempts of one request.
+
+    A second bound alongside the attempt count, because the two fail differently.
+    An attempt budget alone lets a few very slow attempts run long past any
+    sensible client timeout.
+    """
+
+    backoff_seconds: float = Field(default=0.2, ge=0)
+    """Delay before retrying a *transient fault*.
+
+    Applied only to retryable faults -- a 5xx or a timeout. **Never applied to a
+    rate limit**: retrying into one is prohibited outright rather than spaced,
+    and the cooldown duration governs when capacity returns. The delay here is a
+    courtesy to an upstream that may be recovering, not a compliance mechanism.
+    """
+
+
 class Config(BaseSettings):
     """Validated application configuration."""
 
@@ -266,6 +304,7 @@ class Config(BaseSettings):
 
     models: list[ModelConfig] = Field(min_length=1)
     quota: QuotaConfig = Field(default_factory=QuotaConfig)
+    dispatch: DispatchConfig = Field(default_factory=DispatchConfig)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
     def key_slots(self) -> dict[tuple[str, str], list[str]]:

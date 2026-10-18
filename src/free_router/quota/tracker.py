@@ -40,7 +40,7 @@ from __future__ import annotations
 import asyncio
 import math
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import ROUND_CEILING, Decimal
 from typing import Any
@@ -228,7 +228,7 @@ class QuotaTracker:
 
     def __init__(
         self,
-        dimensions_by_model: dict[tuple[str, str], Sequence[QuotaDimension]],
+        dimensions_by_model: Mapping[tuple[str, str], Sequence[QuotaDimension]],
         *,
         safety_margin: float = 1.1,
         clock: Callable[[], float] = time.monotonic,
