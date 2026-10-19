@@ -45,6 +45,7 @@ from dataclasses import dataclass, field
 from decimal import ROUND_CEILING, Decimal
 from typing import Any
 
+from free_router.core.timestamps import from_iso, to_iso
 from free_router.quota.dimensions import DimensionResource, QuotaDimension, WindowReset
 
 __all__ = [
@@ -215,6 +216,25 @@ class _Window:
     def _bucket(self, at: float) -> int:
         return int(at // self.dimension.window_seconds)
 
+    def bucket_of(self, at: float) -> int:
+        """The bucket an instant falls in, for a fixed window.
+
+        Public because persistence needs to reason about which bucket a
+        restored reservation belongs to, and reimplementing the arithmetic
+        outside this class is how the two would drift apart.
+        """
+        return self._bucket(at)
+
+    def bucket_end(self, now: float) -> float:
+        """The instant the bucket containing ``now`` ends, for a fixed window.
+
+        This is the boundary the window *actually* honours. It is not a
+        documented boundary it does not: Google's daily allowance resets at
+        midnight Pacific, but nothing here knows about Pacific, so the honest
+        thing to persist is the boundary the code uses.
+        """
+        return (self._bucket(now) + 1) * self.dimension.window_seconds
+
 
 class QuotaTracker:
     """In-memory Level 1 quota accounting.
@@ -232,6 +252,7 @@ class QuotaTracker:
         *,
         safety_margin: float = 1.1,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
     ) -> None:
         """Build a tracker over the configured dimensions.
 
@@ -244,6 +265,11 @@ class QuotaTracker:
                 ``estimated_tokens * 1.1`` as its example.
             clock: Monotonic time source, injected so tests do not sleep and so
                 a future implementation is not tied to wall time.
+            wall_clock: Wall-clock source, used only to translate instants to
+                and from the durable form. Durations are always measured on the
+                monotonic clock; the wall clock exists because a monotonic
+                value is only meaningful against the current boot, so a
+                persisted one would restore nonsense after a reboot.
 
         Raises:
             ValueError: If ``safety_margin`` is not greater than 1.0.
@@ -265,6 +291,7 @@ class QuotaTracker:
         # the arithmetic exact so the configured margin is the applied margin.
         self._safety_margin = Decimal(str(safety_margin))
         self._clock = clock
+        self._wall_clock = wall_clock
         self._lock = asyncio.Lock()
         self._next_identifier = 0
         self._pending: dict[int, list[tuple[_Window, _Entry]]] = {}
@@ -390,3 +417,139 @@ class QuotaTracker:
         unlimited.
         """
         return self._dimensions.setdefault((provider, model_id), [])
+
+    def export_windows(self) -> list[dict[str, Any]]:
+        """Serialise the window state for persistence.
+
+        The durable form is a list of one row per configured dimension, each
+        carrying the reservations that window has recorded. A reservation keeps
+        its *reserved* amount and its *reported* amount side by side, because
+        collapsing them into one effective figure would make estimator drift
+        unmeasurable after a restart -- and the console cross-check is the only
+        independent check available.
+
+        Timestamps are **wall-clock**, not the monotonic instants the window
+        holds. A monotonic value is only meaningful against the current boot, so
+        persisting one and restoring it after a reboot would restore nonsense.
+        The conversion happens here, at the boundary, rather than leaking into
+        the window logic.
+
+        Returns:
+            One row per configured dimension.
+        """
+        now = self._clock()
+        offset = self._wall_clock() - now
+        rows: list[dict[str, Any]] = []
+
+        for (provider, model_id), windows in self._dimensions.items():
+            for window in windows:
+                dimension = window.dimension
+                reset_at: str | None = None
+                if dimension.reset is WindowReset.FIXED:
+                    # The instant the *current* bucket ends, in wall-clock
+                    # terms. This is the boundary the window actually uses, not
+                    # a documented one it does not: the honest thing to persist
+                    # is the boundary the code honours.
+                    # Monotonic to wall-clock is an *addition*: the offset is
+                    # wall_now - mono_now, so mono + offset is the wall
+                    # instant. Subtracting it produced a boundary far in the
+                    # past, which made every fixed window look already-reset
+                    # and silently discarded its restored usage.
+                    boundary = window.bucket_end(now) + offset
+                    reset_at = to_iso(boundary)
+                rows.append(
+                    {
+                        "provider": provider,
+                        "model_id": model_id,
+                        "resource": dimension.resource.value,
+                        "window_seconds": dimension.window_seconds,
+                        "reset_kind": dimension.reset.value,
+                        "reset_at": reset_at,
+                        "entries": [
+                            {
+                                "at": round(entry.at + offset, 6),
+                                "reserved": entry.reserved,
+                                "actual": entry.actual,
+                            }
+                            for entry in window.entries
+                        ],
+                        "flushed_at": to_iso(self._wall_clock()),
+                    }
+                )
+        return rows
+
+    def import_windows(self, rows: Sequence[Mapping[str, Any]]) -> int:
+        """Restore window state from persisted rows.
+
+        The *dimension* is taken from configuration, never from the row: the
+        database records usage, not policy, and a limit that has changed must
+        take effect. A row whose dimension is no longer configured is ignored,
+        which is what ``spec.md`` requires -- state for a dimension that is
+        gone is discarded, not applied to one that remains.
+
+        Entries that fall outside the window they belong to are dropped rather
+        than restored, because they cannot affect any future decision.
+
+        Args:
+            rows: Rows as produced by :meth:`export_windows`.
+
+        Returns:
+            The number of reservations restored.
+        """
+        now = self._clock()
+        offset = self._wall_clock() - now
+        by_key = {
+            (
+                row.get("provider"),
+                row.get("model_id"),
+                row.get("resource"),
+                float(row.get("window_seconds", 0.0)),
+            ): row
+            for row in rows
+        }
+
+        restored = 0
+        for (provider, model_id), windows in self._dimensions.items():
+            for window in windows:
+                dimension = window.dimension
+                row = by_key.get(
+                    (provider, model_id, dimension.resource.value, dimension.window_seconds)
+                )
+                if row is None:
+                    continue
+
+                if dimension.reset is WindowReset.FIXED:
+                    reset_at = row.get("reset_at")
+                    if not reset_at:
+                        # No boundary recorded, so the current bucket's usage
+                        # cannot be identified. Starting from zero is the safe
+                        # direction: it may admit a request the limit has
+                        # already refused, but it never refuses one it should
+                        # admit.
+                        continue
+                    if self._wall_clock() >= from_iso(str(reset_at)):
+                        # The bucket has rolled since the flush. The old usage
+                        # belongs to a window that has reset.
+                        continue
+
+                for entry in row.get("entries") or []:
+                    try:
+                        wall_at = float(entry["at"])
+                        reserved = float(entry["reserved"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    actual = entry.get("actual")
+                    actual_value = None if actual is None else float(actual)
+                    mono_at = wall_at - offset
+
+                    if dimension.reset is WindowReset.FIXED:
+                        if window.bucket_of(mono_at) != window.bucket_of(now):
+                            continue
+                    elif now - mono_at >= dimension.window_seconds:
+                        continue
+
+                    window.entries.append(
+                        _Entry(at=mono_at, reserved=reserved, actual=actual_value)
+                    )
+                    restored += 1
+        return restored

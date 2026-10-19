@@ -30,13 +30,16 @@ persistence should look here first.
 
 from __future__ import annotations
 
+import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from typing import Any
+
+from free_router.core.timestamps import from_iso, to_iso
 
 __all__ = [
     "DEFAULT_COOLDOWN_SECONDS",
@@ -54,6 +57,19 @@ Sixty seconds because it spans the shortest window either provider documents
 without assuming one: Mistral's per-minute ceilings and Google's per-minute
 metric both roll over within a minute. A shorter default would re-dispatch into
 a window that has not reset.
+"""
+
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_MAX_COOLDOWN_SECONDS = 86_400.0
+"""Upper bound on a single cooldown, in seconds (clarification B4).
+
+Twenty-four hours accommodates the longest *legitimate* provider hint --
+a daily cap resetting at midnight -- while still bounding a lockout caused
+by a clock that jumped backwards. A backwards jump is better detected than
+patched: restoring a cooldown compares it against the system clock, and this
+is the backstop for the case that check cannot cover.
 """
 
 
@@ -84,6 +100,12 @@ class CooldownRecord:
     until: float
     reason: str
     source: str
+    provider_hint: float | None = None
+    """Seconds the provider asked us to wait, if it said.
+
+    Kept because it is the provider's own answer about how long the limit
+    lasts, and persisting only our derived wait loses it.
+    """
 
     def describe(self) -> str:
         """Render for a log line. Carries no payload and no key material."""
@@ -99,6 +121,9 @@ class CooldownManager:
         durations: dict[tuple[str, str], float] | None = None,
         default_duration: float = DEFAULT_COOLDOWN_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
+        store: Any = None,
+        max_cooldown_seconds: float = DEFAULT_MAX_COOLDOWN_SECONDS,
     ) -> None:
         """Build a manager over per-model configured durations.
 
@@ -112,13 +137,17 @@ class CooldownManager:
         self._durations = dict(durations or {})
         self._default_duration = default_duration
         self._clock = clock
+        self._wall_clock = wall_clock
+        self._store = store
+        self._max_cooldown_seconds = max_cooldown_seconds
         self._records: dict[tuple[str, str], CooldownRecord] = {}
+        self._degraded: dict[tuple[str, str], str] = {}
 
     def configured_duration(self, provider: str, model_id: str) -> float:
         """The configured wait for a model, or the default."""
         return self._durations.get((provider, model_id), self._default_duration)
 
-    def enter(
+    async def enter(
         self,
         provider: str,
         model_id: str,
@@ -158,11 +187,13 @@ class CooldownManager:
             until=moment + wait,
             reason=reason,
             source=source,
+            provider_hint=provider_hint,
         )
         self._records[(provider, model_id)] = record
+        await self._persist(provider, model_id, record)
         return record
 
-    def enter_until(
+    async def enter_until(
         self,
         provider: str,
         model_id: str,
@@ -195,6 +226,7 @@ class CooldownManager:
             source="window",
         )
         self._records[(provider, model_id)] = record
+        await self._persist(provider, model_id, record)
         return record
 
     def status(self, provider: str, model_id: str) -> CooldownStatus:
@@ -221,13 +253,30 @@ class CooldownManager:
         """The active record, or ``None``. Diagnostic only."""
         return self._active(provider, model_id)
 
-    def clear(self, provider: str, model_id: str) -> None:
+    async def clear(self, provider: str, model_id: str) -> None:
         """Drop any cooldown, returning the model to available.
 
         Exists for operator recovery and for M2, where cooldown state becomes
-        persisted and therefore needs a way to be invalidated deliberately.
+        persisted and therefore needs a way to be invalidated deliberately. The
+        removal is written through, so a deliberate clearing is not undone by
+        the next restore.
         """
         self._records.pop((provider, model_id), None)
+        self._degraded.pop((provider, model_id), None)
+        if self._store is not None:
+            try:
+                await self._store.save_cooldown(
+                    {
+                        "provider": provider,
+                        "model_id": model_id,
+                        "cooldown_until": None,
+                        "reason": None,
+                        "retry_after": None,
+                        "updated_at": to_iso(self._wall_clock()),
+                    }
+                )
+            except Exception as exc:
+                self._degrade(provider, model_id, exc)
 
     def _active(self, provider: str, model_id: str) -> CooldownRecord | None:
         """The record if still in force, expiring and removing it if elapsed.
@@ -244,6 +293,123 @@ class CooldownManager:
             del self._records[key]
             return None
         return record
+
+    def persistence_degraded(self, provider: str, model_id: str) -> bool:
+        """True when a limit on this unit could not be recorded durably.
+
+        The in-memory cooldown still refuses dispatch, so the unit is not
+        serving traffic while the cooldown holds. The degradation matters for
+        the moment the cooldown *expires*: by then the limit has reset, but if
+        the record of it was lost the router would not know that, and a restart
+        in between would forget a limit it had been told about.
+        """
+        return (provider, model_id) in self._degraded
+
+    def degradation_reason(self, provider: str, model_id: str) -> str | None:
+        """Why the unit is degraded, or ``None``."""
+        return self._degraded.get((provider, model_id))
+
+    def export_cooldowns(self) -> list[dict[str, Any]]:
+        """Serialise the active cooldowns for persistence.
+
+        Timestamps are wall-clock: a monotonic value is only meaningful against
+        the current boot, and persisting one would restore nonsense after a
+        reboot.
+        """
+        now = self._clock()
+        offset = self._wall_clock() - now
+        rows: list[dict[str, Any]] = []
+        for (provider, model_id), record in self._records.items():
+            rows.append(
+                {
+                    "provider": provider,
+                    "model_id": model_id,
+                    "cooldown_until": to_iso(record.until + offset),
+                    "reason": record.reason,
+                    "retry_after": record.provider_hint,
+                    "updated_at": to_iso(self._wall_clock()),
+                }
+            )
+        return rows
+
+    def import_cooldowns(self, rows: Sequence[Mapping[str, Any]]) -> int:
+        """Restore cooldowns from persisted rows.
+
+        An **expired** cooldown is not restored. A cooldown is time-bounded, so
+        restoring one that has already elapsed would refuse capacity that is
+        actually free.
+
+        A ``cooldown_until`` in the future is restored, because that is exactly
+        the case CONSTITUTION 8.3 names: a restart must not retry a key that is
+        cooling. A value absurdly far in the future is clamped by the maximum
+        cooldown, which bounds a lockout caused by a clock that jumped
+        backwards.
+        """
+        now = self._clock()
+        offset = self._wall_clock() - now
+        restored = 0
+        for row in rows:
+            provider = row.get("provider")
+            model_id = row.get("model_id")
+            until_text = row.get("cooldown_until")
+            if not provider or not model_id or not until_text:
+                continue
+            try:
+                until = from_iso(str(until_text)) - offset
+            except ValueError:
+                continue
+            if until <= now:
+                continue
+            if until - now > self._max_cooldown_seconds:
+                until = now + self._max_cooldown_seconds
+            self._records[(provider, model_id)] = CooldownRecord(
+                provider=str(provider),
+                model_id=str(model_id),
+                until=until,
+                reason=str(row.get("reason") or "restored"),
+                source="restored",
+                provider_hint=row.get("retry_after"),
+            )
+            restored += 1
+        return restored
+
+    async def _persist(self, provider: str, model_id: str, record: CooldownRecord) -> None:
+        """Write a cooldown through, immediately.
+
+        A cooldown is the one piece of state that cannot wait for a flush: a
+        forgotten cooldown makes the router contact a provider that has just
+        refused it, which spends quota to learn nothing.
+        """
+        if self._store is None:
+            return
+        offset = self._wall_clock() - self._clock()
+        try:
+            await self._store.save_cooldown(
+                {
+                    "provider": provider,
+                    "model_id": model_id,
+                    "cooldown_until": to_iso(record.until + offset),
+                    "reason": record.reason,
+                    "retry_after": record.provider_hint,
+                    "updated_at": to_iso(self._wall_clock()),
+                }
+            )
+        except Exception as exc:
+            self._degrade(provider, model_id, exc)
+        else:
+            self._degraded.pop((provider, model_id), None)
+
+    def _degrade(self, provider: str, model_id: str, exc: Exception) -> None:
+        self._degraded[(provider, model_id)] = type(exc).__name__
+        logger.warning(
+            "cooldown_persist_failed",
+            extra={
+                "event": "cooldown_persist_failed",
+                "provider": provider,
+                "model_id": model_id,
+                "error_category": type(exc).__name__,
+            },
+        )
 
 
 def parse_retry_after_seconds(headers: Any) -> float | None:

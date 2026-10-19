@@ -153,6 +153,7 @@ model_status_table = Table(
     Column("model_id", String, nullable=False, primary_key=True),
     Column("status", String, nullable=False),
     Column("detail", String, nullable=True),
+    Column("threshold_tokens", Integer, nullable=True),
     Column("updated_at", String, nullable=False),
 )
 """Whether a provider/model is healthy, degraded or unavailable.
@@ -166,6 +167,11 @@ refusal does, because that is the one payload failure that says something
 about the model rather than about the request.
 
 A degraded model still serves small requests, so this is not an on/off switch.
+``threshold_tokens`` is the size at or above which it is degraded, and it is the
+whole meaning of the state: a model shown to fail only on a 900k-token request
+must still serve a 4k-token one. Without the column the state cannot be
+restored -- a restart would either forget the degradation or, worse, degrade
+the model without knowing which requests it applies to.
 """
 
 key_state_table = Table(

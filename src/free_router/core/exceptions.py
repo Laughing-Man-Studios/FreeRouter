@@ -118,6 +118,24 @@ class NoAvailableCapacityError(ProviderBaseError):
     code = "no_available_capacity"
 
 
+class PersistenceUnavailableError(ProviderBaseError):
+    """The router cannot record a limit it has been told about.
+
+    Raised when a cooldown could not be written through, so the router knows
+    it will not remember the limit across a restart. Continuing would mean
+    dispatching into a capacity unit whose exhaustion is not durable, and a
+    restart would then forget it -- which is the overshoot CONSTITUTION 8.3
+    exists to prevent.
+
+    This is a fail-safe, not a diagnosis: the router refuses the affected
+    capacity unit rather than guessing that its own record-keeping is good
+    enough.
+    """
+
+    error_type = "api_error"
+    code = "persistence_unavailable"
+
+
 class ProviderAuthError(ProviderBaseError):
     """The provider rejected our credentials; maps to HTTP 401."""
 

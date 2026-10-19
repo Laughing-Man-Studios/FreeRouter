@@ -217,11 +217,11 @@ depends on that stream for diagnosis would be the wrong trade.
 
 ---
 
-## Batch 2: SQLite-Backed Quota Store
+## Batch 2: Persistence Layer & Restore
 
 **Maps to GitHub Issue:** `#12 Single-File Local Persistence Engine`
 
-- [ ] **T044: `quota/persistence.py` — the persistence layer.** Attached to the
+- [x] **T044: `quota/persistence.py` — the persistence layer.** Attached to the
   existing `QuotaTracker`; **the tracker's window logic is unchanged** (A3).
 
   **Durability is asymmetric** (ADR-0005): cooldowns and status transitions write
@@ -233,13 +233,13 @@ depends on that stream for diagnosis would be the wrong trade.
   path is a state, not a class: an unreadable row means the same tracker starts
   with empty state and continues.
 
-- [ ] **T045: `restore()` before the listener serves.** Called in lifespan so no
+- [x] **T045: `restore()` before the listener serves.** Called in lifespan so no
   request can be dispatched against an unrestored counter. Prunes windows whose
   reset instant has passed; does not restore expired cooldowns; **detects a
   backwards clock jump** by comparing persisted `cooldown_until` against the system
   clock (the primary mechanism — the 24 h cap in B4 is the backstop).
 
-- [ ] **T046: Cooldown and breaker write-through.** `cooldown.py` and `breaker.py`
+- [x] **T046: Cooldown and breaker write-through.** `cooldown.py` and `breaker.py`
   persist on transition. A failed cooldown write returns `503
   persistence_unavailable` rather than dispatching into a limit the router cannot
   record.
@@ -248,14 +248,68 @@ depends on that stream for diagnosis would be the wrong trade.
   an hour ago may have been fixed; resurrecting the suspension would refuse a working
   key and produce a confusing 503 instead of the `401` that would diagnose it.
 
-- [ ] **T047: LRU ordinal restore.** `key_state` restores selection order. Verified by
+- [x] **T047: LRU ordinal restore.** `key_state` restores selection order. Verified by
   **observed selection order**, not by reading the table — a test that reads the
   table would pass even if selection ignored it.
 
-- [ ] **T048: Failure degradation.** An unreadable or corrupt row discards that
+- [x] **T048: Failure degradation.** An unreadable or corrupt row discards that
   unit's state and continues with in-memory accounting, recording it. A general
   restore failure degrades the tracker and startup **succeeds**. A crash-loop is worse
   than forgetting a cooldown.
+
+**Batch 2 verification gate (2026-10-19):**
+
+1. Full `pytest`, `ruff`, `ruff format --check .`, `mypy --strict src/` — clean.
+2. **Scenarios 1–4 and 12 pass against a real process restart.** The restart
+   tests run **two separate processes** — one writes the state and exits, the
+   second constructs fresh objects and restores from the database. A single
+   process that cleared its objects would pass even if the state only ever
+   lived in memory, which is the failure this milestone exists to prevent.
+3. **The event loop stays responsive** under concurrent reservation — a
+   heartbeat coroutine must keep ticking while reservations are made. This is
+   the CONSTITUTION §8.3 requirement and the easiest thing to violate silently.
+4. **Suspension survives a store round-trip but not a restart**, and the LRU
+   ordinal counter is **seeded above the highest restored ordinal** — a fresh
+   process starts its counter at zero, so a restored ordinal of 500 and a fresh
+   one of 1 would invert the LRU order *and* collide with it.
+5. **A failed cooldown write yields `503 persistence_unavailable` and no
+   dispatch.**
+6. **Full suite after Batch 2: 471 passing**, up from 461.
+
+**Three things changed the design, and are recorded rather than absorbed.**
+
+**The dispatcher is no longer untouched.** The plan said `core/dispatch.py` would
+be unchanged "in its entirety". It is not, and the reason is worth stating: a
+durability feature cannot report its own failure through a fire-and-forget task,
+so the two state-changing calls the dispatcher makes — entering a cooldown and
+recording a breaker failure — became `async` and are now awaited. A third change
+adds the gate that refuses a unit whose limit could not be recorded. **The
+dispatcher's logic, contract and measured behaviour are unchanged**; three call
+sites gained an `await` and one gate branch was added.
+
+**A third migration was needed.** `model_status` had no column for the breaker's
+threshold, and the threshold is the whole meaning of the degraded state: a model
+shown to fail only on a 900k-token request must still serve a 4k-token one.
+Without it, a restart would either forget the degradation or degrade the model
+without knowing which requests it applies to. `detail` could have carried it as
+text, but a value that has to be parsed back out of a string is a value that
+will eventually be parsed wrongly. Revision `0003_model_status_threshold` adds
+the column.
+
+**A real bug was found and fixed during the batch.** The wall-clock conversion
+for a fixed window's reset instant *subtracted* the offset where it had to add
+it, producing a boundary far in the past. Every fixed window then looked
+already-reset, and its restored usage was silently discarded — the failure
+looked like "the counters did not survive", which is exactly what the test was
+written to catch.
+
+**One documentation claim was corrected rather than preserved.**
+`WindowReset.FIXED` promised a reset "at a wall-clock boundary, e.g. midnight
+Pacific for Google's RPD", but the implementation buckets on the monotonic clock,
+so a fixed window resets at an arbitrary offset from boot. The persisted
+boundary is now the boundary the code actually honours, expressed in wall-clock
+terms, and the docstring says so. No fixed window is configured, so nothing
+misbehaves today.
 
 **Verification & Stop:**
 

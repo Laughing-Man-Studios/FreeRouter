@@ -138,10 +138,27 @@ holds there too.
 | `providers/{google,mistral}/adapter.py` | Implement streaming for both |
 | `api/main.py` | Restore state before serving; start the flush task |
 
-**Explicitly unchanged:** `core/normalization.py`, `core/config.py` (beyond the new
-output-assumption, safety-margin and max-cooldown fields), `core/dispatch.py`
-**in its entirety** (A2), and the adapter/request translation logic already proven
-by M1's 100/100 measurement.
+**Explicitly unchanged:** `core/normalization.py`, the adapter/request translation
+logic already proven by M1's 100/100 measurement, and the dispatcher's *logic*.
+
+**`core/dispatch.py` did change, during Batch 2, and the change is recorded rather
+than absorbed.** A2's "the dispatcher is not modified" was about *streaming*, and
+it was correct there. It did not survive contact with persistence, for a reason
+worth stating: **a durability feature cannot report its own failure through a
+fire-and-forget task.** The dispatcher makes exactly two state-changing calls —
+entering a cooldown and recording a breaker failure — and both are places where
+the state must reach the database before the request can be answered. Making
+those `async` and awaiting them is the smallest change that lets a write failure
+be reported, and a third change adds the gate that refuses a capacity unit whose
+limit could not be recorded.
+
+Three call sites gained an `await`; one gate branch was added. The dispatcher's
+contract, its decision logic and its measured behaviour are unchanged. The
+alternative — scheduling the write as a background task — would have preserved
+the letter of the rule and lost the guarantee the rule was protecting.
+
+`core/config.py` gains two fields: `max_cooldown_seconds` (B4) and
+`quota_flush_interval_seconds` (B2).
 
 ## Interfaces
 

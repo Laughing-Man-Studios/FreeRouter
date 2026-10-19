@@ -74,20 +74,20 @@ def test_fresh_manager_is_available() -> None:
     assert manager.remaining(PROVIDER, MODEL) == 0.0
 
 
-def test_rate_limit_marks_the_model_cooling() -> None:
+async def test_rate_limit_marks_the_model_cooling() -> None:
     clock = FakeClock()
     manager = _manager(clock)
 
-    manager.enter(PROVIDER, MODEL, reason="rate_limited")
+    await manager.enter(PROVIDER, MODEL, reason="rate_limited")
 
     assert manager.is_cooling(PROVIDER, MODEL)
     assert manager.status(PROVIDER, MODEL) is CooldownStatus.COOLING
 
 
-def test_cooldown_expires_without_operator_action() -> None:
+async def test_cooldown_expires_without_operator_action() -> None:
     clock = FakeClock()
     manager = _manager(clock)
-    manager.enter(PROVIDER, MODEL)
+    await manager.enter(PROVIDER, MODEL)
 
     clock.advance(59.9)
     assert manager.is_cooling(PROVIDER, MODEL)
@@ -97,10 +97,10 @@ def test_cooldown_expires_without_operator_action() -> None:
     assert manager.status(PROVIDER, MODEL) is CooldownStatus.AVAILABLE
 
 
-def test_remaining_counts_down_and_floors_at_zero() -> None:
+async def test_remaining_counts_down_and_floors_at_zero() -> None:
     clock = FakeClock()
     manager = _manager(clock)
-    manager.enter(PROVIDER, MODEL)
+    await manager.enter(PROVIDER, MODEL)
 
     assert manager.remaining(PROVIDER, MODEL) == pytest.approx(60.0)
 
@@ -111,27 +111,27 @@ def test_remaining_counts_down_and_floors_at_zero() -> None:
     assert manager.remaining(PROVIDER, MODEL) == 0.0
 
 
-def test_clear_returns_a_model_to_available() -> None:
+async def test_clear_returns_a_model_to_available() -> None:
     """Operator recovery, and M2's seam for invalidating persisted state."""
     clock = FakeClock()
     manager = _manager(clock)
-    manager.enter(PROVIDER, MODEL)
+    await manager.enter(PROVIDER, MODEL)
 
-    manager.clear(PROVIDER, MODEL)
+    await manager.clear(PROVIDER, MODEL)
 
     assert not manager.is_cooling(PROVIDER, MODEL)
 
 
-def test_clearing_an_available_model_is_harmless() -> None:
+async def test_clearing_an_available_model_is_harmless() -> None:
     clock = FakeClock()
-    _manager(clock).clear(PROVIDER, MODEL)
+    await _manager(clock).clear(PROVIDER, MODEL)
 
 
-def test_expired_cooldown_is_discarded_not_retained() -> None:
+async def test_expired_cooldown_is_discarded_not_retained() -> None:
     """Expiry is lazy, so a read must not leave dead state accumulating."""
     clock = FakeClock()
     manager = _manager(clock)
-    manager.enter(PROVIDER, MODEL)
+    await manager.enter(PROVIDER, MODEL)
 
     clock.advance(120)
     assert manager.record(PROVIDER, MODEL) is None
@@ -140,17 +140,17 @@ def test_expired_cooldown_is_discarded_not_retained() -> None:
 # --- The wait is the longest applicable hint, never the shortest ---
 
 
-def test_a_longer_provider_hint_is_honoured() -> None:
+async def test_a_longer_provider_hint_is_honoured() -> None:
     """Google telling us to wait 45s must beat a 60s floor only if longer."""
     clock = FakeClock()
     manager = _manager(clock, default=10.0)
 
-    manager.enter(PROVIDER, MODEL, provider_hint=45.0)
+    await manager.enter(PROVIDER, MODEL, provider_hint=45.0)
 
     assert manager.remaining(PROVIDER, MODEL) == pytest.approx(45.0)
 
 
-def test_a_shorter_provider_hint_never_shortens_the_wait() -> None:
+async def test_a_shorter_provider_hint_never_shortens_the_wait() -> None:
     """CONSTITUTION §6.1: retrying into a rate limit is prohibited.
 
     A provider asking for 5s against a 60s floor must not get 5s. Honouring the
@@ -159,35 +159,35 @@ def test_a_shorter_provider_hint_never_shortens_the_wait() -> None:
     clock = FakeClock()
     manager = _manager(clock, default=60.0)
 
-    record = manager.enter(PROVIDER, MODEL, provider_hint=5.0)
+    record = await manager.enter(PROVIDER, MODEL, provider_hint=5.0)
 
     assert manager.remaining(PROVIDER, MODEL) == pytest.approx(60.0)
     assert record.source == "configured"
 
 
-def test_hint_source_is_recorded_for_diagnostics() -> None:
+async def test_hint_source_is_recorded_for_diagnostics() -> None:
     clock = FakeClock()
     manager = _manager(clock, default=10.0)
 
-    assert manager.enter(PROVIDER, MODEL, provider_hint=45.0).source == "provider_hint"
+    assert (await manager.enter(PROVIDER, MODEL, provider_hint=45.0)).source == "provider_hint"
 
 
-def test_no_hint_falls_back_to_the_configured_duration() -> None:
+async def test_no_hint_falls_back_to_the_configured_duration() -> None:
     clock = FakeClock()
     manager = _manager(clock, default=25.0)
 
-    record = manager.enter(PROVIDER, MODEL)
+    record = await manager.enter(PROVIDER, MODEL)
 
     assert manager.remaining(PROVIDER, MODEL) == pytest.approx(25.0)
     assert record.source == "configured"
 
 
-def test_zero_hint_does_not_produce_a_zero_wait() -> None:
+async def test_zero_hint_does_not_produce_a_zero_wait() -> None:
     """A hint of zero must not be treated as 'no wait at all'."""
     clock = FakeClock()
     manager = _manager(clock, default=60.0)
 
-    manager.enter(PROVIDER, MODEL, provider_hint=0.0)
+    await manager.enter(PROVIDER, MODEL, provider_hint=0.0)
 
     assert manager.remaining(PROVIDER, MODEL) == pytest.approx(60.0)
 
@@ -209,23 +209,23 @@ def test_duration_is_per_model_not_global() -> None:
     assert manager.configured_duration("google", "unconfigured") == 60.0
 
 
-def test_cooldown_is_isolated_per_model() -> None:
+async def test_cooldown_is_isolated_per_model() -> None:
     clock = FakeClock()
     manager = _manager(clock)
-    manager.enter(PROVIDER, MODEL)
+    await manager.enter(PROVIDER, MODEL)
 
     assert not manager.is_cooling(PROVIDER, "gemini-3.5-pro")
     assert not manager.is_cooling("mistral", MODEL)
 
 
-def test_re_entering_extends_the_wait() -> None:
+async def test_re_entering_extends_the_wait() -> None:
     """A second rate limit while cooling must not shorten the cooldown."""
     clock = FakeClock()
     manager = _manager(clock, default=60.0)
-    manager.enter(PROVIDER, MODEL)
+    await manager.enter(PROVIDER, MODEL)
 
     clock.advance(50)
-    manager.enter(PROVIDER, MODEL)
+    await manager.enter(PROVIDER, MODEL)
 
     assert manager.remaining(PROVIDER, MODEL) == pytest.approx(60.0)
 
@@ -233,7 +233,7 @@ def test_re_entering_extends_the_wait() -> None:
 # --- Window-derived cooldown ---
 
 
-def test_enter_until_covers_a_daily_window() -> None:
+async def test_enter_until_covers_a_daily_window() -> None:
     """A daily budget exhausted at 23:50 cannot be retried in sixty seconds.
 
     Google's free tier is dominated by a requests-per-day ceiling, so a
@@ -243,7 +243,7 @@ def test_enter_until_covers_a_daily_window() -> None:
     manager = _manager(clock)
     midnight = clock.now + 600
 
-    manager.enter_until(PROVIDER, MODEL, midnight, reason="window_exhausted")
+    await manager.enter_until(PROVIDER, MODEL, midnight, reason="window_exhausted")
 
     assert manager.remaining(PROVIDER, MODEL) == pytest.approx(600.0)
     clock.advance(599)
@@ -252,11 +252,11 @@ def test_enter_until_covers_a_daily_window() -> None:
     assert not manager.is_cooling(PROVIDER, MODEL)
 
 
-def test_enter_until_in_the_past_is_immediately_available() -> None:
+async def test_enter_until_in_the_past_is_immediately_available() -> None:
     clock = FakeClock()
     manager = _manager(clock)
 
-    manager.enter_until(PROVIDER, MODEL, clock.now - 1)
+    await manager.enter_until(PROVIDER, MODEL, clock.now - 1)
 
     assert not manager.is_cooling(PROVIDER, MODEL)
 
@@ -264,12 +264,12 @@ def test_enter_until_in_the_past_is_immediately_available() -> None:
 # --- Logging safety ---
 
 
-def test_record_never_carries_provider_text() -> None:
+async def test_record_never_carries_provider_text() -> None:
     """CONSTITUTION §9.1: provider bodies can echo prompt content."""
     clock = FakeClock()
     manager = _manager(clock)
 
-    record = manager.enter(PROVIDER, MODEL, reason="rate_limited")
+    record = await manager.enter(PROVIDER, MODEL, reason="rate_limited")
     described = record.describe()
 
     assert "rate_limited" in described
@@ -287,7 +287,7 @@ def test_config_cooldown_default_is_configurable_per_model() -> None:
     assert model.cooldown_seconds == 300.0
 
 
-def test_config_rejects_a_non_positive_cooldown() -> None:
+async def test_config_rejects_a_non_positive_cooldown() -> None:
     """A zero cooldown would mean 'do not wait', which is the prohibited retry."""
     with pytest.raises(ValueError):
         ModelConfig(id="m/m", provider="m", provider_id="m", cooldown_seconds=0.0)
@@ -305,7 +305,7 @@ def test_config_default_covers_a_rolling_window() -> None:
 # --- Retry-After header ---
 
 
-def test_retry_after_seconds_form() -> None:
+async def test_retry_after_seconds_form() -> None:
     assert parse_retry_after_seconds(FakeHeaders(**{"Retry-After": "30"})) == 30.0
 
 
@@ -313,7 +313,7 @@ def test_retry_after_whitespace_and_float() -> None:
     assert parse_retry_after_seconds(FakeHeaders(**{"Retry-After": " 45.5 "})) == 45.5
 
 
-def test_retry_after_absent_returns_none() -> None:
+async def test_retry_after_absent_returns_none() -> None:
     assert parse_retry_after_seconds(FakeHeaders()) is None
 
 
@@ -323,7 +323,7 @@ def test_retry_after_unparseable_returns_none_rather_than_guessing() -> None:
     assert parse_retry_after_seconds(None) is None
 
 
-def test_retry_after_http_date_form() -> None:
+async def test_retry_after_http_date_form() -> None:
     """The second documented form. Evaluated against the wall clock."""
     future = format_datetime(datetime.now(UTC) + timedelta(seconds=120), usegmt=True)
 
@@ -342,7 +342,7 @@ def test_retry_after_http_date_in_the_past_floors_at_zero() -> None:
 # --- Google RetryInfo ---
 
 
-def test_retry_info_delay_is_parsed() -> None:
+async def test_retry_info_delay_is_parsed() -> None:
     body = {
         "error": {
             "code": 429,
@@ -374,7 +374,7 @@ def test_retry_info_parses_a_fractional_delay() -> None:
     assert parse_retry_delay_seconds(body) == pytest.approx(45.06576809)
 
 
-def test_retry_info_absent_returns_none() -> None:
+async def test_retry_info_absent_returns_none() -> None:
     body = {"error": {"details": [{"@type": "type.googleapis.com/google.rpc.Help"}]}}
 
     assert parse_retry_delay_seconds(body) is None
@@ -394,7 +394,7 @@ def test_retry_info_malformed_duration_returns_none() -> None:
     assert parse_retry_delay_seconds(body) is None
 
 
-def test_retry_info_non_string_duration_returns_none() -> None:
+async def test_retry_info_non_string_duration_returns_none() -> None:
     body = {
         "error": {
             "details": [{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": 16}]
@@ -404,7 +404,7 @@ def test_retry_info_non_string_duration_returns_none() -> None:
     assert parse_retry_delay_seconds(body) is None
 
 
-def test_the_longest_hint_wins_across_header_and_body() -> None:
+async def test_the_longest_hint_wins_across_header_and_body() -> None:
     """Header and body are independent hints; the later wait governs."""
     clock = FakeClock()
     manager = _manager(clock, default=10.0)
@@ -419,6 +419,6 @@ def test_the_longest_hint_wins_across_header_and_body() -> None:
             }
         }
     )
-    manager.enter(PROVIDER, MODEL, provider_hint=max(x for x in (header, body) if x))
+    await manager.enter(PROVIDER, MODEL, provider_hint=max(x for x in (header, body) if x))
 
     assert manager.remaining(PROVIDER, MODEL) == pytest.approx(45.0)

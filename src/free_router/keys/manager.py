@@ -34,11 +34,14 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Any
 
 from pydantic import SecretStr
+
+from free_router.core.timestamps import to_iso
 
 __all__ = [
     "KeyManager",
@@ -155,6 +158,7 @@ class KeyManager:
         material: Mapping[tuple[str, str], Mapping[str, SecretStr]],
         *,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
     ) -> None:
         """Build a manager from resolved key material.
 
@@ -163,6 +167,9 @@ class KeyManager:
                 as returned by ``Config.resolve_key_material()``.
             clock: Monotonic time source, injected so tests do not sleep and so
                 ordering does not depend on wall-clock adjustments.
+            wall_clock: Wall-clock source, used only to stamp persisted rows.
+                Ordering stays on the monotonic clock; durations are measured
+                there because it is immune to an NTP step.
         """
         self._pools: dict[tuple[str, str], _Pool] = {}
         for (provider, model_id), slots in material.items():
@@ -178,6 +185,7 @@ class KeyManager:
                 ]
             )
         self._clock = clock
+        self._wall_clock = wall_clock
         self._sequence = 0
         """Monotonic ordinal for LRU ordering. Independent of the clock."""
         self._lock = asyncio.Lock()
@@ -249,6 +257,88 @@ class KeyManager:
                 self._sequence += 1
                 pool.last_used[key.alias] = self._sequence
                 pool.last_used_at[key.alias] = self._clock()
+
+    def export_key_state(self) -> list[dict[str, Any]]:
+        """Serialise per-credential selection state for persistence.
+
+        The credential is identified by its **alias**. No key material is
+        exported, and no column could hold any: the material comes from the
+        environment at every start, so a state dump cannot leak a secret.
+
+        Rows are keyed by ``(provider, alias)``, which is how the table is
+        keyed -- and it is the right key, because the same alias under two
+        models of one provider names the *same* credential. The environment
+        variable is derived from the provider and the alias alone
+        (``<PROVIDER>_KEY_<ALIAS>``), so two models declaring ``primary`` share
+        one secret and must share one row.
+
+        The ordinal exported is therefore the **highest** across the pools that
+        hold the credential, and the suspension is the union. A credential used
+        through one model has still been used.
+        """
+        ordinals: dict[tuple[str, str], int] = {}
+        suspended: dict[tuple[str, str], bool] = {}
+        seen: set[tuple[str, str]] = set()
+
+        for (provider, _model_id), pool in self._pools.items():
+            for key in pool.keys:
+                identity = (provider, key.alias)
+                seen.add(identity)
+                ordinal = pool.last_used.get(key.alias, -1)
+                if ordinal > ordinals.get(identity, -1):
+                    ordinals[identity] = ordinal
+                if key.alias in pool.suspended:
+                    suspended[identity] = True
+
+        return [
+            {
+                "provider": provider,
+                "alias": alias,
+                "last_used_ordinal": ordinals.get((provider, alias), -1),
+                "suspended": suspended.get((provider, alias), False),
+                "updated_at": to_iso(self._wall_clock()),
+            }
+            for provider, alias in sorted(seen)
+        ]
+
+    async def import_key_state(self, rows: Sequence[Mapping[str, Any]]) -> int:
+        """Restore selection order from persisted rows.
+
+        **The ordinal counter must be seeded above the highest restored
+        ordinal.** A fresh process starts its counter at zero, so a restored
+        ordinal of 500 and a freshly assigned ordinal of 1 would invert the LRU
+        order *and* collide with it. The counter is the durable part of the
+        ordering, and restoring it without the counter is worse than not
+        restoring it at all.
+
+        The suspension is **not** restored. A cooldown is time-bounded and
+        safely restorable; a suspension is event-shaped and resolved by events
+        the router cannot observe, and a credential revoked an hour ago may
+        have been fixed since. Resurrecting the suspension would refuse a
+        working key and surface a confusing 503 instead of the 401 that would
+        diagnose it.
+        """
+        restored = 0
+        highest = -1
+        for row in rows:
+            provider = row.get("provider")
+            alias = row.get("alias")
+            if not provider or not alias:
+                continue
+            ordinal = row.get("last_used_ordinal")
+            ordinal_value = -1 if ordinal is None else int(ordinal)
+            for (pool_provider, _model_id), pool in self._pools.items():
+                if pool_provider != provider:
+                    continue
+                if not any(key.alias == alias for key in pool.keys):
+                    continue
+                if ordinal_value >= 0:
+                    pool.last_used[alias] = ordinal_value
+                    highest = max(highest, ordinal_value)
+                restored += 1
+        if highest >= 0:
+            self._sequence = max(self._sequence, highest + 1)
+        return restored
 
     async def suspend(self, provider: str, model_id: str, alias: str) -> None:
         """Take a credential out of rotation.
