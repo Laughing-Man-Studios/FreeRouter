@@ -210,7 +210,7 @@ quota_windows
   resource, window_seconds      (composite key)
   reset_kind                    rolling | fixed
   reset_at                      fixed windows only
-  bucket_used                   JSON map of bucket ordinal -> amount
+  entries                       JSON list of {at, reserved, actual}
   flushed_at
 
 cooldowns
@@ -228,29 +228,87 @@ key_state
   provider, alias               (composite key, primary)
   last_used_ordinal
   suspended                     boolean — suspension is in-memory and resets at boot
+  updated_at
 ```
 
-Four decisions are worth stating because they are not obvious from the schema:
+**This shape changed during Batch 1, and the reasons are worth recording** — the
+original draft specified `bucket_used` as a JSON map of bucket ordinal to amount,
+which would have been wrong in two independent ways.
 
-- **`bucket_used` is a JSON map keyed by bucket ordinal**, mirroring `_Window`'s
-  in-memory buckets. A relational row per bucket would multiply rows unboundedly
-  on a rolling window and make the flush far more expensive than the state it
-  holds.
-- **`reset_at` is stored for fixed windows only.** Google's RPD resets at midnight
-  Pacific; a rolling window has no such instant. Modelling both as one nullable
-  column keeps the dimension model uniform.
-- **`suspended` is stored but not restored.** Credential suspension is M1's
-  conservative response to an auth failure. A credential that was revoked an hour
-  ago may have been fixed since; resurrecting the suspension would refuse a
-  working key. Cooldowns are time-bounded and so are restorable; suspensions are
-  event-shaped and so are not.
-- **`request_logs` is left alone.** It is M0's telemetry table and is not a quota
-  source. Reading quota state back from request logs would require reconstructing
-  rolling windows from individual rows on every boot — correct but far more
-  expensive, and it would make a corrupt log row fatal to startup.
+**A rolling window is a sum over ages, not over buckets.** The in-memory window
+keeps a flat list of reservations and computes a rolling window by summing those
+within the trailing period; bucketing exists only for a *fixed* window. A
+per-bucket total therefore cannot reconstruct a rolling window: the boundary
+slices of a bucket fall inside the trailing period on one side and outside it on
+the other, and the two halves differ. The persisted unit is the reservation
+list, which is exactly what the in-memory window holds.
+
+**Timestamps are wall-clock, not monotonic.** The tracker measures durations on a
+monotonic clock, which is right for measuring intervals — it is immune to an NTP
+step. But a monotonic value is only meaningful against the current boot, so
+persisting one and restoring it after a reboot would restore nonsense. Wall-clock
+instants survive a reboot and a container recreate. The conversion into the
+local monotonic domain happens at the persistence boundary.
+
+**The estimate and the actual are stored separately.** Each entry keeps
+`reserved` alongside `actual`, rather than the two being collapsed into one
+effective figure. Collapsing them would make estimator drift unmeasurable after
+a restart, and the console cross-check is the only independent check available.
+This is `spec.md` Behavioral Rule 9, and the schema is where it is enforced.
+
+**`reset_at` is stored for fixed windows only.** Google's RPD resets at midnight
+Pacific; a rolling window has no such instant. Modelling both as one nullable
+column keeps the dimension model uniform.
+
+**`key_state` carries `updated_at`.** The original draft had none, and it was
+added during Batch 1. `suspended` is persisted for *inspection*, and a
+suspension with no timestamp says only that it happened, not when — which is
+almost the whole value of keeping the column at all.
+
+**`suspended` is stored but not restored.** Credential suspension is M1's
+conservative response to an auth failure. A credential that was revoked an hour
+ago may have been fixed since; resurrecting the suspension would refuse a
+working key. Cooldowns are time-bounded and so are restorable; suspensions are
+event-shaped and so are not.
+
+**`request_logs` is left alone.** It is M0's telemetry table and is not a quota
+source. Reading quota state back from request logs would require reconstructing
+rolling windows from individual rows on every boot — correct but far more
+expensive, and it would make a corrupt log row fatal to startup.
 
 **No payload columns exist in any of these tables**, which is what makes a state
 dump safe to paste into an issue.
+
+### A second landmine: the pre-Alembic adoption path
+
+M0 derived the adoption path's expected table set from the *current* schema, and
+its own docstring said this was only correct "while there is exactly one
+revision", and that "when a second revision lands, the adoption path must be
+reconsidered". Batch 1 is that moment.
+
+Keeping the derivation would have required a pre-Alembic database to contain the
+M2 tables as well, so it would never have been recognised as adoptable, and the
+upgrade would have tried to create tables that already existed. The set is now
+pinned to the initial revision, and **the adoption path stamps at that revision
+and then upgrades** — stamping at head would mark a legacy database as already
+carrying the later tables, and they would never be created.
+
+The revision's own text is the authority, and a test asserts the pinned set
+against what that revision actually creates, so the two cannot drift.
+
+### A pre-existing gap: the fixed window's boundary
+
+`WindowReset.FIXED` is documented as resetting "at a wall-clock boundary, e.g.
+midnight Pacific for Google's RPD", but the implementation buckets on the
+monotonic clock, so a fixed window actually resets at a machine-boot-aligned
+boundary instead.
+
+**No fixed window is currently configured** — the shipped configuration declares
+only rolling dimensions — so nothing is misbehaving today. But `reset_at` in the
+persisted state records the *documented* wall-clock boundary, and that is not
+what the in-memory window computes. Batch 2 must reconcile the two, and the
+reconciliation belongs in the window implementation rather than in the
+persistence layer, which should not decide what a bucket means.
 
 ## External Integrations
 
@@ -360,12 +418,16 @@ A long stream holds a reservation far longer than a unary request, so in-flight
 capacity is held longer. A single-user router will not notice; the design should
 not become the reason it would.
 
-### `bucket_used` as JSON trades queryability for write cost
+### `entries` as JSON trades queryability for write cost
 
-Per-bucket rows would be queryable but would multiply writes. Since the primary
-consumer is "restore and continue", not "query the last hour", the trade favours
-the cheap write. Recorded because it would need revisiting if an operator-facing
-usage report is ever built.
+A row per reservation would be queryable but would multiply writes and rows. Since
+the primary consumer is "restore and continue", not "query the last hour", the
+trade favours the cheaper shape. Recorded because it would need revisiting if an
+operator-facing usage report is ever built.
+
+The list is bounded in practice by the dimension's own limit: a window that has
+exhausted its allowance refuses further requests rather than recording them, so
+a daily window holds at most a day of requests.
 
 ### M2 may not move the success rate
 
