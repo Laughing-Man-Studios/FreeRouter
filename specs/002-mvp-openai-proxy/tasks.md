@@ -385,6 +385,52 @@ Mistral adapter landed in Batch 2. `MISTRAL_KEY_PRIMARY` added with a conditiona
 default, so a Google-only deployment still starts without it. `ROUTER_DEBUG_PAYLOAD_LOG`
 added alongside it.
 
+### Regression caught in review: the shipped config was untested
+
+PR #61's **Docker Build** check failed on the first run. Not expected, and not a
+flake — a real regression introduced in this batch, and the CI check was correct.
+
+T040's two-provider measurement needed the Mistral model in `config.yaml`. Adding
+it made **`MISTRAL_KEY_PRIMARY` mandatory**, because every declared credential is
+required and a missing one aborts startup by design (CONSTITUTION §9.2, ADR-0002).
+CI's smoke test supplies `GOOGLE_KEY_PRIMARY` alone, so the container aborted:
+
+```
+CRITICAL startup_failed config_invalid Model 'mistral/ministral-3b-2512' declares
+  key alias 'primary', but no environment variable MISTRAL_KEY_PRIMARY is set.
+```
+
+**All 435 tests passed while this was broken.** Every configuration test writes its
+own file through the `write_config` fixture, so **nothing in the suite loaded the
+one file every deployment actually uses.** That is the real defect, and it is
+bigger than the CI break.
+
+**Resolved by reverting the config, not by patching CI.** Batch 2 deliberately
+shipped the adapter *without* declaring the model — `core/config.py` and
+`api/routes.py` were left unmodified so it is "selectable purely through
+configuration". This batch overrode that for measurement convenience. The Mistral
+entry now appears in `config.yaml` as a documented, commented opt-in block, so the
+capability stays discoverable without becoming a mandatory second credential.
+
+**Gap closed — `tests/test_shipped_config.py`** loads the real file: it must parse,
+carry no credential-shaped field (checked against the *parsed* document — a
+substring scan over the raw text fires on this config's own comments about
+"tokens"), require only credentials `MANAGED_ENV_VARS` clears, resolve from its own
+declared slots, and **still start given only `GOOGLE_KEY_PRIMARY`**.
+
+**Verified load-bearing, not decorative.** Re-injecting the Mistral entry makes
+`test_a_google_only_deployment_still_starts` fail with *the exact CI error message*.
+Restoring the config returns the suite to green.
+
+**What remains uncovered, deliberately.** The unit suite cannot know which
+credentials a container will be *given* — that lives in `ci.yml` and
+`docker-compose.yml`, and reading workflow syntax into a unit test would assert on
+the wrong thing. The cross-file contract stays checked by the CI smoke test, which
+starts the real image with the real environment. Both `config.yaml` and `ci.yml`
+now carry a warning at the point of edit, so the next person meets it there.
+
+**Full suite after the fix: 441 passing**, up from 435.
+
 ---
 
 ## Ordering Rationale
