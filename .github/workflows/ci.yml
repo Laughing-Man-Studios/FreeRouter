@@ -166,6 +166,13 @@ jobs:
           # authenticity, so this exercises the real startup path with no
           # provider access. The variable name is DERIVED by ADR-0003 from the
           # provider and the alias, not chosen here.
+          #
+          # This is the ONLY check that the shipped config.yaml and the
+          # environment a container is given agree. Every credential a model in
+          # config.yaml declares is REQUIRED and a missing one aborts startup,
+          # so adding a model there without adding its credential here fails
+          # exactly as it did in Batch 6. The unit suite cannot catch this -- it
+          # writes its own config -- hence this step. See config.yaml.
           docker run -d --name router -p 8000:8000 \
             -e GOOGLE_KEY_PRIMARY=ci-placeholder-key \
             free-router:ci

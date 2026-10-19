@@ -33,6 +33,7 @@ from typing import Any
 
 import httpx
 
+from free_router.core.debug_logging import debug_payload
 from free_router.core.exceptions import (
     ProviderAuthError,
     ProviderRateLimitError,
@@ -117,8 +118,15 @@ class GoogleAdapter:
         }
         payload = to_gemini_request(request)
 
+        # The headers are deliberately not passed here: the credential travels in
+        # x-goog-api-key, and the debug stream's redaction is a backstop for
+        # unanticipated cases, not a licence to hand it a header mapping.
+        debug_payload(
+            phase="wire_request", provider="google", model=provider_model_id, data=payload
+        )
         response = await self._send(url, headers, payload)
         raw = await self._read_body(response)
+        debug_payload(phase="wire_response", provider="google", model=provider_model_id, data=raw)
         return from_gemini_response(raw, provider_model_id)
 
     async def _send(

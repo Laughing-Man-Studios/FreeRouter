@@ -2,3 +2,42 @@ models:
   - id: "google/gemini-3.5-flash-lite"
     provider: "google"
     provider_id: "gemini-3.5-flash-lite"
+
+# The Mistral adapter ships in M1 (Issue #7) and is selectable purely through
+# configuration -- `core/config.py` and `api/routes.py` were deliberately left
+# unmodified by Batch 2. It is NOT declared here by default, for one reason:
+#
+#   Every credential a model declares is REQUIRED. Adding the Mistral entry makes
+#   MISTRAL_KEY_PRIMARY mandatory, and startup aborts without it -- by design
+#   (CONSTITUTION 9.2, ADR-0002). That would mean a Google-only operator can no
+#   longer start the router, which is a deployment-contract change nobody asked
+#   for.
+#
+# To enable it, add the entry and supply the credential:
+#
+#   - id: "mistral/ministral-3b-2512"
+#     provider: "mistral"
+#     provider_id: "ministral-3b-2512"
+#     # Measured free-tier limits (Issue #7, workspace console):
+#     #   12.50 requests/second, 1,300,000 tokens/minute.
+#     # Recorded as measured rather than published -- neither provider documents
+#     # free-tier figures. See spec.md section 4.
+#     #
+#     # No daily (RPD) dimension is declared: Mistral's console shows no daily
+#     # ceiling, and an unverified limit is omitted rather than guessed. Omitting
+#     # it means "not enforced", which is a visible gap -- unlike declaring it
+#     # unlimited, which would be a false guarantee.
+#     quota:
+#       - resource: "requests"
+#         limit: 12.5
+#         window_seconds: 1
+#         provenance: "measured"
+#       - resource: "tokens"
+#         limit: 1300000
+#         window_seconds: 60
+#         provenance: "measured"
+#
+# WARNING: this file is baked into the image and the CI smoke test supplies only
+# GOOGLE_KEY_PRIMARY. Adding a model here without also passing its credential in
+# `.github/workflows/ci.yml` and `docker-compose.yml` will break the build. See
+# tests/test_shipped_config.py for what is and is not covered by the test suite.

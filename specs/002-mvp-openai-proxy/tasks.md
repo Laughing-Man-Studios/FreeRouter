@@ -273,9 +273,81 @@ The shipped `config.yaml` needs no change — a model with no `key_aliases` decl
 
 **Maps to GitHub Issue:** `#6 [M1 Epic] MVP OpenAI-Compatible Proxy`
 
-- [ ] **T038: Opt-in debug payload logging.** Implement full request/response logging behind explicit environment configuration, written to an **isolated** stream. When disabled, the existing structural guarantee holds unchanged (CONSTITUTION §9.1). This is a ROADMAP M1 deliverable that M0 skipped and no other issue owned.
-- [ ] **T039: Request pacing — SKIPPED, decision recorded.** Issue #51 found that neither Google's nor Mistral's documented terms impose mandatory request pacing, so CONSTITUTION §6.1's pacing requirement is **not triggered** for M1. No pacing is implemented. This stands as the recorded outcome rather than an open task; revisit only if a provider's terms change or Issue #51 is reopened.
-- [ ] **T040: Milestone verification.** Re-verify the specification end to end, measure the achieved success rate against the ≥80% target, confirm Issue #51 remains closed, and confirm the recorded CONSTITUTION §8.3 deviation is still accurate.
+- [x] **T038: Opt-in debug payload logging — complete.** New `core/debug_logging.py`, plus four integration points.
+
+  Enabled by `ROUTER_DEBUG_PAYLOAD_LOG=<path>`. Absent means disabled, and the operational formatter is neither modified nor aware of the module — so CONSTITUTION §9.1's structural guarantee holds unchanged rather than being re-established around an exception.
+
+  **Isolation is the design, not a side effect.** The debug logger is separate from the operational one and sets `propagate = False`. **The destination is a file, not a stream, and that choice was forced by the deployment:** Docker's logging driver merges stdout *and* stderr into one container log, so a stderr debug stream would merge into the operational stream and defeat the entire point. Verified against the running container, not only in tests.
+
+  **Credential-shaped values are redacted before writing**, so enabling the feature cannot disclose a key even when a provider echoes one in an error body. Adapters pass only payloads and never headers — credentials travel in headers — and redaction is the backstop for the case nobody anticipates.
+
+  **A test caught a real bug in that redaction.** The first implementation matched `api_key` and `apikey` as substrings, which **silently missed Google's own header, `x-goog-api-key`** — hyphenated, so neither pattern matched. The most important key in the codebase was the one the guard did not cover. Matching now strips separators before comparing, so `x-goog-api-key`, `api_key` and `apiKey` are recognised as one thing.
+
+  Redaction is deliberately **name-based, not pattern-based.** Guessing at key *shapes* would be fragile in both directions — missing unrecognised formats while mangling legitimate payload content, which is the very thing this stream exists to show in full.
+
+  Recorded: `ROUTER_DEBUG_PAYLOAD_LOG` joins `MANAGED_ENV_VARS` in `tests/conftest.py`, and an autouse fixture resets the module's enabled flag after every test. Both were real leak vectors — a developer with debug logging set in their shell would otherwise have had it apply to the whole suite, and a test that enabled it would have enabled it for every test after.
+- [x] **T039: Request pacing — SKIPPED, decision recorded.** Issue #51 found that neither Google's nor Mistral's documented terms impose mandatory request pacing, so CONSTITUTION §6.1's pacing requirement is **not triggered** for M1. No pacing is implemented. This stands as the recorded outcome rather than an open task; revisit only if a provider's terms change or Issue #51 is reopened.
+
+- [x] **T040: Milestone verification — measured 2026-10-18.**
+
+  Run against the containerised router (`free-router`, healthy) with both providers
+  configured in `config.yaml` and both credential slots resolving. 100 requests,
+  alternating Google and Mistral, three prompt lengths so the token dimension was
+  exercised rather than assumed.
+
+  | | |
+  | --- | --- |
+  | **Client-observed success rate** | **100/100 = 100.0%** (target ≥80%) |
+  | 95% Wilson interval | **[96.3%, 100%]** — clears the target by 16.3 pts |
+  | Per provider | `gemini-3.5-flash-lite` 50/50 · `ministral-3b-2512` 50/50 |
+  | Latency | p50 762 ms · p95 1366 ms · max 1901 ms |
+  | 429s · cooldowns · breaker trips | **none** |
+
+  **Conditions (recorded per `spec.md` § *Measuring the success rate*):**
+
+  - **Request volume: 100 requests on 2026-10-18**, 50 per model.
+  - **Against ceilings: 50 of Gemini's 500 RPD = 10.0%**; Mistral peaked at 0.5 of
+    12.5 RPS = 4.0%. **Volume did not approach the daily ceiling** — the call-out
+    `spec.md` asks for is a clean negative, so it is recorded as one.
+  - **Paced at 4 s** between requests (7.5 RPM per provider). Not incidental: Gemini's
+    binding limit is 15 RPM, so an unpaced script would have measured the *client's*
+    burstiness and reported it as a router defect.
+  - **Tracker active** throughout; all reservations reconciled.
+  - **Retry active and exercised twice** — Google returned `ProviderTimeoutError` on
+    attempt 1 at 02:42:58 and 02:43:59; both recovered on attempt 2. Client-observed
+    success is unaffected, but the router made 106 upstream dispatches for 104 client
+    requests.
+  - **Failover NOT exercised.** `failovers` is null on all 104 dispatches. T033 is
+    implemented and unit-tested but **this run provides no live evidence for it** —
+    recorded as unmeasured rather than let it read as verified.
+
+  **Honest limits of this result, which matter more than the headline:**
+
+  - **It is not comparable to M0's ~50% baseline and must not be read as a 50→100
+    improvement.** The conditions differ in the direction that flatters M1: this run
+    was paced and stayed at 10% of the daily ceiling. A like-for-like comparison was
+    not attempted, so none is claimed.
+  - **100% here does not predict 100% at sustained load.** At the real ceiling the
+    binding constraint becomes quota, not router quality. This run establishes the
+    router is *correct while within limits*; it says nothing about behaviour at the
+    boundary, which is where the ≥80% target will actually be tested in real use.
+  - **Retry contributed only 2 points.** With retry disabled the run would still have
+    scored 98%. The result reflects headroom, not the retry layer.
+
+  **Console cross-check (independent of the router's own accounting):** AI Studio
+  reported **53** RPD used. The router dispatched **54** Google calls — 52 client
+  requests plus the 2 timed-out retries. **Delta: +1, the router over-counting.**
+
+  The direction is the safe one: a quota system that reserves more than it consumes
+  cannot overshoot the ceiling. The most likely cause is one of the two timed-out
+  requests being aborted in flight, so the router recorded a dispatch the provider
+  never billed. **Attributed, not proven** — the router cannot distinguish an aborted
+  request from a billed one, and closing that gap would require trusting a provider's
+  own accounting over our own.
+
+  **Remaining T040 obligations:** Issue #51 confirmed still closed; the CONSTITUTION
+  §8.3 deviation (in-memory quota state, ADR-0004) re-confirmed still accurate and
+  still outstanding for M2.
 
 **Verification & Stop:**
 
@@ -284,6 +356,80 @@ The shipped `config.yaml` needs no change — a model with no `key_aliases` decl
 3. Confirm debug output does not appear in the operational stream **when enabled**.
 4. Record the measured success rate and the conditions under which it was measured.
 5. **STOP**, review, then close Issues #6 and milestone #2 (M1).
+
+**Batch 6 verification gate (2026-10-18):**
+
+1. `ruff check .`, `ruff format --check .`, `mypy --strict src/` — clean. Full
+   `pytest`: **435 passing**, up from 418.
+2. **Debug disabled — run against the live container.** One request carrying the
+   canary prompt `ZEBRAFISH-CANARY-9f3a2b` produced four operational records
+   (`provider_dispatched`, `provider_responded`, `dispatch_completed`,
+   `request_completed`), all telemetry only. Canary **absent**; payload-shaped keys
+   (`messages`, `content`, `data`, `normalized`) **absent**; `AIza` /
+   `x-goog-api-key` **absent**; **no debug file created**.
+3. **Debug enabled — run against the live container.** The same request produced
+   **0 canary occurrences in the operational stream** and **4 debug records**
+   (`inbound`, `wire_request`, `wire_response`, `client_response`) in the file.
+   Asserted as a *difference*, not an absence: the canary was confirmed present in
+   the debug file first, so "not in the operational stream" cannot pass vacuously
+   if the feature were broken. No credential material in either stream.
+4. Success rate recorded above: **100/100**, with its conditions and its limits.
+5. Disabled is the restored default — confirmed by deleting the debug file,
+   reissuing the request, and observing that **no file was recreated**.
+
+**Also fixed, found while running the gate:** `docker-compose.yml` passed only
+`GOOGLE_KEY_PRIMARY`. With a Mistral model configured the container would have
+failed at startup — the `:?` guard that reports a missing Google key loudly simply
+did not exist for the second provider, because compose was never updated when the
+Mistral adapter landed in Batch 2. `MISTRAL_KEY_PRIMARY` added with a conditional
+default, so a Google-only deployment still starts without it. `ROUTER_DEBUG_PAYLOAD_LOG`
+added alongside it.
+
+### Regression caught in review: the shipped config was untested
+
+PR #61's **Docker Build** check failed on the first run. Not expected, and not a
+flake — a real regression introduced in this batch, and the CI check was correct.
+
+T040's two-provider measurement needed the Mistral model in `config.yaml`. Adding
+it made **`MISTRAL_KEY_PRIMARY` mandatory**, because every declared credential is
+required and a missing one aborts startup by design (CONSTITUTION §9.2, ADR-0002).
+CI's smoke test supplies `GOOGLE_KEY_PRIMARY` alone, so the container aborted:
+
+```text
+CRITICAL startup_failed config_invalid Model 'mistral/ministral-3b-2512' declares
+  key alias 'primary', but no environment variable MISTRAL_KEY_PRIMARY is set.
+```
+
+**All 435 tests passed while this was broken.** Every configuration test writes its
+own file through the `write_config` fixture, so **nothing in the suite loaded the
+one file every deployment actually uses.** That is the real defect, and it is
+bigger than the CI break.
+
+**Resolved by reverting the config, not by patching CI.** Batch 2 deliberately
+shipped the adapter *without* declaring the model — `core/config.py` and
+`api/routes.py` were left unmodified so it is "selectable purely through
+configuration". This batch overrode that for measurement convenience. The Mistral
+entry now appears in `config.yaml` as a documented, commented opt-in block, so the
+capability stays discoverable without becoming a mandatory second credential.
+
+**Gap closed — `tests/test_shipped_config.py`** loads the real file: it must parse,
+carry no credential-shaped field (checked against the *parsed* document — a
+substring scan over the raw text fires on this config's own comments about
+"tokens"), require only credentials `MANAGED_ENV_VARS` clears, resolve from its own
+declared slots, and **still start given only `GOOGLE_KEY_PRIMARY`**.
+
+**Verified load-bearing, not decorative.** Re-injecting the Mistral entry makes
+`test_a_google_only_deployment_still_starts` fail with *the exact CI error message*.
+Restoring the config returns the suite to green.
+
+**What remains uncovered, deliberately.** The unit suite cannot know which
+credentials a container will be *given* — that lives in `ci.yml` and
+`docker-compose.yml`, and reading workflow syntax into a unit test would assert on
+the wrong thing. The cross-file contract stays checked by the CI smoke test, which
+starts the real image with the real environment. Both `config.yaml` and `ci.yml`
+now carry a warning at the point of edit, so the next person meets it there.
+
+**Full suite after the fix: 441 passing**, up from 435.
 
 ---
 

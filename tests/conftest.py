@@ -25,6 +25,7 @@ MANAGED_ENV_VARS = (
     "LOG_LEVEL",
     "ROUTER_CONFIG_PATH",
     "ROUTER_DB_PATH",
+    "ROUTER_DEBUG_PAYLOAD_LOG",
 )
 """Environment variables that must not leak into a test.
 
@@ -109,6 +110,27 @@ def ready_app(
     monkeypatch.setenv("ROUTER_DB_PATH", str(tmp_path / "router.db"))
 
     yield create_app
+
+
+@pytest.fixture
+def reset_debug_logging() -> Iterator[None]:
+    """Restore the debug payload logger to disabled after every test.
+
+    ``debug_logging`` keeps its enabled flag in a module global, because it is
+    read on every call site in the request path. Without this, a test that enables
+    payload logging would silently enable it for every test that follows, and the
+    "disabled by default" guarantee would only ever be verified once per run.
+    """
+    from free_router.core.debug_logging import configure_debug_payload_logging
+
+    yield
+    configure_debug_payload_logging({})
+
+
+@pytest.fixture(autouse=True)
+def _isolate_debug_logging(reset_debug_logging: None) -> None:
+    """Apply :func:`reset_debug_logging` to every test in the suite."""
+    assert reset_debug_logging is None
 
 
 @pytest.fixture

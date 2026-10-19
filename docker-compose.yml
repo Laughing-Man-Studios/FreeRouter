@@ -34,6 +34,19 @@ services:
       # crash-loop afterwards.
       # Derived from the provider and alias per ADR-0003; not configurable here.
       GOOGLE_KEY_PRIMARY: ${GOOGLE_KEY_PRIMARY:?GOOGLE_KEY_PRIMARY must be exported or set in .env}
+      # Required whenever config.yaml declares a Mistral model. Startup resolves a
+      # credential for every declared slot and aborts if one is missing, so this
+      # must be passed through for a two-provider deployment to start at all.
+      MISTRAL_KEY_PRIMARY: ${MISTRAL_KEY_PRIMARY:-}
+      # Opt-in debug payload logging (T038). Unset disables it, and the
+      # operational log stream is then byte-for-byte what it was before.
+      #
+      # A path inside the container, not a stream: Docker's logging driver merges
+      # stdout and stderr into one container log, so writing payloads to stderr
+      # would merge them into the operational stream and defeat the isolation that
+      # makes this feature safe. /data is the named volume, so the file survives a
+      # restart and can be read back with `docker compose exec`.
+      ROUTER_DEBUG_PAYLOAD_LOG: ${ROUTER_DEBUG_PAYLOAD_LOG:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
     volumes:
