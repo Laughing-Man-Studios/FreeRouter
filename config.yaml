@@ -2,3 +2,24 @@ models:
   - id: "google/gemini-3.5-flash-lite"
     provider: "google"
     provider_id: "gemini-3.5-flash-lite"
+  - id: "mistral/ministral-3b-2512"
+    provider: "mistral"
+    provider_id: "ministral-3b-2512"
+    # Measured free-tier limits (Issue #7, workspace console):
+    #   12.50 requests/second, 1,300,000 tokens/minute.
+    # Recorded as measured rather than published -- neither provider documents
+    # free-tier figures. See spec.md section 4.
+    #
+    # No daily (RPD) dimension is declared: Mistral's console shows no daily
+    # ceiling, and an unverified limit is omitted rather than guessed. Omitting
+    # it means "not enforced", which is a visible gap -- unlike declaring it
+    # unlimited, which would be a false guarantee.
+    quota:
+      - resource: "requests"
+        limit: 12.5
+        window_seconds: 1
+        provenance: "measured"
+      - resource: "tokens"
+        limit: 1300000
+        window_seconds: 60
+        provenance: "measured"

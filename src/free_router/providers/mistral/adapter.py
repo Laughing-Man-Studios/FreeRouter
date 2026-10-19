@@ -41,6 +41,7 @@ from typing import Any
 
 import httpx
 
+from free_router.core.debug_logging import debug_payload
 from free_router.core.exceptions import (
     ProviderAuthError,
     ProviderRateLimitError,
@@ -133,8 +134,15 @@ class MistralAdapter:
         }
         payload = to_mistral_request(request, provider_model_id)
 
+        # Headers are excluded deliberately: the credential travels in
+        # Authorization. Redaction in the debug stream is a backstop for
+        # unanticipated cases, not a licence to hand it a header mapping.
+        debug_payload(
+            phase="wire_request", provider="mistral", model=provider_model_id, data=payload
+        )
         response = await self._send(url, headers, payload)
         raw = await self._read_body(response)
+        debug_payload(phase="wire_response", provider="mistral", model=provider_model_id, data=raw)
         return from_mistral_response(raw, provider_model_id)
 
     async def _send(

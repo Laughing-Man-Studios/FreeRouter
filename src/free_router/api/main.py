@@ -28,6 +28,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from free_router.api.health import health_router
 from free_router.api.routes import router
 from free_router.core.config import Config, ConfigError, load_config
+from free_router.core.debug_logging import configure_debug_payload_logging
 from free_router.core.dispatch import Dispatcher
 from free_router.core.exceptions import (
     NoAvailableCapacityError,
@@ -89,6 +90,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     so that a fatal error in any later step is itself logged correctly.
     """
     configure_logging(os.environ.get("LOG_LEVEL", "INFO"))
+    # Configured separately and strictly after the operational stream, so the
+    # debug handler can never be the reason the operational one is misconfigured.
+    configure_debug_payload_logging()
 
     app.state.config = await _startup_step("config_invalid", _load_config)
     app.state.db_engine = await _startup_step("database_init_failed", _init_database)

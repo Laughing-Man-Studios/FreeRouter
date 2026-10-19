@@ -17,6 +17,7 @@ from typing import Any, cast
 from fastapi import APIRouter, Depends, Request
 
 from free_router.core.config import Config
+from free_router.core.debug_logging import debug_payload
 from free_router.core.dispatch import Dispatcher
 from free_router.core.exceptions import UnsupportedModelError, ValidationError
 from free_router.core.logging import log_context
@@ -121,6 +122,13 @@ async def chat_completions(
     request.state.model = normalized.model
     request.state.provider = provider
 
+    debug_payload(
+        phase="inbound",
+        provider=provider,
+        model=normalized.model,
+        data={"client_request": payload, "normalized": normalized.model_dump()},
+    )
+
     # The context is opened here rather than inside the dispatcher so that every
     # record the dispatcher emits -- provider_dispatched, provider_rate_limited,
     # credential_suspended, and the rest -- carries the externally-requested
@@ -140,12 +148,19 @@ async def chat_completions(
         )
 
     response = outcome.response
-    return to_openai_completion(
+    completion = to_openai_completion(
         response,
         request_model=normalized.model,
         response_id=f"chatcmpl-{_completion_id(normalized, response, provider_id)}",
         created=int(datetime.now(tz=UTC).timestamp()),
     )
+    debug_payload(
+        phase="client_response",
+        provider=provider,
+        model=normalized.model,
+        data=completion,
+    )
+    return completion
 
 
 async def _read_json_object(request: Request) -> dict[str, Any]:
