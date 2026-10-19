@@ -28,10 +28,13 @@ a provider echoes one back inside an error body. Header mappings are never passe
 in by callers -- credentials travel in headers -- and redaction is the backstop for
 the case nobody thinks of.
 
-Redaction is deliberately name-based rather than pattern-based. Guessing at key
-*shapes* to catch secrets would be fragile in both directions: it would miss
-unrecognised formats and mangle legitimate payload content, which is the very thing
-this stream exists to show in full.
+Redaction matches credential-bearing **phrases**, not loose substrings. A loose
+substring is fragile in both directions, and both directions have bitten this
+module: a bare ``token`` substring mangles legitimate usage fields
+(``promptTokenCount``, ``max_tokens``) while missing ``private_key`` entirely. The
+stream exists to show payload content in full, so mangling it defeats the purpose;
+missing a credential defeats the guarantee. A rule that produces both failures
+cannot be right.
 """
 
 from __future__ import annotations
@@ -61,21 +64,64 @@ _BACKUP_COUNT = 3
 _REDACTED = "[redacted]"
 _SEPARATOR_RE = re.compile(r"[^a-z0-9]")
 
-_SENSITIVE_KEY_PARTS = (
+_WORD_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z]*|[a-z]+|\d+")
+
+_CREDENTIAL_PHRASES = (
     "apikey",
     "authorization",
     "credential",
     "password",
     "secret",
-    "token",
+    "passphrase",
+    "accesstoken",
+    "authtoken",
+    "apitoken",
+    "bearertoken",
+    "idtoken",
+    "refreshtoken",
+    "sessiontoken",
+    "privatekey",
+    "signingkey",
+    "encryptionkey",
+    "clientkey",
 )
-"""Substrings marking a mapping key as credential-bearing.
+"""Phrases marking a mapping key as credential-bearing.
 
 Compared against the key with separators stripped, because credential-bearing names
 are spelled inconsistently: Google's own header is ``x-goog-api-key``, not
 ``api_key``, and a literal underscore match would miss the single most important
 key in this codebase.
+
+These are **phrases**, not single words. The bare word ``token`` is deliberately
+absent: it occurs in legitimate usage fields far more often than in credentials,
+and matching it destroyed ``promptTokenCount``, ``max_tokens`` and ``token_count``
+while failing to catch ``private_key``.
 """
+
+_OPAQUE_TERMINAL_WORDS = frozenset(
+    {
+        "bearer",
+        "credential",
+        "key",
+        "keys",
+        "password",
+        "secret",
+        "token",
+        "tokens",
+    }
+)
+"""Terminal words that make a key *ambiguous* rather than plainly credential-named.
+
+A key ending in one of these is redacted only when its value looks like an opaque
+credential -- a long string. A count, an enum or a short identifier is left alone.
+
+This is the one place the rule inspects a value's shape, and it is deliberately
+narrow: it applies to a single ambiguous terminal word, not to a general "looks
+like a secret" heuristic.
+"""
+
+_OPAQUE_VALUE_MIN_LENGTH = 16
+"""Minimum length for an ambiguous key's value to be treated as an opaque credential."""
 
 _enabled = False
 
@@ -176,7 +222,7 @@ def redact(value: object) -> Any:
     """
     if isinstance(value, dict):
         return {
-            key: _REDACTED if _is_sensitive(str(key)) else redact(item)
+            key: _REDACTED if _is_sensitive(str(key), item) else redact(item)
             for key, item in value.items()
         }
     if isinstance(value, list):
@@ -186,14 +232,33 @@ def redact(value: object) -> Any:
     return value
 
 
-def _is_sensitive(key: str) -> bool:
-    """True when a mapping key names a credential.
+def _is_sensitive(key: str, value: object) -> bool:
+    """True when a mapping key names a credential, given its value.
 
-    Separators are stripped before matching so ``x-goog-api-key``, ``api_key`` and
-    ``apiKey`` are all recognised as the same thing.
+    Two rules, in order:
+
+    1. **The key names a credential.** Matched against the separator-stripped,
+       lowercased key, so ``x-goog-api-key``, ``api_key`` and ``apiKey`` are all
+       recognised as the same thing.
+    2. **The key is ambiguous and the value looks opaque.** A key whose last word
+       is ``token``, ``key`` or similar is only redacted when its value is a long
+       string. This is what catches a bare ``"token": "<jwt>"`` without
+       destroying ``"token_count": 42``.
+
+    Args:
+        key: The mapping key being considered.
+        value: The value under that key, consulted only by the ambiguous case.
     """
     normalised = _SEPARATOR_RE.sub("", key.lower())
-    return any(part in normalised for part in _SENSITIVE_KEY_PARTS)
+    if any(phrase in normalised for phrase in _CREDENTIAL_PHRASES):
+        return True
+
+    words = _WORD_RE.findall(_SEPARATOR_RE.sub(" ", key))
+    if not words:
+        return False
+    if words[-1].lower() not in _OPAQUE_TERMINAL_WORDS:
+        return False
+    return isinstance(value, str) and len(value) >= _OPAQUE_VALUE_MIN_LENGTH
 
 
 class _DebugFormatter(logging.Formatter):
