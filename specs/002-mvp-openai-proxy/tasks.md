@@ -296,7 +296,7 @@ The shipped `config.yaml` needs no change — a model with no `key_aliases` decl
   exercised rather than assumed.
 
   | | |
-  |---|---|
+  | --- | --- |
   | **Client-observed success rate** | **100/100 = 100.0%** (target ≥80%) |
   | 95% Wilson interval | **[96.3%, 100%]** — clears the target by 16.3 pts |
   | Per provider | `gemini-3.5-flash-lite` 50/50 · `ministral-3b-2512` 50/50 |
@@ -395,7 +395,7 @@ it made **`MISTRAL_KEY_PRIMARY` mandatory**, because every declared credential i
 required and a missing one aborts startup by design (CONSTITUTION §9.2, ADR-0002).
 CI's smoke test supplies `GOOGLE_KEY_PRIMARY` alone, so the container aborted:
 
-```
+```text
 CRITICAL startup_failed config_invalid Model 'mistral/ministral-3b-2512' declares
   key alias 'primary', but no environment variable MISTRAL_KEY_PRIMARY is set.
 ```
