@@ -21,24 +21,39 @@ from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
 
 from free_router.db.engine import DEFAULT_DATABASE_PATH, DatabaseInitializationError
-from free_router.db.schema import metadata
 
 __all__ = ["MIGRATIONS_DIR", "alembic_config", "run_migrations"]
 
 MIGRATIONS_DIR = Path(__file__).parent
 """Directory holding ``env.py`` and the revision scripts."""
 
-INITIAL_SCHEMA_TABLES = frozenset(table.name for table in metadata.sorted_tables)
+INITIAL_REVISION = "0001_initial"
+"""The first Alembic revision.
+
+A database written before migrations existed has this revision's schema and no
+``alembic_version`` table, so it must be stamped here rather than upgraded from
+scratch. The adoption path stamps at this revision and *then* upgrades, so a
+legacy database still receives the tables added by later revisions.
+"""
+
+INITIAL_SCHEMA_TABLES = frozenset({"models", "request_logs"})
 """Tables created by revision ``0001_initial``.
 
-Derived from the schema definition rather than hardcoded, so adding a table
-automatically widens the set the adoption path accepts.
+**This is deliberately no longer derived from the current schema.** It was,
+while there was exactly one revision, and deriving it was the right call: adding
+a table to the schema automatically widened the set the adoption path accepted.
 
-Caveat: this reflects the *current* schema, which is only correct while there is
-exactly one revision. When a second revision lands, the adoption path must be
-reconsidered — a database from the pre-Alembic era is only ever at the initial
-revision, and comparing its tables against a multi-revision schema would make the
-exact-match test unreachable.
+That stopped being true when ``0002_quota_state`` landed, and keeping the
+derivation would have been a latent bug rather than a convenience. A database
+from the pre-Alembic era can only ever hold the *initial* revision's schema --
+the pre-migration code had no way to produce anything else. Deriving the set
+from the current metadata would have required a legacy database to contain the
+M2 tables as well, so such a database would never be recognised as adoptable
+and the upgrade would try to create tables that were already there.
+
+The set is therefore pinned to the initial revision, and
+``tests/test_migrations.py`` asserts it against what that revision actually
+creates, so the two cannot drift apart.
 """
 
 
@@ -69,10 +84,15 @@ def run_migrations(database_path: str | Path | None = None) -> None:
 
     A database written before migrations existed has tables but no
     ``alembic_version`` table, so a plain upgrade would fail trying to create
-    tables that are already there. Such a database is *stamped* at head
-    instead: its schema is, by construction, the initial revision, since that
+    tables that are already there. Such a database is *stamped* at the initial
+    revision and then upgraded, so it receives the tables added by later
+    revisions: its schema is, by construction, the initial revision, since that
     is the only schema the pre-migration code could produce. Genuine upgrades
     from a later revision are unaffected.
+
+    Stamping at *head* would be wrong once there is more than one revision --
+    it would mark a legacy database as already carrying the later tables, and
+    they would never be created.
 
     Args:
         database_path: Target database file. Defaults to ``data/router.db``.
@@ -83,8 +103,7 @@ def run_migrations(database_path: str | Path | None = None) -> None:
     config = alembic_config(database_path)
     try:
         if _needs_adoption(database_path):
-            command.stamp(config, "head")
-            return
+            command.stamp(config, INITIAL_REVISION)
         command.upgrade(config, "head")
     except Exception as exc:
         raise DatabaseInitializationError(f"Database migrations failed: {exc}") from exc

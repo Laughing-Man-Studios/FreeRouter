@@ -124,24 +124,38 @@ depends on that stream for diagnosis would be the wrong trade.
 
 **Maps to GitHub Issue:** `#12 Single-File Local Persistence Engine`
 
-- [ ] **T041: Define the persisted state schema** (ROADMAP §3.14). Four tables per
+- [x] **T041: Define the persisted state schema — complete.** Four tables per
   `plan.md` § *Data / Persistence Changes*: `quota_windows`, `cooldowns`,
   `model_status`, `key_state`.
 
-  **`bucket_used` is a JSON map keyed by bucket ordinal**, mirroring `_Window`'s
-  in-memory buckets. A row per bucket would multiply writes unboundedly on a rolling
-  window and make the flush more expensive than the state it holds.
+  **`entries` is a JSON list of reservations**, each `{at, reserved, actual}`. The
+  original draft specified a JSON map of bucket ordinal to amount, which would
+  have been wrong twice over: a rolling window sums by *age*, not by bucket, so
+  a per-bucket total cannot reconstruct it; and collapsing the estimate into the
+  effective figure would make estimator drift unmeasurable after a restart.
+  Timestamps are **wall-clock**, because a monotonic value is only meaningful
+  against the current boot and would restore nonsense after a reboot.
 
   **`reset_at` exists for fixed windows only.** Google's RPD resets at midnight
   Pacific; a rolling window has no such instant. One nullable column keeps the
   dimension model uniform.
 
+  **`key_state` carries `updated_at`.** `suspended` is persisted for inspection,
+  and a suspension with no timestamp says only that it happened, not when.
+
   **No payload columns exist in any table**, and no key-material column either —
   only `alias`. That is what makes a state dump safe to paste into an issue.
 
-- [ ] **T042: Alembic revision 0002.** Adds the four tables. Must apply cleanly to a
+- [x] **T042: Alembic revision 0002 — complete.** Adds the four tables. Must apply cleanly to a
   database created by revision 0001 and must be idempotent on re-run, since
   migrations run at every startup.
+
+  **The pre-Alembic adoption path is reconsidered here**, because M0's docstring
+  said it had to be: its expected table set was derived from the *current* schema,
+  which is only correct while there is exactly one revision. The set is now pinned
+  to the initial revision, and the adoption path **stamps at that revision and
+  then upgrades** — stamping at head would mark a legacy database as already
+  carrying the new tables, and they would never be created.
 
 - [ ] **T043: ~~Extract `QuotaTrackerProtocol`~~ — DROPPED, and the drop is informative.**
 
@@ -166,12 +180,40 @@ depends on that stream for diagnosis would be the wrong trade.
 
 1. `ruff check .`, `ruff format --check .`, `mypy --strict src/`
 2. Migration applies to a fresh database and to one created by revision 0001.
-3. The tracker's public surface is unchanged apart from the added `restore()` —
-   asserted by signature, not by inspection.
+3. The tracker's public surface is **unchanged** — Batch 1 defines the schema and
+   does not touch the tracker at all, so `restore()` and the persistence layer
+   are Batch 2's work.
 4. A test asserts the new tables contain no column able to hold key material or
    payload text.
-5. `pytest tests/test_db.py tests/test_migrations.py tests/test_quota_tracker.py`
-6. **STOP**, review, then update #12.
+5. **A legacy pre-Alembic database gains the new tables** rather than failing to
+   upgrade.
+6. `pytest tests/test_db.py tests/test_migrations.py tests/test_quota_schema.py
+   tests/test_quota_tracker.py`
+7. **STOP**, review, then update #12.
+
+**Batch 1 verification gate (2026-10-19):**
+
+1. `ruff check .`, `ruff format --check .`, `mypy --strict src/` — clean.
+2. Migration applies to a fresh database and to one created by revision 0001.
+3. **The tracker is untouched** — Batch 1 adds tables and a revision, and changes
+   no runtime behaviour. `restore()` and the persistence layer are Batch 2's.
+4. A test asserts **no column in any table** could hold key material or payload
+   text, checked across every table rather than only the new ones, and that
+   `key_state` identifies a credential by alias only.
+5. **The migration and the schema definitions are compared against each other**,
+   so the two representations of one schema cannot drift apart. A drift would
+   surface on a real query rather than at startup, which is the worst place for
+   it.
+6. **A legacy pre-Alembic database gains the four new tables** rather than
+   failing to upgrade — the case M0's adoption path would have broken on.
+7. The pre-existing gap in the fixed window's boundary is **recorded rather than
+   silently inherited**: `WindowReset.FIXED` is documented as resetting at a
+   wall-clock boundary, but the implementation buckets on the monotonic clock. No
+   fixed window is configured today, so nothing misbehaves; Batch 2 must
+   reconcile the two, in the window implementation rather than in the persistence
+   layer.
+
+**Full suite after Batch 1: 461 passing**, up from 446.
 
 ---
 
