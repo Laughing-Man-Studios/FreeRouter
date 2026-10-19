@@ -89,7 +89,21 @@ class WindowReset(StrEnum):
 
     ROLLING = "rolling"
     FIXED = "fixed"
-    """Resets at a wall-clock boundary, e.g. midnight Pacific for Google's RPD."""
+    """Resets at a boundary, rather than decaying continuously.
+
+    **The boundary is aligned to the monotonic clock's epoch, not to midnight
+    Pacific.** Google's daily allowance really does reset at midnight Pacific,
+    and that is the intent, but nothing in the router knows about Pacific time,
+    so a fixed window currently resets at an arbitrary offset from boot.
+
+    The persisted boundary is this one, expressed in wall-clock terms, so the
+    durable record is truthful about the behaviour the code actually has. Making
+    the window reset at a *specified* wall-clock boundary is outstanding work,
+    and it belongs in the window implementation rather than in the persistence
+    layer -- which should not decide what a bucket means.
+
+    No fixed window is currently configured, so nothing misbehaves today.
+    """
 
 
 class Provenance(StrEnum):

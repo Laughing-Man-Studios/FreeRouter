@@ -305,6 +305,21 @@ class Config(BaseSettings):
     models: list[ModelConfig] = Field(min_length=1)
     quota: QuotaConfig = Field(default_factory=QuotaConfig)
     dispatch: DispatchConfig = Field(default_factory=DispatchConfig)
+    max_cooldown_seconds: float = Field(default=86_400.0, gt=0)
+    """Upper bound on a single cooldown, in seconds (clarification B4).
+
+    Twenty-four hours accommodates the longest *legitimate* provider hint -- a
+    daily cap resetting at midnight -- while still bounding a lockout caused by
+    a clock that jumped backwards. A backwards jump is better detected than
+    patched: a restored cooldown is compared against the system clock, and this
+    is the backstop for the case that check cannot cover.
+    """
+    quota_flush_interval_seconds: float = Field(default=20.0, gt=0)
+    """Seconds between counter flushes (clarification B2).
+
+    A crash loses up to one interval of counters. Cooldowns are unaffected --
+    they are written through the moment they are set.
+    """
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
     def key_slots(self) -> dict[tuple[str, str], list[str]]:

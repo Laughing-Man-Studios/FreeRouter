@@ -424,7 +424,7 @@ async def test_a_degraded_model_refuses_large_requests_without_dispatching(
     route = respx.post(GENERATE_URL).mock(return_value=httpx.Response(200, json=SUCCESS_BODY))
     dispatcher = _dispatcher(http_client)
 
-    dispatcher._breaker.record_failure(PROVIDER, MODEL, 1000)
+    await dispatcher._breaker.record_failure(PROVIDER, MODEL, 1000)
     route.reset()
 
     with pytest.raises(NoAvailableCapacityError):
@@ -438,7 +438,7 @@ async def test_a_degraded_model_still_serves_small_requests(http_client: httpx.A
     """Degradation is size-conditional; blocking small requests would cost quota."""
     route = respx.post(GENERATE_URL).mock(return_value=httpx.Response(200, json=SUCCESS_BODY))
     dispatcher = _dispatcher(http_client)
-    dispatcher._breaker.record_failure(PROVIDER, MODEL, 1000)
+    await dispatcher._breaker.record_failure(PROVIDER, MODEL, 1000)
 
     outcome = await dispatcher.dispatch(_request("hi"), PROVIDER, MODEL)
 
@@ -492,7 +492,7 @@ def test_retry_defaults_are_conservative() -> None:
 
 
 @pytest.mark.parametrize("attempts", [0, -1, 11])
-def test_invalid_attempt_counts_are_refused(attempts: int) -> None:
+async def test_invalid_attempt_counts_are_refused(attempts: int) -> None:
     from pydantic import ValidationError
 
     with pytest.raises(ValidationError):

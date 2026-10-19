@@ -49,6 +49,7 @@ import httpx
 
 from free_router.core.exceptions import (
     NoAvailableCapacityError,
+    PersistenceUnavailableError,
     ProviderAuthError,
     ProviderRateLimitError,
     ProviderServerError,
@@ -123,6 +124,26 @@ class Dispatcher:
         self._max_attempts = max_attempts
         self._attempt_budget = attempt_budget_seconds
         self._backoff = backoff_seconds
+
+    @property
+    def quota(self) -> QuotaTracker:
+        """The quota tracker. Read-only, for the persistence layer."""
+        return self._quota
+
+    @property
+    def cooldown(self) -> CooldownManager:
+        """The cooldown manager. Read-only, for the persistence layer."""
+        return self._cooldown
+
+    @property
+    def breaker(self) -> ContextBreaker:
+        """The context breaker. Read-only, for the persistence layer."""
+        return self._breaker
+
+    @property
+    def key_manager(self) -> KeyManager:
+        """The credential pool. Read-only, for the persistence layer."""
+        return self._keys
 
     async def dispatch(
         self, request: NormalizedRequest, provider: str, model_id: str
@@ -200,7 +221,7 @@ class Dispatcher:
             except ProviderRateLimitError as exc:
                 # The request was sent, so its quota is spent regardless.
                 await self._quota.reconcile(reservation, None)
-                self._cooldown.enter(
+                await self._cooldown.enter(
                     provider, model_id, provider_hint=exc.retry_after, reason="rate_limited"
                 )
                 last_error = exc
@@ -246,7 +267,7 @@ class Dispatcher:
                     # size rather than rediscovering the limit on every one of
                     # them. Recorded in OUR token estimate, not the provider's
                     # count -- different tokenizers are not comparable.
-                    self._breaker.record_failure(provider, model_id, estimated)
+                    await self._breaker.record_failure(provider, model_id, estimated)
                     logger.info(
                         "model_degraded_for_large_context",
                         extra={
@@ -314,6 +335,16 @@ class Dispatcher:
             ProviderRateLimitError: If a rate limit is in force, so the client is
                 told ``429`` rather than a generic ``503``.
         """
+        if self._cooldown.persistence_degraded(provider, model_id):
+            # The router knows a limit on this unit and could not record it, so
+            # it cannot promise to remember it. Dispatching anyway would mean a
+            # restart forgets a limit it was told about -- the overshoot
+            # CONSTITUTION 8.3 exists to prevent.
+            raise PersistenceUnavailableError(
+                f"Model '{model_id}' cannot be served: its rate limit could not be "
+                f"recorded, so the router cannot guarantee to respect it."
+            )
+
         if self._cooldown.is_cooling(provider, model_id):
             remaining = round(self._cooldown.remaining(provider, model_id), 3)
             if remaining > 0:

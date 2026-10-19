@@ -32,6 +32,7 @@ from free_router.core.debug_logging import configure_debug_payload_logging
 from free_router.core.dispatch import Dispatcher
 from free_router.core.exceptions import (
     NoAvailableCapacityError,
+    PersistenceUnavailableError,
     ProviderAuthError,
     ProviderBaseError,
     ProviderRateLimitError,
@@ -66,6 +67,7 @@ PROVIDER_ERROR_STATUS_MAP: dict[type[RouterBaseError], int] = {
     ProviderTimeoutError: 504,
     ProviderRateLimitError: 429,
     NoAvailableCapacityError: 503,
+    PersistenceUnavailableError: 503,
     RetriesExhaustedError: 503,
     ProviderAuthError: 401,
     ProviderValidationError: 400,
