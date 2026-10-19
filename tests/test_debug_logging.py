@@ -263,10 +263,104 @@ def test_redact_replaces_credential_shaped_keys() -> None:
     assert redacted["messages"][0]["content"] == "kept in full"
 
 
+def test_redact_replaces_private_key_and_other_key_material() -> None:
+    """``private_key`` and the other key-material names are redacted.
+
+    The previous rule matched the bare substring ``token``, which mangled
+    legitimate usage fields while missing ``private_key`` entirely. A rule that
+    produces both kinds of failure is not a rule.
+    """
+    for key in (
+        "private_key",
+        "privateKey",
+        "signing_key",
+        "encryption_key",
+        "client_key",
+        "client_secret",
+        "passphrase",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "bearer_token",
+        "api_token",
+    ):
+        redacted = redact({key: "sk-proj-abcdefghijklmnopqrstuvwxyz"})
+        assert redacted[key] == "[redacted]", f"{key} was not redacted"
+
+
+def test_redact_preserves_legitimate_token_usage_fields() -> None:
+    """Usage and parameter fields whose names contain "token" survive.
+
+    These are exactly the fields the previous rule destroyed. ``promptTokenCount``
+    and its siblings are Gemini's usage metadata, and ``max_tokens`` is a request
+    parameter -- the stream exists to show them.
+    """
+    for key in (
+        "promptTokenCount",
+        "candidatesTokenCount",
+        "totalTokenCount",
+        "promptTokensDetails",
+        "max_tokens",
+        "token_count",
+        "tokens",
+        "tokenBudget",
+    ):
+        redacted = redact({key: 1234})
+        assert redacted[key] == 1234, f"{key} was wrongly redacted"
+
+
+def test_redact_leaves_ambiguous_keys_alone_when_the_value_is_not_opaque() -> None:
+    """An ambiguous terminal word is only a credential when its value looks like one.
+
+    This is the narrow value-shape check, and it has to leave counts and short
+    identifiers alone or it re-creates the over-redaction the phrase rule fixed.
+    """
+    assert redact({"token": 42})["token"] == 42
+    assert redact({"token": "42"})["token"] == "42"
+    assert redact({"tokens": 999})["tokens"] == 999
+    assert redact({"key_alias": "primary"})["key_alias"] == "primary"
+    assert redact({"max_tokens": 512})["max_tokens"] == 512
+
+
+def test_redact_replaces_an_ambiguous_key_holding_an_opaque_value() -> None:
+    """A bare ``token`` holding a JWT-shaped value is still a credential."""
+    opaque = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature"
+    assert redact({"token": opaque})["token"] == "[redacted]"
+    assert redact({"key": opaque})["key"] == "[redacted]"
+    assert redact({"bearer": opaque})["bearer"] == "[redacted]"
+
+
 def test_redact_leaves_ordinary_payloads_untouched() -> None:
     """Redaction must not mangle the content an operator is trying to read."""
     payload = {"contents": [{"parts": [{"text": "hello"}], "role": "user"}], "model": MODEL}
     assert redact(payload) == payload
+
+
+def test_gemini_usage_metadata_survives_redaction() -> None:
+    """The regression that motivated the fix, asserted end to end.
+
+    Gemini reports usage as ``usageMetadata`` with ``promptTokenCount``,
+    ``candidatesTokenCount`` and ``totalTokenCount``. The previous rule replaced
+    all three with ``[redacted]``, so a debug session could not show what a
+    request actually cost.
+    """
+    body = {
+        "candidates": [{"content": {"parts": [{"text": "hi"}], "role": "model"}}],
+        "usageMetadata": {
+            "promptTokenCount": "8",
+            "candidatesTokenCount": "1",
+            "totalTokenCount": "9",
+            "serviceTier": "standard",
+        },
+    }
+
+    redacted = redact(body)
+
+    usage = redacted["usageMetadata"]
+    assert usage["promptTokenCount"] == "8"
+    assert usage["candidatesTokenCount"] == "1"
+    assert usage["totalTokenCount"] == "9"
+    assert usage["serviceTier"] == "standard"
 
 
 def test_redaction_applies_to_what_is_actually_written(debug_file: Path) -> None:
