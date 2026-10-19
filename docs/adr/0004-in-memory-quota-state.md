@@ -68,7 +68,22 @@ M2 must:
 - Read persisted cooldowns at startup so a restart does not retry a cooling key.
 - Remove the recorded deviation from `spec.md` § *Recorded Deviations*.
 
-Until then, this deviation is open.
+**Closed 2026-10-19**, by M2 Batch 2 (PR #69) and Batch 1 (PR #68). The tables
+exist, the state is durable and restored before the listener serves anything, the
+event loop stays responsive, and the deviation has been removed from
+`specs/002-mvp-openai-proxy/spec.md` § *Recorded Deviations*.
+
+**The second obligation was met differently than worded.** This ADR asked for "a
+SQLite-backed `QuotaTracker`", which reads as a second implementation alongside
+the in-memory one. What was built is **one** implementation with a persistence
+layer attached, and ADR-0005 explains why: if counters batch behind a flush
+interval, the state they batch must be hot in memory, and a tracker reading and
+writing SQLite per reservation would put a database round-trip on the dispatch
+path -- the exact cost the asymmetry principle exists to avoid. **The interface
+is unchanged either way**, which is what this ADR identified as the durable part
+of the decision.
+
+Until 2026-10-19, this deviation was open.
 
 ## 7. Constitutional Compliance Check
 
