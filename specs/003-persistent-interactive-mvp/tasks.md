@@ -30,6 +30,7 @@ worth stating because two of the reorderings were forced by dependencies that we
 only visible once the plan existed.
 
 ```text
+Batch 0  Debug redaction fix (M1 defect)      #66
 Batch 1  Persistence schema & migration      #12
 Batch 2  Persistence layer & restore          #12
 Batch 3  Token estimation & reservation       #13
@@ -37,6 +38,11 @@ Batch 4  GET /v1/models                       #14
 Batch 5  SSE streaming & fail-fast            #15
 Batch 6  Error classification & verification  #12, #15
 ```
+
+**Batch 0 is a defect fix, not planned work.** It leads because it is small,
+independent of everything else, and it repairs the instrument M2's diagnosis work
+depends on. It was found while measuring provider-reported usage for the M2
+output-token-assumption decision, so it is adjacent to work M2 is about to do.
 
 **Batches 1–2 come first because they close a constitutional deviation.** ADR-0005
 closes CONSTITUTION §8.3, and ROADMAP §3.14 places it first among M2's
@@ -57,6 +63,60 @@ settled what the adapters are allowed to know.
 adapters and touches the dispatcher's use of their results, so folding it into either
 adapter's batch would mean reviewing an adapter change and a classification change
 together, which is how a behavioural regression hides.
+
+---
+
+## Batch 0: Debug Payload Redaction Fix (M1 defect)
+
+**Maps to GitHub Issue:** `#66 Debug payload redaction mangles token usage fields and misses private_key`
+
+**This is a defect fix, not planned milestone work.** It is M1's T038 code and was
+found on 2026-10-19 while measuring provider-reported token usage for the M2
+output-token-assumption decision — the usage figures were the first thing the
+redaction mangled.
+
+It sits ahead of Batch 1 because it is small, it is independent of every other
+task, and leaving a known defect in the debug stream through a milestone that
+depends on that stream for diagnosis would be the wrong trade.
+
+- [ ] **T066: Replace the debug redaction rule.** The loose-substring rule
+  matched the bare word `token`, which produced two failures at once:
+  **over-redaction** of legitimate usage fields (`promptTokenCount`,
+  `candidatesTokenCount`, `totalTokenCount`, `max_tokens`, `token_count`) and
+  **under-redaction** of real key material (`private_key` was not redacted at
+  all).
+
+  Replaced with a **phrase** rule — `apikey`, `authorization`, `credential`,
+  `password`, `secret`, `passphrase`, `accesstoken`, `authtoken`, `apitoken`,
+  `bearertoken`, `idtoken`, `refreshtoken`, `sessiontoken`, `privatekey`,
+  `signingkey`, `encryptionkey`, `clientkey` — with the bare word `token`
+  deliberately removed, plus one narrow value-shape rule for **ambiguous terminal
+  words**: a key ending in `token`/`tokens`/`key`/`secret`/`password`/
+  `credential`/`bearer` is redacted only when its value is a 16+ character
+  string. So a JWT-shaped value is caught, a count is not, and `key_alias`
+  survives.
+
+  Keys are matched on **word boundaries** (separators *and* camelCase), so
+  `promptTokenCount` and `prompt_tokens` are both handled.
+
+  **The module docstring changes too.** It currently claims redaction is
+  "name-based rather than pattern-based", which was never quite true and is
+  less true now. The new rule consults a value's shape in exactly one narrow
+  case, and the docstring has to say so rather than overclaim.
+
+  This is the same class of defect as the `x-goog-api-key` miss fixed in M1
+  (T038): a substring rule simultaneously too broad and too narrow. **A rule that
+  produces both kinds of failure is not a rule.**
+
+**Verification & Stop:**
+
+1. `ruff check .`, `ruff format --check .`, `mypy --strict src/`, full `pytest`.
+2. The acceptance criteria in #66 pass — the legitimate usage fields survive, the
+   credential names are redacted, and `Authorization` / `x-goog-api-key` do not
+   regress.
+3. A test asserts Gemini's `usageMetadata` survives end to end, so the
+   regression cannot return silently.
+4. **STOP**, review, then update #66.
 
 ---
 
