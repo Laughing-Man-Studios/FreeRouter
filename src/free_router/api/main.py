@@ -14,7 +14,7 @@ import logging
 import os
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -28,18 +28,28 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from free_router.api.health import health_router
 from free_router.api.routes import router
 from free_router.core.config import Config, ConfigError, load_config
+from free_router.core.debug_logging import configure_debug_payload_logging
+from free_router.core.dispatch import Dispatcher
 from free_router.core.exceptions import (
+    NoAvailableCapacityError,
     ProviderAuthError,
     ProviderBaseError,
+    ProviderRateLimitError,
     ProviderServerError,
     ProviderTimeoutError,
     ProviderValidationError,
+    RetriesExhaustedError,
     RouterBaseError,
     UnsupportedModelError,
     ValidationError,
 )
 from free_router.core.logging import configure_logging, log_context
 from free_router.db.engine import DatabaseInitializationError, init_db_engine
+from free_router.keys.manager import KeyManager
+from free_router.quota.breaker import ContextBreaker
+from free_router.quota.cooldown import CooldownManager
+from free_router.quota.dimensions import QuotaDimension
+from free_router.quota.tracker import QuotaTracker
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +64,9 @@ PROVIDER_ERROR_STATUS_MAP: dict[type[RouterBaseError], int] = {
     # by. ProviderValidationError must precede ProviderBaseError's 502 fallback,
     # and ProviderAuthError must precede ProviderValidationError's 400.
     ProviderTimeoutError: 504,
+    ProviderRateLimitError: 429,
+    NoAvailableCapacityError: 503,
+    RetriesExhaustedError: 503,
     ProviderAuthError: 401,
     ProviderValidationError: 400,
     ProviderServerError: 502,
@@ -77,11 +90,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     so that a fatal error in any later step is itself logged correctly.
     """
     configure_logging(os.environ.get("LOG_LEVEL", "INFO"))
+    # Configured separately and strictly after the operational stream, so the
+    # debug handler can never be the reason the operational one is misconfigured.
+    configure_debug_payload_logging()
 
     app.state.config = await _startup_step("config_invalid", _load_config)
     app.state.db_engine = await _startup_step("database_init_failed", _init_database)
 
+    # Built after the HTTP client so the dispatcher can hold it, and after config
+    # so a missing credential has already aborted startup. Every collaborator is
+    # constructed once and shared: each holds in-memory state that a per-request
+    # construction would silently discard, which would defeat the quota
+    # reservation cycle entirely.
     app.state.http_client = httpx.AsyncClient(timeout=HTTP_CLIENT_TIMEOUT)
+    app.state.dispatcher = _build_dispatcher(app.state.config, app.state.http_client)
     logger.info("startup_completed", extra={"event": "startup_completed"})
 
     try:
@@ -100,6 +122,31 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 async def _load_config() -> Config:
     """Load configuration. Exists to give every startup step one signature."""
     return load_config()
+
+
+def _build_dispatcher(config: Config, http_client: httpx.AsyncClient) -> Dispatcher:
+    """Construct the dispatcher's whole object graph from configuration.
+
+    Runs after configuration so a declared alias with no credential has already
+    failed startup: an unusable key is discovered before the process serves
+    traffic, not as a 401 on the first request.
+    """
+    dimensions: Mapping[tuple[str, str], tuple[QuotaDimension, ...]] = {
+        (entry.provider, entry.provider_id): tuple(entry.quota) for entry in config.models
+    }
+    durations = {
+        (entry.provider, entry.provider_id): entry.cooldown_seconds for entry in config.models
+    }
+    return Dispatcher(
+        key_manager=KeyManager(config.resolve_key_material()),
+        quota=QuotaTracker(dimensions, safety_margin=config.quota.estimation_safety_margin),
+        cooldown=CooldownManager(durations=durations),
+        breaker=ContextBreaker(),
+        http_client=http_client,
+        max_attempts=config.dispatch.max_attempts,
+        attempt_budget_seconds=config.dispatch.attempt_budget_seconds,
+        backoff_seconds=config.dispatch.backoff_seconds,
+    )
 
 
 async def _init_database() -> AsyncEngine:

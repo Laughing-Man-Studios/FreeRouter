@@ -7,6 +7,7 @@ from typing import Any
 import httpx
 import pytest
 import respx
+from pydantic import SecretStr
 
 from free_router.core.exceptions import (
     ProviderAuthError,
@@ -16,6 +17,7 @@ from free_router.core.exceptions import (
     UnsupportedModelError,
 )
 from free_router.core.normalization import NormalizedRequest, NormalizedResponse
+from free_router.keys.manager import KeyRef
 from free_router.providers.base import ProviderAdapter, build_adapter, supported_providers
 from free_router.providers.google.adapter import (
     GOOGLE_API_BASE,
@@ -43,11 +45,20 @@ SUCCESS_BODY: dict[str, Any] = {
 }
 
 
-@pytest.fixture(autouse=True)
-def api_key(monkeypatch: pytest.MonkeyPatch) -> str:
-    """Provide a dummy key so the adapter can build its auth header."""
-    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
-    return "test-gemini-key"
+@pytest.fixture
+def key() -> KeyRef:
+    """A dummy credential.
+
+    The adapter receives key material from the pool rather than reading the
+    environment, so there is nothing to set here. That is the point: no variable
+    name reaches an adapter, and a test cannot make one by exporting a variable.
+    """
+    return KeyRef(
+        alias="primary",
+        provider="google",
+        model_id="gemini-3.5-flash-lite",
+        secret=SecretStr("test-google-key-primary"),
+    )
 
 
 @pytest.fixture
@@ -75,11 +86,16 @@ def test_supported_providers_includes_google() -> None:
 
 
 def test_build_adapter_rejects_unknown_provider(http_client: httpx.AsyncClient) -> None:
-    """An unregistered provider is refused rather than silently dispatched."""
-    with pytest.raises(UnsupportedModelError) as excinfo:
-        build_adapter("mistral", http_client)
+    """An unregistered provider is refused rather than silently dispatched.
 
-    assert "mistral" in excinfo.value.message
+    The name used to be ``mistral``, back when it was the obvious example of a
+    provider that did not exist yet. It is registered now, so using it here
+    would have quietly stopped testing anything.
+    """
+    with pytest.raises(UnsupportedModelError) as excinfo:
+        build_adapter("anthropic", http_client)
+
+    assert "anthropic" in excinfo.value.message
 
 
 # --- Request translation (T011) ---
@@ -198,12 +214,13 @@ def test_empty_candidates_raises_rather_than_index_error() -> None:
 @respx.mock
 async def test_successful_dispatch_returns_normalized_response(
     http_client: httpx.AsyncClient,
+    key: KeyRef,
 ) -> None:
     """Scenario 1: a 200 becomes a NormalizedResponse."""
     route = respx.post(GENERATE_URL).mock(return_value=httpx.Response(200, json=SUCCESS_BODY))
 
     adapter = GoogleAdapter(http_client=http_client)
-    result = await adapter.chat_completion(_request(), "gemini-3.5-flash-lite")
+    result = await adapter.chat_completion(_request(), "gemini-3.5-flash-lite", key)
 
     assert isinstance(result, NormalizedResponse)
     assert result.content == "hello from gemini"
@@ -213,36 +230,39 @@ async def test_successful_dispatch_returns_normalized_response(
 @respx.mock
 async def test_request_uses_api_key_header_not_query_param(
     http_client: httpx.AsyncClient,
+    key: KeyRef,
 ) -> None:
     """The key travels in a header so it cannot leak into URLs."""
     route = respx.post(GENERATE_URL).mock(return_value=httpx.Response(200, json=SUCCESS_BODY))
 
     await GoogleAdapter(http_client=http_client).chat_completion(
-        _request(), "gemini-3.5-flash-lite"
+        _request(), "gemini-3.5-flash-lite", key
     )
 
     request = route.calls[0].request
-    assert request.headers["x-goog-api-key"] == "test-gemini-key"
+    assert request.headers["x-goog-api-key"] == "test-google-key-primary"
     assert "key=" not in str(request.url)
-    assert "test-gemini-key" not in str(request.url)
+    assert "test-google-key-primary" not in str(request.url)
 
 
 @respx.mock
 async def test_auth_error_raises_provider_auth_error(
     http_client: httpx.AsyncClient,
+    key: KeyRef,
 ) -> None:
     """Scenario 8: provider 401 becomes ProviderAuthError."""
     respx.post(GENERATE_URL).mock(return_value=httpx.Response(401, json={"error": {}}))
 
     with pytest.raises(ProviderAuthError):
         await GoogleAdapter(http_client=http_client).chat_completion(
-            _request(), "gemini-3.5-flash-lite"
+            _request(), "gemini-3.5-flash-lite", key
         )
 
 
 @respx.mock
 async def test_invalid_api_key_400_maps_to_auth_error(
     http_client: httpx.AsyncClient,
+    key: KeyRef,
 ) -> None:
     """Google reports a bad API key as 400, not 401. Verified live.
 
@@ -265,13 +285,14 @@ async def test_invalid_api_key_400_maps_to_auth_error(
 
     with pytest.raises(ProviderAuthError):
         await GoogleAdapter(http_client=http_client).chat_completion(
-            _request(), "gemini-3.5-flash-lite"
+            _request(), "gemini-3.5-flash-lite", key
         )
 
 
 @respx.mock
 async def test_permission_denied_400_maps_to_auth_error(
     http_client: httpx.AsyncClient,
+    key: KeyRef,
 ) -> None:
     """The PERMISSION_DENIED status flag is also an auth failure."""
     respx.post(GENERATE_URL).mock(
@@ -283,13 +304,14 @@ async def test_permission_denied_400_maps_to_auth_error(
 
     with pytest.raises(ProviderAuthError):
         await GoogleAdapter(http_client=http_client).chat_completion(
-            _request(), "gemini-3.5-flash-lite"
+            _request(), "gemini-3.5-flash-lite", key
         )
 
 
 @respx.mock
 async def test_genuine_bad_payload_400_is_not_an_auth_error(
     http_client: httpx.AsyncClient,
+    key: KeyRef,
 ) -> None:
     """A real payload rejection must stay a validation error.
 
@@ -310,39 +332,42 @@ async def test_genuine_bad_payload_400_is_not_an_auth_error(
 
     with pytest.raises(ProviderValidationError):
         await GoogleAdapter(http_client=http_client).chat_completion(
-            _request(), "gemini-3.5-flash-lite"
+            _request(), "gemini-3.5-flash-lite", key
         )
 
 
 @respx.mock
 async def test_unparseable_400_body_is_a_validation_error(
     http_client: httpx.AsyncClient,
+    key: KeyRef,
 ) -> None:
     """An unreadable body falls back to the default mapping, not auth."""
     respx.post(GENERATE_URL).mock(return_value=httpx.Response(400, text="not json"))
 
     with pytest.raises(ProviderValidationError):
         await GoogleAdapter(http_client=http_client).chat_completion(
-            _request(), "gemini-3.5-flash-lite"
+            _request(), "gemini-3.5-flash-lite", key
         )
 
 
 @respx.mock
 async def test_server_error_raises_provider_server_error(
     http_client: httpx.AsyncClient,
+    key: KeyRef,
 ) -> None:
     """Scenario 9: provider 5xx becomes ProviderServerError."""
     respx.post(GENERATE_URL).mock(return_value=httpx.Response(500, text="boom"))
 
     with pytest.raises(ProviderServerError):
         await GoogleAdapter(http_client=http_client).chat_completion(
-            _request(), "gemini-3.5-flash-lite"
+            _request(), "gemini-3.5-flash-lite", key
         )
 
 
 @respx.mock
 async def test_bad_request_raises_provider_validation_error(
     http_client: httpx.AsyncClient,
+    key: KeyRef,
 ) -> None:
     """Provider 400 becomes ProviderValidationError."""
     respx.post(GENERATE_URL).mock(
@@ -351,13 +376,14 @@ async def test_bad_request_raises_provider_validation_error(
 
     with pytest.raises(ProviderValidationError):
         await GoogleAdapter(http_client=http_client).chat_completion(
-            _request(), "gemini-3.5-flash-lite"
+            _request(), "gemini-3.5-flash-lite", key
         )
 
 
 @respx.mock
 async def test_error_message_never_contains_key_or_prompt(
     http_client: httpx.AsyncClient,
+    key: KeyRef,
 ) -> None:
     """Provider errors must not echo the secret or the prompt (spec 9)."""
     respx.post(GENERATE_URL).mock(
@@ -368,56 +394,70 @@ async def test_error_message_never_contains_key_or_prompt(
         await GoogleAdapter(http_client=http_client).chat_completion(
             _request([{"role": "user", "content": "my-secret-prompt"}]),
             "gemini-3.5-flash-lite",
+            key,
         )
 
     message = excinfo.value.message
     assert "my-secret-prompt" not in message
-    assert "test-gemini-key" not in message
+    assert "test-google-key-primary" not in message
 
 
 @respx.mock
 async def test_non_json_body_raises_provider_server_error(
     http_client: httpx.AsyncClient,
+    key: KeyRef,
 ) -> None:
     """An undecodable body is an upstream fault, not a crash."""
     respx.post(GENERATE_URL).mock(return_value=httpx.Response(200, text="<html>not json</html>"))
 
     with pytest.raises(ProviderServerError):
         await GoogleAdapter(http_client=http_client).chat_completion(
-            _request(), "gemini-3.5-flash-lite"
+            _request(), "gemini-3.5-flash-lite", key
         )
 
 
 @respx.mock
-async def test_missing_api_key_raises_provider_auth_error(
-    http_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+async def test_credential_material_comes_from_the_pool_not_the_environment(
+    http_client: httpx.AsyncClient, key: KeyRef, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A key disappearing after startup surfaces as an auth error, not a crash."""
-    monkeypatch.delenv("GEMINI_API_KEY")
+    """No variable name reaches an adapter.
 
-    with pytest.raises(ProviderAuthError, match="GEMINI_API_KEY"):
-        await GoogleAdapter(http_client=http_client).chat_completion(
-            _request(), "gemini-3.5-flash-lite"
-        )
+    The adapter previously read ``GEMINI_API_KEY`` from the process environment
+    itself. It no longer does, so exporting that variable cannot change which
+    credential is used -- the pool decides. This test exists because that is a
+    security property, and a test that sets the old variable and asserts nothing
+    about it is the only thing that will catch a regression.
+    """
+    monkeypatch.setenv("GEMINI_API_KEY", "a-decoy-that-must-not-be-used")
+    monkeypatch.setenv("GOOGLE_KEY_PRIMARY", "another-decoy")
+    route = respx.post(GENERATE_URL).mock(return_value=httpx.Response(200, json=SUCCESS_BODY))
 
+    await GoogleAdapter(http_client=http_client).chat_completion(
+        _request(), "gemini-3.5-flash-lite", key
+    )
 
-# --- Timeout envelope (Scenario 10) ---
+    assert route.calls[0].request.headers["x-goog-api-key"] == "test-google-key-primary"
+    assert "decoy" not in str(route.calls[0].request.headers)
 
 
 @respx.mock
-async def test_slow_headers_raise_timeout(http_client: httpx.AsyncClient) -> None:
+async def test_slow_headers_raise_timeout(
+    http_client: httpx.AsyncClient,
+    key: KeyRef,
+) -> None:
     """Scenario 10: exceeding the 0.4s header budget raises ProviderTimeoutError."""
     respx.post(GENERATE_URL).mock(side_effect=httpx.ReadTimeout("headers too slow"))
 
     with pytest.raises(ProviderTimeoutError):
         await GoogleAdapter(http_client=http_client).chat_completion(
-            _request(), "gemini-3.5-flash-lite"
+            _request(), "gemini-3.5-flash-lite", key
         )
 
 
 @respx.mock
 async def test_asyncio_timeout_is_enforced_on_slow_headers(
     http_client: httpx.AsyncClient,
+    key: KeyRef,
 ) -> None:
     """A connection slower than 0.4s is cut off by asyncio.timeout itself.
 
@@ -434,13 +474,14 @@ async def test_asyncio_timeout_is_enforced_on_slow_headers(
 
     with pytest.raises(ProviderTimeoutError):
         await GoogleAdapter(http_client=http_client).chat_completion(
-            _request(), "gemini-3.5-flash-lite"
+            _request(), "gemini-3.5-flash-lite", key
         )
 
 
 @respx.mock
 async def test_slow_body_is_not_subject_to_the_header_timeout(
     http_client: httpx.AsyncClient,
+    key: KeyRef,
 ) -> None:
     """The 0.4s budget covers headers only, so a slow body still succeeds.
 
@@ -457,7 +498,7 @@ async def test_slow_body_is_not_subject_to_the_header_timeout(
     respx.post(GENERATE_URL).mock(side_effect=_slow_body)
 
     result = await GoogleAdapter(http_client=http_client).chat_completion(
-        _request(), "gemini-3.5-flash-lite"
+        _request(), "gemini-3.5-flash-lite", key
     )
 
     assert result.content == "hello from gemini"

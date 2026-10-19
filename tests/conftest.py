@@ -18,7 +18,19 @@ from fastapi.testclient import TestClient
 
 from free_router.core.logging import NORMALISED_LOGGERS, JsonFormatter
 
-MANAGED_ENV_VARS = ("GEMINI_API_KEY", "LOG_LEVEL", "ROUTER_CONFIG_PATH", "ROUTER_DB_PATH")
+MANAGED_ENV_VARS = (
+    "GOOGLE_KEY_PRIMARY",
+    "GOOGLE_KEY_SECONDARY",
+    "MISTRAL_KEY_PRIMARY",
+    "LOG_LEVEL",
+    "ROUTER_CONFIG_PATH",
+    "ROUTER_DB_PATH",
+    "ROUTER_DEBUG_PAYLOAD_LOG",
+)
+"""Environment variables that must not leak into a test.
+
+Covers every ``<PROVIDER>_KEY_<ALIAS>`` slot the shipped configuration can name,
+so a developer shell with real credentials cannot influence a result."""
 """Environment variables that must not leak into a test."""
 
 MINIMAL_CONFIG = """\
@@ -61,10 +73,18 @@ def write_config(workdir: Path) -> Callable[..., Path]:
 
 @pytest.fixture
 def set_api_key(monkeypatch: pytest.MonkeyPatch) -> Callable[..., str]:
-    """Set a dummy ``GEMINI_API_KEY`` for the duration of a test."""
+    """Set a dummy key in the slot the shipped configuration declares.
 
-    def _set(value: str = "test-gemini-key") -> str:
-        monkeypatch.setenv("GEMINI_API_KEY", value)
+    The variable name is derived by ``key_env_var("google", "primary")``, so a
+    change to the derivation breaks these fixtures loudly rather than silently
+    leaving every test without a credential.
+    """
+    from free_router.core.config import key_env_var
+
+    variable = key_env_var("google", "primary")
+
+    def _set(value: str = "test-google-key-primary") -> str:
+        monkeypatch.setenv(variable, value)
         return value
 
     return _set
@@ -90,6 +110,27 @@ def ready_app(
     monkeypatch.setenv("ROUTER_DB_PATH", str(tmp_path / "router.db"))
 
     yield create_app
+
+
+@pytest.fixture
+def reset_debug_logging() -> Iterator[None]:
+    """Restore the debug payload logger to disabled after every test.
+
+    ``debug_logging`` keeps its enabled flag in a module global, because it is
+    read on every call site in the request path. Without this, a test that enables
+    payload logging would silently enable it for every test that follows, and the
+    "disabled by default" guarantee would only ever be verified once per run.
+    """
+    from free_router.core.debug_logging import configure_debug_payload_logging
+
+    yield
+    configure_debug_payload_logging({})
+
+
+@pytest.fixture(autouse=True)
+def _isolate_debug_logging(reset_debug_logging: None) -> None:
+    """Apply :func:`reset_debug_logging` to every test in the suite."""
+    assert reset_debug_logging is None
 
 
 @pytest.fixture

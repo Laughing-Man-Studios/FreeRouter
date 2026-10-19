@@ -5,20 +5,13 @@ Translates the router's internal normalized models to and from the Gemini
 
 Two details are worth knowing before changing this file.
 
-**The timeout covers provider I/O, not routing decisions.** Spec 8 originally
-wrapped connection and response headers in ``asyncio.timeout(0.4)``, on the
-theory that this protected the <500 ms routing envelope. It does not. Measured
-live, provider headers alone take p50 743 ms and up to 2893 ms, so a 400 ms
-window failed almost every real request with a 504. The router's own decision
-path is 0.003 ms, so the <500 ms target (CONSTITUTION 2.5, ROADMAP section 4)
-has ample headroom and is now documented rather than enforced. Spec 8 has been
-amended accordingly.
-
-The window still bounds *connection and headers*, not generation: a model's
-actual generation can take many seconds, so the body must be read *after* it
-closes. That is why dispatch uses ``stream=True`` and reads with ``aread()``
-rather than ``client.post()``, which reads the entire body inside the timeout
-and would turn every real completion into a 504.
+**The timeout is shared, not local.** ``PROVIDER_TIMEOUT_SECONDS`` is resolved
+in :mod:`free_router.providers.timeout` and re-exported here, because it is a
+cross-provider policy read from a single environment variable. Resolving it
+per-adapter would leave two sources of truth that drift the first time the
+default is retuned from measurement. See that module for why the window covers
+provider I/O rather than routing decisions, and why it bounds headers but not
+generation.
 
 **Only the messages the normalizer kept are sent.** M0 honours ``model`` and
 ``messages`` exclusively; ``temperature`` and ``max_tokens`` were already
@@ -35,14 +28,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 from collections.abc import Mapping
 from typing import Any
 
 import httpx
 
+from free_router.core.debug_logging import debug_payload
 from free_router.core.exceptions import (
     ProviderAuthError,
+    ProviderRateLimitError,
     ProviderServerError,
     ProviderTimeoutError,
     ProviderValidationError,
@@ -52,6 +46,12 @@ from free_router.core.normalization import (
     NormalizedRequest,
     NormalizedResponse,
 )
+from free_router.keys.manager import KeyRef
+from free_router.providers.timeout import (
+    DEFAULT_PROVIDER_TIMEOUT_SECONDS,
+    PROVIDER_TIMEOUT_SECONDS,
+)
+from free_router.quota.breaker import is_context_length_error
 
 __all__ = [
     "DEFAULT_PROVIDER_TIMEOUT_SECONDS",
@@ -67,55 +67,6 @@ GOOGLE_API_BASE = "https://generativelanguage.googleapis.com"
 
 API_VERSION = "v1beta"
 """REST path segment. Pinned because the API is versioned independently."""
-
-DEFAULT_PROVIDER_TIMEOUT_SECONDS = 5.0
-"""Default budget for provider connection and response receipt, in seconds.
-
-Sized from live measurement, not from the routing-overhead target. Fifteen live
-calls to ``gemini-3.5-flash-lite`` measured p50 743 ms, p90 2332 ms, and
-2893 ms maximum, so the previous 400 ms window failed real traffic roughly seven
-times out of eight.
-
-That 400 ms came from spec 8, which wrapped the provider call in the same
-budget that CONSTITUTION 2.5 and ROADMAP section 4 set for *routing decisions*.
-Those are different things: the router's own decision path measures 0.003 ms
-(0.015 ms worst case over 2000 iterations), leaving roughly 190,000x headroom
-against its 500 ms target, while every millisecond of the old window was being
-spent on provider network I/O the router does not control. Spec 8 has been
-amended to say so.
-
-The window still covers only connection and response headers, not generation:
-see the module docstring. Overridable via ``ROUTER_PROVIDER_TIMEOUT`` so M1 can
-give each failover attempt its own budget without editing this constant.
-
-``ROUTER_ROUTING_OVERHEAD_BUDGET_MS`` is deliberately *not* wired up. The
-routing path is far too fast for a 500 ms assertion to ever fire, and the
-mechanism would be dead code. Reintroduce it when routing logic is real.
-"""
-
-
-def _resolve_provider_timeout() -> float:
-    """Read ``ROUTER_PROVIDER_TIMEOUT``, falling back to the default.
-
-    Raises:
-        ValueError: If the override is not a positive number. Failing here is
-            better than silently accepting a zero or negative budget, which
-            would time out every request immediately.
-    """
-    raw = os.environ.get("ROUTER_PROVIDER_TIMEOUT")
-    if raw is None:
-        return DEFAULT_PROVIDER_TIMEOUT_SECONDS
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise ValueError(f"ROUTER_PROVIDER_TIMEOUT must be a number, got '{raw}'.") from exc
-    if value <= 0:
-        raise ValueError(f"ROUTER_PROVIDER_TIMEOUT must be positive, got {value}.")
-    return value
-
-
-PROVIDER_TIMEOUT_SECONDS = _resolve_provider_timeout()
-"""Effective provider timeout, in seconds."""
 
 _FINISH_REASON_MAP: Mapping[str, FinishReason] = {
     "STOP": "stop",
@@ -137,7 +88,7 @@ class GoogleAdapter:
         self._http_client = http_client
 
     async def chat_completion(
-        self, request: NormalizedRequest, provider_model_id: str
+        self, request: NormalizedRequest, provider_model_id: str, key: KeyRef
     ) -> NormalizedResponse:
         """Send one request to Gemini and normalise the reply.
 
@@ -145,6 +96,9 @@ class GoogleAdapter:
             request: The internal normalized request.
             provider_model_id: The Gemini-side model id, e.g.
                 ``gemini-3.5-flash-lite``, as resolved from configuration.
+            key: The credential to dispatch with. The material comes from the key
+                pool, not from the environment, so the environment variable name
+                is never handled here.
 
         Returns:
             The internal normalized response.
@@ -159,13 +113,20 @@ class GoogleAdapter:
         headers = {
             # The key travels in a header rather than a query parameter so it
             # cannot appear in URLs, proxy logs, or access logs.
-            "x-goog-api-key": _api_key(),
+            "x-goog-api-key": key.secret.get_secret_value(),
             "Content-Type": "application/json",
         }
         payload = to_gemini_request(request)
 
+        # The headers are deliberately not passed here: the credential travels in
+        # x-goog-api-key, and the debug stream's redaction is a backstop for
+        # unanticipated cases, not a licence to hand it a header mapping.
+        debug_payload(
+            phase="wire_request", provider="google", model=provider_model_id, data=payload
+        )
         response = await self._send(url, headers, payload)
         raw = await self._read_body(response)
+        debug_payload(phase="wire_response", provider="google", model=provider_model_id, data=raw)
         return from_gemini_response(raw, provider_model_id)
 
     async def _send(
@@ -375,6 +336,11 @@ def _raise_for_status_sync(status: int, raw: bytes) -> httpx.Response:
     """Raise the exception matching ``status``, using ``raw`` for classification."""
     if status in (401, 403):
         raise ProviderAuthError("The upstream provider rejected the API credentials.")
+    if status == 429:
+        # A rate limit is a capacity signal, not a malformed request. Mapping it
+        # to the generic 4xx branch reported it to the client as
+        # 400 invalid_request_error, which reads as "your payload is wrong".
+        raise ProviderRateLimitError("The upstream provider is rate limiting this key.")
     if status == 400:
         # Google reports an invalid API key as 400 INVALID_ARGUMENT rather than
         # 401, with the message "API key not valid. Please pass a valid API key."
@@ -383,12 +349,34 @@ def _raise_for_status_sync(status: int, raw: bytes) -> httpx.Response:
         # payload instead of their credentials.
         if _body_indicates_auth_failure(raw):
             raise ProviderAuthError("The upstream provider rejected the API credentials.")
-        raise ProviderValidationError("The upstream provider rejected the request payload.")
+        raise ProviderValidationError(
+            "The upstream provider rejected the request payload.",
+            context_length=body_indicates_context_length_error(raw),
+        )
     if 400 <= status < 500:
         raise ProviderValidationError(
-            f"The upstream provider rejected the request with status {status}."
+            f"The upstream provider rejected the request with status {status}.",
+            context_length=body_indicates_context_length_error(raw),
         )
     raise ProviderServerError(f"The upstream provider returned status {status}.")
+
+
+def body_indicates_context_length_error(raw: bytes) -> bool:
+    """True when a ``400`` body is a context-length refusal rather than a bad payload.
+
+    CONSTITUTION §8.2 requires a context-length refusal to degrade the model for
+    large-context requests rather than be retried. The classification has to happen
+    where the body is read, because once the exception is raised the body is gone
+    and the breaker (Batch 5) would have nothing to classify.
+
+    The body is inspected only to classify and is never propagated into an error
+    message, since it can echo prompt content.
+    """
+    try:
+        decoded: Any = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return False
+    return is_context_length_error(decoded) is not None
 
 
 def _body_indicates_auth_failure(raw: bytes) -> bool:
@@ -413,20 +401,3 @@ def _body_indicates_auth_failure(raw: bytes) -> bool:
     if status_flag in ("PERMISSION_DENIED", "UNAUTHENTICATED"):
         return True
     return "api key not valid" in str(error.get("message", "")).lower()
-
-
-def _api_key() -> str:
-    """Read the API key from the process environment.
-
-    Reads the environment directly rather than taking a ``Config`` argument so
-    the adapter stays independent of the configuration layer, matching the
-    interface described in the plan.
-
-    Raises:
-        ProviderAuthError: If the key is unset. Startup already fails fast on
-            this, so reaching here means the environment changed mid-run.
-    """
-    key = os.environ.get("GEMINI_API_KEY")
-    if not key:
-        raise ProviderAuthError("GEMINI_API_KEY is not set.")
-    return key

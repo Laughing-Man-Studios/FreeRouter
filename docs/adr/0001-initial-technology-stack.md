@@ -45,7 +45,19 @@ Before development of Milestone 0 begins, the baseline technology stack, executi
   * `pool=0.05` (50 ms connection acquisition)
   * `write=1.0` (1,000 ms prompt JSON push)
   * `read=10.0` (10-second idle timeout between SSE tokens)
-* **Routing Envelope:** The initial connection and response header phase is wrapped in a strict `asyncio.timeout(0.4)` window.
+* **Routing Envelope:** The initial connection and response header phase is wrapped in a strict `asyncio.timeout` window, budgeted at **0.4 s**.
+
+  > **Corrected at `m0.0.0`.** The original 0.4 s figure was derived from the `<500 ms` routing-overhead
+  > target and applied to provider network I/O, which is a different thing. Live measurement against
+  > `gemini-3.5-flash-lite` recorded provider headers at p50 743 ms, p90 2332 ms, and 2893 ms maximum,
+  > so a 400 ms window failed real traffic roughly seven times in eight. The router's own decision path
+  > measures 0.003 ms mean (0.015 ms worst case over 2000 iterations), leaving roughly 190,000x headroom
+  > against its 500 ms target.
+  >
+  > The budget is now **5 s**, overridable via `ROUTER_PROVIDER_TIMEOUT` so a later milestone can give
+  > each failover attempt its own budget. The `<500 ms` routing-overhead target is retained and
+  > documented, not enforced — at 0.003 ms an assertion could never fire. See
+  > `specs/001-project-bootstrap/spec.md` §8 and §10 for the amended requirement.
 * **Failover Rules:**
   * **Pre-stream only:** If a timeout, 5xx, or 429 occurs before the first byte is written to the client, the router catches the error and attempts the next eligible key/model.
   * **Post-stream fail-fast:** Once streaming begins, the stream is locked. Upstream failures must fail fast and inject a synthetic terminal SSE error event. Cross-provider replay mid-stream is forbidden.
@@ -71,7 +83,7 @@ Before development of Milestone 0 begins, the baseline technology stack, executi
 ### Positive
 
 * **Implementation Clarity:** Developers and AI agents have exact Docker images, strict timeout values, and explicit boundaries (e.g., no ORM, no multi-worker), eliminating architectural ambiguity during Milestone 0.
-* **Guaranteed Low Latency:** Bypassing Pydantic for SSE streaming, utilizing `uvloop`, and enforcing the 400ms `asyncio.timeout` wrapper guarantees the system meets its operational overhead targets.
+* **Guaranteed Low Latency:** Bypassing Pydantic for SSE streaming, utilizing `uvloop`, and enforcing the configurable `asyncio.timeout` wrapper guarantees the system meets its operational overhead targets. *(Corrected: the wrapper is 5 s for provider I/O, not 400 ms — see §2.4.)*
 * **Zero-Downtime Schema Updates:** Automatic Alembic migrations at startup ensure the database schema is always current without manual CLI intervention during deployments.
 * **Concurrency Safety:** Forcing SQLite into WAL mode and refusing to start if it fails ensures that state reconciliation from concurrent agent requests will not lock the primary event loop.
 
@@ -88,7 +100,7 @@ Before development of Milestone 0 begins, the baseline technology stack, executi
 | **3.1 Technology Mandate** | **Pass:** Utilizes Python 3.13, FastAPI, Pydantic, HTTPX, and SQLite. |
 | **3.1 Concurrency Directive** | **Pass:** SQLite WAL mode explicitly enforced via `aiosqlite` connection pragmas; app refuses to start if it fails. |
 | **3.2 Single-Node Deployment** | **Pass:** Architecture remains contained within a standard, multi-stage Docker environment with no external DB or queues. |
-| **2.5 Quality over Latency** | **Pass:** The 400ms timeout envelope protects the <500ms routing overhead target while preserving the failover mechanism for high-quality fallback routing. |
+| **2.5 Quality over Latency** | **Pass:** Routing overhead measures 0.003 ms against a <500 ms target, so the ceiling is satisfied with large headroom. The provider-I/O budget is separate and configurable; CONSTITUTION §2.5 explicitly subordinates latency to correctness. |
 | **9.2 Key Management** | **Pass:** Secrets strictly via environment variables; `config.yaml` used for non-secret overrides. |
 
 ***

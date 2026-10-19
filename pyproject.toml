@@ -11,6 +11,10 @@ dependencies = [
     "pydantic",
     "pydantic-settings",
     "pyyaml",
+    # Already required transitively by pydantic-settings, but imported directly
+    # by core.config to read .env for the derived <PROVIDER>_KEY_<ALIAS> names,
+    # which pydantic-settings cannot load as they are not declared fields.
+    "python-dotenv",
     "httpx",
     "aiosqlite",
     "alembic",

@@ -45,7 +45,7 @@ def test_startup_fails_without_api_key(
     tmp_path: Path,
     write_config: Callable[..., Path],
 ) -> None:
-    """Scenario 2: a missing GEMINI_API_KEY aborts startup."""
+    """Scenario 2: a missing credential aborts startup."""
     write_config()
     startup_env(tmp_path / "router.db")
 
