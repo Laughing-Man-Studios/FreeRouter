@@ -45,7 +45,14 @@ reserved = ceil((estimated_input + assumed_output) * safety_margin)
 - **Input** is estimated from the normalized request's message content, retaining
   M1's `chars / 4` calibration as the starting point.
 - **Output** is an **explicitly configured assumption** per deployment, not a
-  constant.
+  constant. **Its value is still open** — see `spec.md` § *Clarifications
+  Recorded* B1, where the supporting measurement is recorded.
+- **The safety margin is also configurable.** It is currently a constructor
+  parameter defaulting to `1.1`, unreachable from `config.yaml`. The margin is the
+  multiplier on the output assumption, so an operator tuning one would reasonably
+  expect to tune the other. The §6.1 key cap is *not* affected: `key_cap_for`
+  stays in code, because a constitutional limit that YAML could raise is not a
+  constitutional limit.
 - **Reconciliation supersedes the estimate** where the provider reports usage, for
   the entries the reservation created and no others.
 - **Absence of reported usage leaves the estimate standing.** Capacity is not
@@ -119,8 +126,11 @@ directly; see ADR-0005.
 - The request dimension is exact, so quota refusal on request counts is trustworthy.
 - Token reservation covers the direction that actually breaches ceilings.
 - The output assumption is visible, documented and tunable without a code change.
+- The safety margin is configurable, so the two quantities an operator would want
+  to tune together are tunable together.
 - Residual error is **measurable**: the console cross-check compares accumulated
-  persisted counts against what the provider bills.
+  persisted counts against what the provider bills. The estimate and the actual are
+  persisted separately so the comparison survives a restart.
 
 ### Negative / Trade-offs
 

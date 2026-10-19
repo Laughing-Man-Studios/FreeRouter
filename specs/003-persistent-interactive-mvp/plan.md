@@ -16,22 +16,30 @@ and Alembic migrations applied at startup. `request_logs` exists and is unused.
 CONSTITUTION §3.1 already mandates this stack.
 
 **M2 does not choose a database, and adds no driver.** It adds tables and a
-tracker behind an interface that ADR-0004 deliberately built for exactly this
-purpose. Choosing Redis now would contradict ROADMAP §3.14's instruction to defer
-that decision until real usage is known, and would violate the single-implementation
-constraint.
+persistence layer attached to the existing tracker. Choosing Redis now would
+contradict ROADMAP §3.14's instruction to defer that decision until real usage is
+known, and would violate the single-implementation constraint.
 
-### The quota interface was designed to be swapped
+### One implementation, with persistence attached
 
 ADR-0004's central claim was that *"the interface, not the storage, is the durable
-decision."* `QuotaTracker` already exposes `reserve`, `reconcile`, `available`,
-`used` and `dimensions_for`, and its internals are already private (`_Window`,
-`_Entry`, `_pending`).
+decision."* M2 cashes that in — and in doing so, **supersedes the
+two-implementations framing** that plan.md and ADR-0005 originally carried.
 
-So the implementation is a **new class satisfying the same surface, constructed at
-startup instead of `QuotaTracker`**, with the in-memory one retained for tests and
-as the degradation path. This is the payoff of having deferred the decision rather
-than guessed at it.
+If counters batch behind a flush interval, the state they batch **must** be hot in
+memory. A tracker that read and wrote SQLite on every reservation would put a
+database round-trip on the dispatch path — the exact cost the asymmetry principle
+exists to avoid. So the design is:
+
+```text
+QuotaTracker  (M1, unchanged window logic, hot in-memory state)
+    └── persistence layer  (M2: write-through cooldowns, batched counter flush)
+```
+
+**There is no second implementation of the window logic**, so no protocol
+extraction is needed to keep two in step, and **no fallback implementation to keep
+alive**. If persisted state is unreadable, the same tracker starts with empty
+state and continues — the degradation path is a state, not a class.
 
 What must **not** happen: the route handler, dispatcher, key manager or adapters
 change to accommodate persistence. If they do, the interface was not as general as
@@ -44,7 +52,7 @@ The two kinds of state have opposite requirements:
 | State | If lost on restart | Write policy |
 | :--- | :--- | :--- |
 | `cooldown_until`, breaker status | Router re-contacts a provider that just refused it — the exact behaviour §8.3 forbids | **Write-through, immediately** |
-| Request/token counters | Router loses a few seconds of accounting; may re-contact a provider it had just exhausted, once | **Batched**, bounded flush interval |
+| Request/token counters | Router loses a few seconds of accounting; may re-contact a provider it had just exhausted, once | **Batched**, 20 s interval (B2) |
 | LRU `last_used` ordinals | Selection order resets; no safety consequence | Batched with counters |
 
 **This asymmetry is the main design decision in M2** (ADR-0005). A uniform
@@ -66,10 +74,15 @@ M2 reserves:
 reserved = ceil((estimated_input + assumed_output) * safety_margin)
 ```
 
-with `assumed_output` configurable per deployment. **The output assumption is
-explicit configuration rather than a constant**, because it is a policy choice about
-how much headroom to buy, and a hidden constant would make that policy invisible
-and unchangeable without a code edit.
+with `assumed_output` configurable per deployment, and with the **safety margin
+itself configurable** (B3) — it is the multiplier on that assumption, so an
+operator tuning one would reasonably expect to tune the other.
+
+**The output assumption is explicit configuration rather than a constant**, because
+it is a policy choice about how much headroom to buy, and a hidden constant would
+make that policy invisible and unchangeable without a code edit. Its value is
+still open — see `spec.md` § *Clarifications Recorded* B1, where the supporting
+measurement is recorded.
 
 Provider-reported usage, where available, supersedes the estimate at reconcile time
 — which the code already supports (`_Entry` carries `actual`, and
@@ -85,16 +98,26 @@ listing does not change as provider state moves.
 **A configured model is always listed, including while in cooldown.** Hiding it
 would make a client's model list oscillate with transient provider state.
 
-### Streaming extends the adapter protocol, not the router
+`created` is the config file's mtime, `owned_by` is the deployment owner, and
+`permission`/`default` are emitted (B5).
+
+### Streaming extends the adapter protocol and the route, not the dispatcher
 
 `chat_completion` is currently a request/response call. Streaming adds a sibling
 method rather than a `stream: bool` parameter, because the two have genuinely
 different contracts: one returns a complete body, the other returns a sequence that
 can fail partway. A flag would force every caller to handle the union.
 
-The route layer translates the provider's chunk sequence into SSE. **Fail-fast is
-enforced at the point where the first chunk has been written to the client**, not
-in the adapter — the adapter cannot know whether anything has been delivered.
+**The dispatcher is not modified** (A2). The streaming path lives in the route
+layer, which re-implements model resolution, key eligibility, capacity gating and
+the bounded retry budget, and applies fail-fast at the point where the first chunk
+has been written to the client. The dispatcher is the most safety-critical
+component in the router and the one M1 measured at 100/100; leaving it
+byte-for-byte untouched is worth more than avoiding the duplication.
+
+**The duplication is bounded and must stay that way.** The streaming path takes
+exactly one `(provider, model)` pair and never varies it, so CONSTITUTION §7.2
+holds there too.
 
 ## Components Affected
 
@@ -102,53 +125,45 @@ in the adapter — the adapter cannot know whether anything has been delivered.
 | :--- | :--- |
 | `db/schema.py` | New tables: quota windows, cooldowns, key state, model status |
 | `db/migrations/` | One Alembic revision (0002) adding the above |
-| `quota/store.py` | **New.** SQLite-backed `QuotaTracker` satisfying the M1 surface |
+| `quota/persistence.py` | **New.** Write-through for cooldowns/status, batched counter flush |
 | `quota/estimation.py` | **New.** Input/output estimation with configurable output assumption |
-| `quota/tracker.py` | Extracted `QuotaTrackerProtocol` so both implementations are checked against one contract |
+| `quota/tracker.py` | Attach the persistence layer; add `restore()` and the flush hook |
 | `quota/cooldown.py` | Write-through persistence on transition |
 | `quota/breaker.py` | Persist degraded/unavailable status |
 | `keys/manager.py` | Restore LRU ordinals; write `last_used` through the store |
 | `api/models_route.py` | **New.** `GET /v1/models` |
-| `api/streaming.py` | **New.** SSE writer, provider-chunk → OpenAI-chunk translation |
+| `api/streaming.py` | **New.** SSE writer, provider-chunk → OpenAI-chunk translation, capacity gating |
 | `api/routes.py` | Branch on `stream`; unchanged for the unary path |
 | `providers/base.py` | `stream_chat_completion` on the adapter protocol |
 | `providers/{google,mistral}/adapter.py` | Implement streaming for both |
-| `api/main.py` | Restore state before serving; construct the SQLite tracker |
+| `api/main.py` | Restore state before serving; start the flush task |
 
 **Explicitly unchanged:** `core/normalization.py`, `core/config.py` (beyond the new
-output-assumption field), `core/dispatch.py` (except streaming dispatch), and the
-adapter/request translation logic already proven by M1's 100/100 measurement.
+output-assumption, safety-margin and max-cooldown fields), `core/dispatch.py`
+**in its entirety** (A2), and the adapter/request translation logic already proven
+by M1's 100/100 measurement.
 
 ## Interfaces
 
-### The tracker contract
+### The tracker
 
-Both implementations must satisfy one protocol, extracted from `QuotaTracker`:
+`QuotaTracker`'s existing surface is preserved exactly (A3). `reserve`/`reconcile`
+**keep their signatures**, including `Reservation | None` and `int | None`.
+Changing them would ripple into the dispatcher for no benefit, and ADR-0004's
+interface is the thing being cashed in here — not revised.
+
+One method is added:
 
 ```python
-class QuotaTrackerProtocol(Protocol):
-    async def restore(self) -> None: ...
-
-    def dimensions_for(self, provider: str, model_id: str) -> tuple[QuotaDimension, ...]: ...
-
-    def available(self, provider: str, model_id: str) -> bool: ...
-
-    async def reserve(
-        self, provider: str, model_id: str, estimated_tokens: int
-    ) -> Reservation | None: ...
-
-    async def reconcile(self, reservation: Reservation, actual_tokens: int | None) -> None: ...
-
-    def used(self, provider: str, model_id: str, resource: DimensionResource) -> float: ...
+async def restore(self) -> None:
+    """Load persisted quota state. Called once at startup, before serving."""
 ```
 
-`reserve`/`reconcile` **keep their signatures**, including `Reservation | None` and
-`int | None`. Changing them would ripple into the dispatcher for no benefit, and
-ADR-0004's interface is the thing being cashed in here — not revised.
+It is called during lifespan, before the listener accepts traffic, so no request
+can be dispatched against an unrestored counter.
 
-`restore()` is the one addition. It is called once during lifespan, before the
-listener accepts traffic, and is absent from the in-memory implementation's
-behaviour (a no-op) so the dispatcher does not need to know which it holds.
+The persistence layer is attached to the tracker rather than replacing it, so the
+tracker gains a collaborator rather than a second implementation to keep in step.
 
 ### Adapter streaming
 
@@ -177,9 +192,13 @@ POST /v1/chat/completions  with  {"stream": true}
 Response: `text/event-stream`, OpenAI-compatible chunk objects, terminated by
 `data: [DONE]`.
 
+A `role` delta is emitted first, `usage` is included on the final chunk, and
+`stream_options: {"include_usage": true}` is honoured (B7).
+
 **Fail-fast boundary:** once any chunk has been written to the client, a provider
 error terminates the connection. Before that point, an error is an ordinary fault
-and may be retried within the existing budget.
+and may be retried within the existing budget. **A zero-chunk stream is not
+"after stream start"** — it has delivered nothing, so it is retryable.
 
 ## Data / Persistence Changes
 

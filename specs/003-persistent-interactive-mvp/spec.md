@@ -83,6 +83,18 @@ The asymmetry is the design, not an optimisation. It is stated here because a
 uniform "persist everything" rule would be simpler to describe and would put a
 write on the latency-sensitive dispatch path for no safety gain.
 
+**The counter flush interval is 20 seconds** (B2), and the requests within an
+interval are coalesced into a single additive write. A `SIGKILL` therefore loses up
+to 20 seconds of counters and nothing else — cooldowns are written through
+immediately and survive an unclean shutdown regardless.
+
+**The maximum cooldown is 24 hours, configurable** (B4). It bounds a pathological
+lockout — a `cooldown_until` written by a clock that later jumps backwards — while
+accommodating the longest legitimate provider hint, a daily cap resetting at
+midnight. A backwards clock jump is better *detected* than patched, by comparing
+persisted `cooldown_until` against the system clock at restore time; the cap is
+the backstop, not the primary mechanism.
+
 ### 2. Restore on Restart
 
 On startup the router must reconstruct its quota position from persisted state
@@ -123,6 +135,9 @@ The estimate must cover **both** directions:
 Existing M1 behaviour reserves `chars / 4` with a safety margin. M2 extends this to
 separate input and output assumptions and states the tolerated error.
 
+**The safety margin becomes configuration** (B3), alongside the output assumption
+it multiplies. The value is not yet fixed — see § *Clarifications Recorded* B1.
+
 ### 4. Reconciliation
 
 When a provider reports actual usage, the router must settle the reservation
@@ -142,6 +157,10 @@ does deliberately, rather than by introducing new behaviour: `_Entry` carries bo
 an estimate and an actual, and reconciliation writes the actual into the entries
 that reservation created.
 
+**The estimate and the actual must be stored separately in persisted state** (not
+collapsed into one effective figure), because the estimator-drift measurement
+described in ADR-0006 §6 depends on being able to compare them after a restart.
+
 ### 5. `GET /v1/models`
 
 The endpoint must return the models the router will actually serve, generated from
@@ -150,6 +169,9 @@ and is not implemented (ROADMAP §3.3).
 
 The response must be OpenAI-compatible in shape: an object with a `data` array of
 model objects carrying at least `id`, `object: "model"`, `created` and `owned_by`.
+
+**`created` is the configuration file's modification time**, **`owned_by` is the
+deployment owner**, and **`permission` and `default` are emitted** (B5).
 
 **A model that is configured but currently unavailable must still be listed**, with
 its availability conveyed separately. Hiding it would make a client's model list
@@ -172,6 +194,20 @@ client **must not** be replayed from another provider (ROADMAP §3.11, and an
 explicit non-goal of #36). The connection is terminated and the failure is
 recorded. Cross-provider replay after stream start is not attempted at any phase.
 
+**The fail-fast boundary is drawn at delivery, not dispatch.** A stream that fails
+before emitting any chunk has delivered nothing and is an ordinary transient
+fault, retryable within the existing budget. A stream that has emitted a chunk
+cannot be retried. A **zero-chunk stream is not "after stream start"** — this
+distinction is what makes the rule precise rather than merely conservative.
+
+**The dispatcher is not modified** (A2). The streaming path lives in the route
+layer, which re-implements model resolution, key eligibility, capacity gating and
+the bounded retry budget, and applies fail-fast at the point of delivery. The
+streaming path takes exactly one `(provider, model)` pair and never varies it.
+
+**Chunk format** (B7): a `role` delta is emitted first, `usage` is included on
+the final chunk, and `stream_options: {"include_usage": true}` is honoured.
+
 This is a deliberate correctness choice over an availability one: a client that
 receives a truncated response from one provider followed by unrelated content from
 another is worse off than one that receives a clean error it can retry.
@@ -181,6 +217,17 @@ another is worse off than one that receives a clean error it can retry.
 Provider errors must be classified into the router's normalized set with enough
 fidelity that a failure is actionable — a quota problem, a credential problem, a
 payload problem, or a transient upstream problem must remain distinguishable.
+
+**M2 delivers four specific improvements** (A4):
+
+1. **Provider-specific error codes are surfaced to the client**, so a payload
+   problem is distinguishable from a credential problem without parsing prose.
+2. **A burst `429` is distinguished from a daily-cap exhaustion.** The first is
+   transient with a short window; the second means the day's budget is spent and
+   no amount of retrying will help. They are identical on the wire.
+3. **`5xx` overload is separated from upstream defect.** An overload signal is
+   retryable; a provider bug is not, and retrying it burns quota to learn nothing.
+4. **The provider's own retryable signal is trusted** where one is supplied.
 
 Ordinary `400`s must not degrade a model. Only a genuine context-length refusal
 does.
@@ -201,6 +248,10 @@ does.
    windows the reservation touched — and only those.
 8. Every dispatched attempt consumes quota, including streaming attempts that
    produce nothing.
+9. The estimate and the actual are persisted separately, so estimator drift stays
+   measurable after a restart.
+10. The dispatcher is unchanged by M2. The streaming path re-implements capacity
+    gating identically rather than diverging from it.
 
 ## Acceptance Scenarios
 
@@ -399,59 +450,266 @@ Added by this specification:
 - **Exactly-once accounting.** The estimate/actual pair may disagree by one
   in-flight request across an unclean shutdown, and that is accepted.
 
-## Open Decisions Requiring Sign-Off
+## Clarifications Recorded
 
-These are recorded with a recommendation rather than silently resolved. #36's
-acceptance criteria require them *agreed*, and each changes behaviour an operator
-would notice.
+Agreed 2026-10-19 with the operator, before implementation began. Each is
+recorded with its reasoning so it does not have to be reconstructed later.
+
+| # | Decision |
+| :--- | :--- |
+| A1 | The OpenHands objective is **deferred to M3** (was D3) |
+| A2 | The **dispatcher stays unary-only**; the streaming path lives in the route layer |
+| A3 | **One implementation** — in-memory hot state with a persistence layer attached |
+| A4 | Error classification: **all four** improvements |
+| B2 | Flush interval: **20 s** |
+| B3 | The **safety margin is configurable** |
+| B4 | Maximum cooldown: **24 h**, configurable |
+| B5 | `/v1/models`: `created` = config file mtime, `owned_by` = deployment owner, `permission`/`default` emitted |
+| B6 | `request_logs` population **deferred** |
+| B7 | Streaming: role delta emitted, `usage` in the final chunk, `stream_options.include_usage` honoured |
+| B1 | **Open** — awaiting the operator's decision, see below |
+
+### A1 — the OpenHands objective is deferred to M3
+
+ROADMAP Milestone 2 asks that OpenHands be used "as an actual workload as early as
+practical", while simultaneously placing **tool calling outside the boundary** as
+"the next compatibility feature after streaming". Those two are in tension
+structurally, not by effort: OpenHands is an agentic client that acts by issuing
+tool calls, so streaming and `GET /v1/models` support *conversational* use but not
+agentic use.
+
+**Decision: defer the OpenHands objective to M3**, where capability-aware routing
+and tool support converge. M2 delivers the capabilities the objective needs —
+streaming and model discovery — and does not claim the workload.
+
+**Consequence, recorded deliberately:** M2's exit criterion, "can serve interactive
+OpenHands workloads with streaming where supported", is **not met by M2 and is not
+claimed to be**. The milestone's exit criteria are restated in `tasks.md` §
+*Milestone Exit Criteria* to what M2 actually delivers. The ROADMAP's Milestone 2
+section carries the same deferral.
+
+This is a scope decision about the milestone, not an implementation detail, and it
+is recorded as a deviation rather than absorbed silently.
+
+### A2 — the dispatcher stays unary-only
+
+**Decision:** the streaming path lives in the route layer. `core/dispatch.py` is
+**not modified**.
+
+Fail-fast needs to know whether a chunk has been delivered to the client, and the
+dispatcher has no way to express that. Two options were considered:
+
+1. **Route-layer streaming** — the dispatcher keeps its single `(provider, model)`
+   signature and its whole unary contract; the route owns the stream and applies
+   fail-fast at the point of delivery.
+2. **A streaming dispatcher variant** — a delivery callback threaded into the
+   dispatcher's retry loop.
+
+**Option 1 is chosen.** The dispatcher is the most safety-critical component in the
+router and the one M1 measured at 100/100 under live traffic. Leaving it
+byte-for-byte untouched is worth more than avoiding some duplicated
+capacity-gating logic in the route.
+
+**The duplication is bounded and must stay that way.** The streaming path in the
+route re-implements: model resolution, key eligibility, capacity gating, and the
+bounded retry budget. It must re-implement them **identically**, and the
+cross-model prohibition of CONSTITUTION §7.2 must hold there too — the streaming
+path takes exactly one `(provider, model)` pair and never varies it across
+attempts.
+
+### A3 — one implementation with a persistence layer attached
+
+**Decision:** there is one quota tracker. Its hot window state stays in memory and
+a persistence layer is attached to it.
+
+This supersedes the two-implementations framing in `plan.md` and ADR-0005, which
+was inconsistent with ADR-0005's own reasoning. If counters batch behind a flush
+interval, the state they batch **must** be hot in memory; a tracker that read and
+wrote SQLite on every reservation would put a database round-trip on the dispatch
+path, which is the exact cost the asymmetry principle exists to avoid.
+
+**Consequences:**
+
+- **There is no second implementation of the window logic**, and therefore no need
+  to extract a `QuotaTrackerProtocol` to keep two in step. The protocol extraction
+  planned in `tasks.md` T043 is **dropped**.
+- **The degradation path is not a different class.** If persisted state is
+  unreadable, the same tracker starts with empty state and continues. There is no
+  fallback implementation to keep alive.
+- **Restore is a method on the tracker**, called once at startup before the
+  listener accepts traffic.
+
+### A4 — error classification: all four improvements
+
+**Decision:** M2 delivers all four:
+
+1. **Provider-specific error codes are surfaced to the client** — Gemini's
+   `INVALID_ARGUMENT`, Mistral's `invalid_api_key`, and so on, so a client can
+   distinguish a payload problem from a credential problem without parsing prose.
+2. **A burst `429` is distinguished from a daily-cap exhaustion.** The first is
+   transient and the window is short; the second means the day's budget is gone
+   and no amount of retrying will help. These look identical on the wire.
+3. **`5xx` overload is separated from upstream defect.** A `503` with an overload
+   signal is retryable; a `500` from a provider bug is not, and retrying it burns
+   quota to learn nothing.
+4. **The provider's own retryable signal is trusted** where the provider supplies
+   one, rather than the router's own guess.
+
+### B2 — flush interval: 20 seconds
+
+**Decision:** 20 s.
+
+A `SIGKILL` loses up to one interval of counters. 20 s bounds that loss to a
+small fraction of a 500-per-day budget while keeping the flush cost negligible —
+one write per 20 s regardless of request rate, because the interval's requests are
+coalesced into a single additive write.
+
+Cooldowns are unaffected: they are written through immediately and survive an
+unclean shutdown regardless of this value.
+
+### B3 — the safety margin is configurable
+
+**Decision:** the safety margin becomes configuration, alongside the output
+assumption it multiplies.
+
+It is currently a constructor parameter defaulting to `1.1`, unreachable from
+`config.yaml`. Making the output assumption configurable while leaving the margin
+fixed would be incoherent: the margin is the multiplier on that assumption, and an
+operator tuning one would reasonably expect to tune the other.
+
+**The §6.1 key cap is *not* affected by this.** `key_cap_for` stays in code: a
+constitutional limit that YAML could raise is not a constitutional limit.
+
+### B4 — maximum cooldown: 24 hours, configurable
+
+**Decision:** `max_cooldown_seconds` defaults to **86400** (24 h).
+
+The cap exists to bound a pathological lockout — a `cooldown_until` written by a
+clock that later jumps backwards, or a provider hint far beyond any real reset.
+24 h accommodates the longest *legitimate* provider hint (a daily cap resetting at
+midnight) while still bounding the pathological case to one day.
+
+**A backwards clock jump is better detected than patched.** A cap treats the
+symptom; comparing persisted `cooldown_until` against the system clock at restore
+time treats the cause, and is the mechanism that should carry the weight. The cap
+is the backstop.
+
+### B5 — `/v1/models` response shape
+
+**Decision:**
+
+- **`created`** is the **modification time of the configuration file** the models
+  are derived from. A config-declared model has no creation date, and a stable
+  value matters: a client that re-fetches and sees a changed `created` may treat
+  the model as updated. The config file's mtime changes only when the operator
+  changes it.
+- **`owned_by`** is the **deployment owner** — the identity the router is
+  operating as — not the provider. The provider is already carried by the model id
+  (`google/…`, `mistral/…`), so repeating it in `owned_by` would add no
+  information.
+- **`permission` and `default` are emitted.** Some clients read them, and
+  omitting them produces inconsistent behaviour across client implementations.
+
+### B6 — `request_logs` population is deferred
+
+**Decision:** M2 does not populate `request_logs`. M0 built the table; M1 left it
+unused; M2 continues to leave it unused.
+
+**This is a deferral, not a decision that it is unwanted.** A table that exists,
+is migrated, and is never written is a loose end, and M2 is the milestone that
+makes real persistence possible. It is deferred because populating it is new
+observability work that is not in M2's deliverables, and adding it would widen
+the milestone. Worth revisiting when a usage report is actually wanted.
+
+### B7 — streaming chunk details
+
+**Decision:**
+
+- **A `role` delta is emitted first**, matching the OpenAI chunk format, so
+  clients that assemble deltas into a message see the role before content.
+- **`usage` is included on the final chunk**, so a streaming client can account
+  for tokens without a second request.
+- **`stream_options: {"include_usage": true}` is honoured.** Usage is included
+  when the client asks for it.
+
+### B1 — the output-token assumption (OPEN)
+
+**Still open, pending the operator's decision.** The supporting analysis is below
+so the decision can be made on evidence rather than intuition.
+
+**Measured provider-reported usage** (2026-10-19, direct calls, two prompt
+shapes):
+
+| Provider | Prompt | Input tokens | Output tokens | Output chars |
+| :--- | :--- | :--- | :--- | :--- |
+| `gemini-3.5-flash-lite` | single word | 8 | 1 | 4 |
+| `gemini-3.5-flash-lite` | short paragraph | 28 | **146** | 827 |
+| `ministral-3b-2512` | single word | 11 | 3 | 4 |
+| `ministral-3b-2512` | short paragraph | 33 | **178** | 891 |
+
+Three findings that bear on the decision:
+
+1. **The input estimate is sound.** 144 prompt characters produced 28–33 input
+   tokens, i.e. 4.4–5.1 characters per token. M1's `chars / 4` therefore
+   *over*-estimates input slightly — conservative in the right direction, and no
+   correction is needed.
+2. **The output assumption is not capacity-critical at current rates.** Gemini's
+   ceiling is 250K TPM against a 15 RPM burst limit; even a 1000-token output
+   assumption reaches 15K tokens/minute, roughly 6% of the ceiling. Mistral's
+   1.3M TPM against 12.5 RPS is looser still. **TPM is not the binding
+   constraint**, which M1's spec already recorded.
+3. **So the assumption's real job is accounting accuracy, not capacity
+   protection.** Because reconciliation supersedes the estimate with the
+   provider's own figure, an over-reservation is refunded after the fact. A
+   generous default therefore costs almost nothing in capacity while keeping the
+   reservation meaningful.
+
+**Consequence of 2 and 3 together:** the exact value is far less critical than it
+first appears. A value that comfortably exceeds a typical response (the measured
+"short paragraph" is 146–178 tokens) is sufficient, and the cost of choosing
+generously is bounded by TPM slack that is 16× the requirement.
+
+**The `max_tokens` complication.** The client *cannot* currently tell the router
+how long a response will be: `normalize_chat_completion_request` discards every
+field except `model` and `messages`, so `max_tokens` never reaches the router.
+The assumption therefore has to be deployment-side configuration — or M2 changes
+the normalization contract to honour `max_tokens`, which is a deliberate change
+to behaviour M1 established and is **not** in M2's deliverables.
+
+**Options for the operator:**
+
+| Option | Effect |
+| :--- | :--- |
+| **A.** Configurable global default, no `max_tokens` | Simplest. Recommended unless a workload needs a different value. |
+| **B.** Configurable **per model** | Follows the quota model, which is already per-model. More configuration surface for a value that barely matters. |
+| **C.** Honour `max_tokens` when present, fall back to the default | Most accurate. Changes the normalization contract M1 established, and widens M2. |
+| **D.** Per request, from the client | Not possible without C. |
+
+**Recommendation: option A**, with a default of **1024 tokens** — about 6× the
+measured short-paragraph output, costing ~8% of Gemini's TPM ceiling at the 15 RPM
+burst limit, and refunded on reconciliation. Option B becomes worth revisiting if
+a long-form workload appears.
 
 ### D1 — Estimation error is tolerated on tokens only
 
-**Recommendation:** adopt.
+**Agreed.**
 
 Requests are counted exactly; tokens are estimated. The tolerated error is
 therefore stated per dimension, not globally. A vague global tolerance ("±20%")
 would be unfalsifiable, because the request dimension has no error to absorb.
 
-Reserving input estimate plus a configurable output assumption is recommended over
+Reserving input estimate plus a configurable output assumption is agreed over
 estimating input alone. Under-reserving output is what breaches a TPM ceiling,
 because the output size is the part genuinely unknown pre-dispatch.
 
 ### D2 — Reconciliation corrects only what it reserved into
 
-**Recommendation:** adopt.
+**Agreed.**
 
 This is what the M1 code already does deliberately, so agreeing it costs nothing.
 The alternative — retroactive rewriting of historical windows — cannot be
 implemented honestly for a rolling window that has already been pruned, and a
-fixed daily window is a record of what occurred, not a mutable tally.
-
-### D3 — OpenHands as a real workload is likely not reachable in M2
-
-**Recommendation:** reduce the objective, and record it.
-
-ROADMAP Milestone 2 asks that OpenHands be used "as an actual workload as early as
-practical", and simultaneously places **tool calling outside the boundary** as
-"the next compatibility feature after streaming".
-
-**These two are in tension, and the tension is structural rather than a matter of
-effort.** OpenHands is an agentic client: it acts by issuing tool calls to read
-files, run commands and edit code. Without tool calling it can converse but cannot
-act, which is not the workload the objective describes.
-
-Options:
-
-1. **Accept a reduced objective** — validate streaming and model discovery against
-   OpenHands' chat path, and record that agentic use awaits tool calling.
-2. **Move tool calling into M2** — enlarges the milestone and displaces work
-   already committed.
-3. **Defer the OpenHands objective to M3** — where capability-aware routing and tool
-   support converge.
-
-**Option 1 is recommended**, because it delivers what M2's deliverables actually
-support without renegotiating the milestone. But this is a scoping decision about
-the objective rather than an implementation detail, and it is the one item here
-most likely to be contested.
+fixed daily window is a record of what occurred rather than a mutable tally.
 
 ## Recorded Deviations Carried From M1
 

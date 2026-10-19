@@ -31,7 +31,7 @@ only visible once the plan existed.
 
 ```text
 Batch 1  Persistence schema & migration      #12
-Batch 2  SQLite-backed quota store            #12
+Batch 2  Persistence layer & restore          #12
 Batch 3  Token estimation & reservation       #13
 Batch 4  GET /v1/models                       #14
 Batch 5  SSE streaming & fail-fast            #15
@@ -83,20 +83,31 @@ together, which is how a behavioural regression hides.
   database created by revision 0001 and must be idempotent on re-run, since
   migrations run at every startup.
 
-- [ ] **T043: Extract `QuotaTrackerProtocol`** from `QuotaTracker` (`plan.md`
-  § *Interfaces*), so both implementations are checked against one contract.
+- [ ] **T043: ~~Extract `QuotaTrackerProtocol`~~ — DROPPED, and the drop is informative.**
 
-  **This is the test of ADR-0004's central claim.** `reserve` and `reconcile` keep
-  their existing signatures *including* `Reservation | None` and `int | None`. The
-  only addition is `restore()`. If extracting the protocol requires changing the
-  dispatcher, ADR-0004's "the interface, not the storage, is the durable decision"
-  was wrong — record that as a finding rather than working around it.
+  Originally planned as the test of ADR-0004's claim that *"the interface, not the
+  storage, is the durable decision"*: extract a protocol so a second, SQLite-backed
+  implementation could be checked against it.
+
+  **Decision A3 collapsed the reason for it.** There is one implementation — hot
+  in-memory state with a persistence layer attached — so there is no second
+  implementation to keep in step, and no protocol to extract. The claim is now
+  tested differently: by checking that `reserve`/`reconcile`/`available` keep their
+  existing signatures *including* `Reservation | None` and `int | None`, and that
+  the dispatcher, key manager and adapters are untouched. If attaching persistence
+  turns out to require changing the dispatcher's call into the tracker,
+  ADR-0004's claim was wrong, and that is a finding to record rather than work
+  around.
+
+  **T043's number is retired, not reused.** A retired task number in a stable
+  identifier scheme is worth keeping visible rather than silently recycling.
 
 **Verification & Stop:**
 
 1. `ruff check .`, `ruff format --check .`, `mypy --strict src/`
 2. Migration applies to a fresh database and to one created by revision 0001.
-3. `QuotaTracker` satisfies `QuotaTrackerProtocol` — asserted, not assumed.
+3. The tracker's public surface is unchanged apart from the added `restore()` —
+   asserted by signature, not by inspection.
 4. A test asserts the new tables contain no column able to hold key material or
    payload text.
 5. `pytest tests/test_db.py tests/test_migrations.py tests/test_quota_tracker.py`
@@ -108,19 +119,23 @@ together, which is how a behavioural regression hides.
 
 **Maps to GitHub Issue:** `#12 Single-File Local Persistence Engine`
 
-- [ ] **T044: `quota/store.py` — SQLite-backed tracker.** Satisfies
-  `QuotaTrackerProtocol`, constructed at startup in place of the in-memory tracker.
+- [ ] **T044: `quota/persistence.py` — the persistence layer.** Attached to the
+  existing `QuotaTracker`; **the tracker's window logic is unchanged** (A3).
 
   **Durability is asymmetric** (ADR-0005): cooldowns and status transitions write
-  through immediately; counters and LRU ordinals batch behind a bounded flush
-  interval, coalesced so N requests in one interval produce one additive write.
+  through immediately; counters and LRU ordinals batch behind a **20 s** flush
+  interval (B2), coalesced so N requests in one interval produce one additive
+  write.
 
-  **The in-memory tracker stays** — as the test double and as the degradation path
-  when restore fails.
+  **There is no second implementation and no fallback class** (A3). The degradation
+  path is a state, not a class: an unreadable row means the same tracker starts
+  with empty state and continues.
 
 - [ ] **T045: `restore()` before the listener serves.** Called in lifespan so no
   request can be dispatched against an unrestored counter. Prunes windows whose
-  reset instant has passed; does not restore expired cooldowns.
+  reset instant has passed; does not restore expired cooldowns; **detects a
+  backwards clock jump** by comparing persisted `cooldown_until` against the system
+  clock (the primary mechanism — the 24 h cap in B4 is the backstop).
 
 - [ ] **T046: Cooldown and breaker write-through.** `cooldown.py` and `breaker.py`
   persist on transition. A failed cooldown write returns `503
@@ -136,7 +151,7 @@ together, which is how a behavioural regression hides.
   table would pass even if selection ignored it.
 
 - [ ] **T048: Failure degradation.** An unreadable or corrupt row discards that
-  unit's state and falls back to in-memory accounting, recording it. A general
+  unit's state and continues with in-memory accounting, recording it. A general
   restore failure degrades the tracker and startup **succeeds**. A crash-loop is worse
   than forgetting a cooldown.
 
@@ -167,9 +182,18 @@ together, which is how a behavioural regression hides.
   `assumed_output`. Reserved = `ceil((input + output) * safety_margin)`, margin
   applied inside the tracker so a caller cannot forget it (M1's existing property).
 
-  **The output assumption is explicit configuration**, not a constant (ADR-0006).
-  M1's estimate silently assumed zero output tokens, which is what actually breaches
-  a TPM ceiling.
+  **Both the output assumption and the safety margin become configuration**
+  (ADR-0006, B3). M1's estimate silently assumed zero output tokens, which is what
+  actually breaches a TPM ceiling, and the margin was a constructor parameter
+  unreachable from `config.yaml`.
+
+  **The output assumption's value is still open** (B1). It is recorded in
+  `spec.md` § *Clarifications Recorded* B1 with the supporting measurement:
+  a short-paragraph response measured 146–178 output tokens, and TPM is ~16×
+  slack at the measured burst limits, so a generous default costs little. **This
+  task does not start until B1 is answered.**
+
+  The §6.1 key cap is unaffected and stays in code.
 
 - [ ] **T050: Wire provider-reported usage.** Both adapters return actual usage where
   the provider reports it; `reconcile` receives `None` where it does not.
@@ -182,6 +206,9 @@ together, which is how a behavioural regression hides.
   the estimate for the entries the reservation created, leaves the estimate standing
   on `None`, and is idempotent (ADR-0006). These are existing behaviours; this task
   makes them specified and tested rather than incidental.
+
+  **The estimate and the actual are persisted separately**, not collapsed into one
+  effective figure, so the drift measurement in T052 survives a restart.
 
 - [ ] **T052: Record the tolerated error.** Update `spec.md` with the measured
   residual against the provider console per ADR-0006 §6.
@@ -207,6 +234,11 @@ together, which is how a behavioural regression hides.
 - [ ] **T053: `api/models_route.py`.** OpenAI-compatible shape from
   `config.models` — the same list that drives routing. No discovery call, no cache
   to invalidate, no second source of truth.
+
+  **`created` is the config file's mtime, `owned_by` is the deployment owner, and
+  `permission`/`default` are emitted** (B5). The config mtime changes only when
+  the operator changes it, so a client re-fetching does not see a spurious
+  "model updated".
 
 - [ ] **T054: Availability as a separate field.** **A configured model is always
   listed, including while in cooldown.** Hiding it would make a client's model list
@@ -240,12 +272,20 @@ together, which is how a behavioural regression hides.
 - [ ] **T056: `api/streaming.py`.** Translate provider chunks to OpenAI-compatible
   SSE, terminated by `data: [DONE]`, for both Gemini and Mistral.
 
+  **A `role` delta is emitted first, `usage` is included on the final chunk, and
+  `stream_options: {"include_usage": true}` is honoured** (B7).
+
 - [ ] **T057: Fail-fast at the first delivered chunk** (ADR-0007). Enforced in the
   route layer, because the adapter cannot know whether anything reached the client.
 
   **Zero chunks is not "after stream start"** — nothing was delivered, so it retries
   within the existing budget. This distinction is what makes the rule precise rather
   than merely conservative.
+
+  **The dispatcher is not touched** (A2). The streaming path in the route
+  re-implements model resolution, key eligibility, capacity gating and the bounded
+  retry budget, and must re-implement them **identically** — including taking
+  exactly one `(provider, model)` pair, so CONSTITUTION §7.2 holds there too.
 
 - [ ] **T058: Reservation lifecycle under streaming.** An interrupted stream
   reconciles with whatever usage was reported; **no reservation leaks**. Streaming
@@ -274,10 +314,22 @@ together, which is how a behavioural regression hides.
 
 **Maps to GitHub Issues:** `#12`, `#15`
 
-- [ ] **T060: Improved provider error classification.** Distinguish quota,
-  credential, payload and transient upstream failures precisely enough to be
-  actionable. Ordinary `400`s must not degrade a model; only a genuine
-  context-length refusal does.
+- [ ] **T060: Improved provider error classification** (A4). All four:
+
+  1. **Provider-specific error codes surfaced to the client** — Gemini's
+     `INVALID_ARGUMENT`, Mistral's `invalid_api_key`, so a client distinguishes a
+     payload problem from a credential problem without parsing prose.
+  2. **Burst `429` distinguished from daily-cap exhaustion.** Identical on the
+     wire, but the first is transient with a short window and the second means the
+     day's budget is spent and retrying cannot help.
+  3. **`5xx` overload separated from upstream defect.** An overload signal is
+     retryable; a provider bug is not, and retrying it burns quota to learn
+     nothing.
+  4. **The provider's own retryable signal trusted** where supplied, rather than
+     the router's own guess.
+
+  Ordinary `400`s must not degrade a model; only a genuine context-length refusal
+  does.
 
 - [ ] **T061: Manual integration-test matrix** (#36 deliverable). Success, `429`,
   `4xx`, `5xx`, timeout, **mid-stream interruption**, and **post-restart behaviour**,
@@ -298,11 +350,17 @@ together, which is how a behavioural regression hides.
 - [ ] **T064: Confirm the §8.3 deviation stays closed** and remove the M1 entry only
   once Scenarios 1–4 pass against a real restart.
 
-- [ ] **T065: Revisit OpenHands.** #36 requires OpenHands brought in "as early as
-  practical". See `spec.md` § *Open Decisions Requiring Sign-Off* **D3**: streaming
-  and `/v1/models` support conversational use, but **agentic use requires tool
-  calling, which is outside M2's boundary**. Validate what is reachable, and record
-  precisely what is not.
+- [ ] **T065: ~~Revisit OpenHands~~ — DEFERRED to M3 (A1).** The OpenHands objective
+  is moved to M3, where capability-aware routing and tool support converge. M2
+  delivers the capabilities the objective needs — streaming and model discovery —
+  and does not claim the workload. Recorded in `spec.md` § *Clarifications
+  Recorded* A1 and in the ROADMAP's Milestone 2 section.
+
+  **M2's exit criterion is restated accordingly.** The ROADMAP's wording — "can
+  serve interactive OpenHands workloads with streaming where supported" — is not
+  met by M2 and is not claimed to be. What M2 demonstrates: survival across
+  restart with cooldown and counter state intact (Batches 1–2), and streaming plus
+  model discovery serving an interactive client (Batches 4–5).
 
 **Verification & Stop:**
 
@@ -321,14 +379,19 @@ Per ROADMAP Milestone 2: *"The router survives a restart without immediately los
 its quota state and can serve interactive OpenHands workloads with streaming where
 supported."*
 
-**Read literally, the second clause is not fully reachable in M2.** "Interactive
-OpenHands workloads" implies agentic use, which requires tool calling — explicitly
-outside this milestone's boundary (see D3). **This needs resolving before the
-milestone is declared met**, not at close-out.
+**The second clause is deferred to M3** by decision A1, and M2 does not claim it.
+The clause was unreachable in M2 regardless of effort: "interactive OpenHands
+workloads" implies agentic use, which requires tool calling — explicitly outside
+this milestone's boundary.
 
-What M2 can demonstrate: survival across restart with cooldown and counter state
-intact (Batches 1–2), and streaming plus model discovery serving an interactive
-client (Batches 4–5).
+What M2 demonstrates:
+
+| Criterion | Batch |
+| :--- | :--- |
+| Survives a restart without losing quota state | 1–2 |
+| Streaming supported where the provider supports it | 5 |
+| Model discovery available | 4 |
+| Token accounting reconciles against provider-reported usage | 3 |
 
 ---
 
@@ -336,8 +399,11 @@ client (Batches 4–5).
 
 | Item | Source | Note |
 | :--- | :--- | :--- |
-| Tool calling | #36 non-goal | Next compatibility feature after streaming. OpenHands agentic use depends on it (D3). |
+| **OpenHands as a real workload** | A1 | **Deferred to M3 by decision.** Tool calling converges with capability-aware routing there. |
+| Tool calling | #36 non-goal | Next compatibility feature after streaming. OpenHands agentic use depends on it. |
 | Capability-aware routing | M3 | — |
 | Cross-file deployment contract enforcement | M1 Batch 6 | `config.yaml` ↔ `docker-compose.yml` ↔ `ci.yml` is checked only by the CI smoke test. Warnings, not enforcement. |
 | Mistral RPD measurement | ADR-0006 §7 | Persistent counters make this answerable empirically for the first time. |
 | Cross-provider stream resume | ADR-0007 §4 | No resumable offset on either free tier. Recorded as unavailable. |
+| `request_logs` population | B6 | Deferred. A migrated table that is never written is a loose end, and M2 is the milestone that makes real persistence possible. |
+| The §8.3 deviation | ADR-0005 | Closed in Batch 2, verified against a real restart, then removed from M1's `spec.md` as a recorded change. |

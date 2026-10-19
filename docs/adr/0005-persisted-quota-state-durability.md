@@ -38,14 +38,19 @@ urgent one.
 ## 2. Decision
 
 Persist to **SQLite through the existing async `aiosqlite` stack** (M0's; mandated
-by CONSTITUTION §3.1), behind the `QuotaTracker` interface ADR-0004 preserved.
+by CONSTITUTION §3.1), attached to the existing `QuotaTracker` as a persistence
+layer.
+
+**There is one implementation.** The tracker's hot window state stays in memory and
+the persistence layer is attached to it. This supersedes the two-implementations
+framing this ADR originally carried, and the reasoning in §3 explains why.
 
 **Durability is asymmetric:**
 
 | State | Policy | Flush |
 | :--- | :--- | :--- |
 | `cooldown_until`, breaker status | Write-through | Immediate, per transition |
-| Request/token counters | Batched | Bounded interval, coalesced |
+| Request/token counters | Batched | 20 s interval, coalesced |
 | LRU ordinals | Batched | With counters |
 
 A burst of N requests within one interval produces **one** write of their sum.
@@ -68,6 +73,25 @@ the specific overshoot §8.3 names.
 accumulator rather than an event log, an interval's N requests are one additive
 write. The batching cost is one write per interval, not one per request — so the
 asymmetry costs almost nothing and protects the state that actually needs it.
+
+**Batching implies hot in-memory state, which implies one implementation.** If the
+state that batches must be hot in memory, then a tracker that read and wrote SQLite
+on every reservation would be a different design entirely — and would put a
+database round-trip on the dispatch path, contradicting the asymmetry principle
+this ADR exists to establish.
+
+So the shape is:
+
+```text
+QuotaTracker  (M1 window logic, hot in-memory state)
+    └── persistence layer  (M2: write-through cooldowns, batched counter flush)
+```
+
+**Consequences of one implementation.** There is no second implementation of the
+window logic, so no protocol extraction is needed to keep two in step, and no
+fallback implementation to keep alive. **The degradation path is a state, not a
+class**: if persisted state is unreadable, the same tracker starts with empty state
+and continues.
 
 **The interface is being cashed in, not revised.** ADR-0004's claim was that *"the
 interface, not the storage, is the durable decision."* M2 adds exactly one method,
@@ -99,6 +123,11 @@ simplest to *describe* and the most expensive to *run*, because one policy must 
 safe for the state that needs the most protection, and that state needs it on every
 transition.
 
+**A second tracker implementation with SQLite-backed state.** Rejected as §3. It
+would put a read-modify-write round-trip on the dispatch path for every
+reservation, and it is inconsistent with the batching this ADR depends on. The
+original draft of this ADR proposed it; the asymmetry analysis is what disproved it.
+
 **Redis or another external store.** Rejected. ROADMAP §3.14 explicitly defers the
 choice until real usage patterns are known, and requires exactly one local
 implementation. #36 lists external persistence as a non-goal. Introducing it would
@@ -122,13 +151,17 @@ accounting. `request_logs` is left untouched as what it is: telemetry.
   is the overshoot case the clause names.
 - **No write on the dispatch path for counters** — the M1 latency profile survives.
 - **No new external dependency.** One implementation, as ROADMAP §3.14 requires.
-- **The tracker interface is exercised against a second implementation**, which
-  tests ADR-0004's claim rather than merely asserting it.
+- **The tracker's existing surface is unchanged**, so the dispatcher, key manager
+  and adapters are untouched — which is what makes this cheap to add and cheap to
+  verify.
+- **One implementation, not two** — a smaller change than the original draft of
+  this ADR proposed, with no protocol extraction and no fallback class to keep
+  alive.
 
 ### Negative / Trade-offs
 
-- **A `SIGKILL` loses up to one flush interval of counters.** Bounded and stated,
-  not eliminated. Cooldowns are unaffected.
+- **A `SIGKILL` loses up to 20 seconds of counters.** Bounded and stated, not
+  eliminated. Cooldowns are unaffected.
 - **Persistence failure becomes a request-path failure.** A failed cooldown
   write-through returns `503 persistence_unavailable` rather than dispatching into
   a limit the router cannot record. This is a new failure mode, and it is
@@ -137,12 +170,16 @@ accounting. `request_logs` is left untouched as what it is: telemetry.
 - **State can drift from reality.** Persisted counters accumulate any difference
   between what the router counts and what the provider bills. M1's cross-check
   already found the router counting one *more* dispatch than billed, so the drift
-  is real and observable.
+  is real and observable. The estimate and the actual are persisted separately so
+  the drift stays measurable.
 - **Restore adds a startup step that can fail.** Mitigated by degrading rather than
   refusing to start.
 - **Corrupt state is now a persistent condition.** A crash mid-write can leave a
   bad row that survives every subsequent boot, degrading silently to in-memory
   accounting until noticed.
+- **A backwards clock jump needs detecting, not just capping.** The 24-hour
+  maximum cooldown is a backstop; the primary mechanism is comparing persisted
+  `cooldown_until` against the system clock at restore time.
 
 ### Suspension is written but not restored
 

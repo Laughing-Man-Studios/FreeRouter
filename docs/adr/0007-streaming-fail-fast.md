@@ -40,6 +40,13 @@ conversation the client already saw part of.
   conservative.
 - **The boundary is enforced in the route layer**, not the adapter, because the
   adapter cannot know whether anything reached the client.
+- **The dispatcher is not modified.** The streaming path lives in the route layer,
+  which re-implements model resolution, key eligibility, capacity gating and the
+  bounded retry budget. The dispatcher is the most safety-critical component in the
+  router and the one M1 measured at 100/100 under live traffic; leaving it
+  byte-for-byte untouched is worth more than avoiding the duplication. The
+  streaming path takes exactly one `(provider, model)` pair and never varies it,
+  so §7.2 holds there too.
 - **A provider that cannot stream fails clearly** (`400 streaming_unsupported`)
   before any dispatch, rather than silently buffering and replaying.
 
@@ -132,7 +139,7 @@ Discharged when:
 ## 7. Open Item Carried Forward
 
 **OpenHands usability is unresolved and may not be reachable in M2.** See
-`spec.md` § *Open Decisions Requiring Sign-Off* D3. Streaming and `/v1/models`
+`spec.md` § *Clarifications Recorded* A1. Streaming and `/v1/models`
 support *conversational* use; agentic use requires tool calling, which #36 places
 outside M2's boundary. This ADR makes streaming correct, but does not make OpenHands
 an agent. That is a scoping decision for the operator, not an implementation

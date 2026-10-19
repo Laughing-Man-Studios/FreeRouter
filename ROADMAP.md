@@ -719,9 +719,26 @@ Begin using the router with the local OpenHands instance as an actual workload a
 
 Tool calling remains outside the MVP boundary but should be the next compatibility feature after streaming.
 
+> **Amended 2026-10-19: the OpenHands objective is deferred to Milestone 3.** M2's
+> planning found the objective structurally unreachable within this milestone, not
+> merely effortful: OpenHands is an agentic client that acts by issuing tool calls,
+> so streaming and `/v1/models` support *conversational* use but not agentic use —
+> and tool calling is outside this milestone's boundary by the paragraph above.
+>
+> M2 delivers the capabilities the objective needs — streaming and model
+> discovery — and does not claim the workload. The objective moves to M3, where
+> capability-aware routing and tool support converge. The full reasoning is
+> recorded in `specs/003-persistent-interactive-mvp/spec.md` § *Clarifications
+> Recorded* (A1).
+
 ### Milestone 2: Exit criteria
 
 The router survives a restart without immediately losing its quota state and can serve interactive OpenHands workloads with streaming where supported.
+
+> **Amended 2026-10-19, with the OpenHands objective above:** the second clause is
+> **deferred to Milestone 3** and is not met or claimed by M2. M2's exit criteria
+> are: the router survives a restart without immediately losing its quota state,
+> and it supports streaming and model discovery where the provider supports them.
 
 ---
 
