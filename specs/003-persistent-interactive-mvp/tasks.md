@@ -334,7 +334,7 @@ misbehaves today.
 
 **Maps to GitHub Issue:** `#13 Token Estimation & Pre-Dispatch Quota Reservation System`
 
-- [ ] **T049: `quota/estimation.py`.** Separate `estimated_input` from
+- [x] **T049: `quota/estimation.py`.** Separate `estimated_input` from
   `assumed_output`. Reserved = `ceil((input + output) * safety_margin)`, margin
   applied inside the tracker so a caller cannot forget it (M1's existing property).
 
@@ -343,22 +343,39 @@ misbehaves today.
   actually breaches a TPM ceiling, and the margin was a constructor parameter
   unreachable from `config.yaml`.
 
-  **The output assumption's value is still open** (B1). It is recorded in
-  `spec.md` § *Clarifications Recorded* B1 with the supporting measurement:
-  a short-paragraph response measured 146–178 output tokens, and TPM is ~16×
-  slack at the measured burst limits, so a generous default costs little. **This
-  task does not start until B1 is answered.**
+  **The output assumption is 1025, configurable globally** (B1, agreed
+  2026-10-20). It is recorded in `spec.md` § *Clarifications Recorded* B1 with
+  the supporting measurement: a short-paragraph response measured 146–178 output
+  tokens, and TPM is ~16× slack at the measured burst limits, so a generous
+  default costs little.
+
+  **The tracker composes the reservation, not the caller.** The caller estimates
+  the *input*; the tracker adds the output assumption it holds. A caller can no
+  more forget the output half than it could forget the margin.
+
+  **The breaker keeps using the input estimate.** A context-length refusal is
+  about the prompt, so the breaker's threshold is compared against the input
+  estimate, not the reserved total.
 
   The §6.1 key cap is unaffected and stays in code.
 
-- [ ] **T050: Wire provider-reported usage.** Both adapters return actual usage where
-  the provider reports it; `reconcile` receives `None` where it does not.
+- [x] **T050: Wire provider-reported usage.** `NormalizedResponse` gains a usage
+  field; both adapters populate it from what the provider reports — Gemini's
+  `usageMetadata`, Mistral's `usage`. `reconcile` receives `None` where the
+  provider reports nothing.
 
-  **Provider-reported usage is authoritative where present.** If either provider
-  reports cumulative rather than per-request usage, that must be handled explicitly
-  — a cumulative figure would inflate reconciliation without bound.
+  **Until M1 the normalised response carried no usage**, so every reconciliation
+  received `None` and every reservation's estimate stood. The plumbing was
+  already there and had nothing to read.
 
-- [ ] **T051: Reconciliation rules.** Confirm and test that reconciliation supersedes
+  **Provider-reported usage is authoritative where present.** A cumulative figure
+  reported as if it were per-request would inflate reconciliation without bound,
+  so an actual more than an order of magnitude above the reservation is treated
+  as implausible and the estimate stands. This is a heuristic, and it is recorded
+  as one: the *authoritative* check on estimator drift is the console cross-check
+  in T052.
+
+- [x] **T051: Reconciliation rules.** Confirm and test that reconciliation supersedes
   the estimate for the entries the reservation created, leaves the estimate standing
   on `None`, and is idempotent (ADR-0006). These are existing behaviours; this task
   makes them specified and tested rather than incidental.
@@ -368,6 +385,49 @@ misbehaves today.
 
 - [ ] **T052: Record the tolerated error.** Update `spec.md` with the measured
   residual against the provider console per ADR-0006 §6.
+
+**Batch 3 verification gate (2026-10-20):**
+
+1. `ruff check .`, `ruff format --check .`, `mypy --strict src/`, full `pytest` —
+   clean. **491 passing**, up from 471.
+2. **Scenarios 5–7 pass**, including that `actual_tokens=None` leaves the estimate
+   standing rather than releasing capacity.
+3. A test asserts the reservation covers input **plus** the configured output
+   assumption — the regression M1's estimator would have permitted.
+4. **A provider-reported figure supersedes the estimate**, and an implausible
+   one is not believed.
+5. **The request dimension is exact** — a provider's token count must not
+   inflate it.
+6. **T052 is outstanding**: the console cross-check needs live traffic and the
+   console figure, so it is recorded as open rather than claimed.
+
+**One real bug was caught by the existing suite, and it was a serious one.**
+
+Reconciliation was writing the provider's **token** count into every entry of the
+reservation, including the **request** entry. One request reporting 7 tokens
+therefore consumed **seven request-slots instead of one**, and an RPM budget
+would have been exhausted roughly seven times faster than the traffic warranted.
+
+**The request dimension is exact** — one dispatched attempt is one request,
+whatever the response contained, and a provider's token count says nothing about
+how many requests were made. Reconciliation now corrects only the token
+dimension.
+
+This is worth dwelling on for a moment. The bug was introduced by *this* batch,
+it was caught by a test written for a *different* feature, and it would have
+degraded throughput on every request in production. It is also the kind of error
+that a test asserting "the reported figure is recorded" would have passed, because
+the figure *was* recorded — in the wrong dimension.
+
+**The estimator was consolidated.** `estimate_tokens` lived in the tracker and
+duplicated what `quota/estimation.py` now owns. The tracker no longer has an
+estimator of its own; there is one implementation, and the two directions —
+input, which is measured, and output, which is a policy — are kept apart.
+
+**T052 remains open.** The console cross-check compares accumulated persisted
+counts against what the provider actually bills, which needs live traffic and a
+figure read from the provider's console. It is the authoritative check on
+estimator drift, and this batch has made it *possible* rather than performed it.
 
 **Verification & Stop:**
 

@@ -135,8 +135,19 @@ The estimate must cover **both** directions:
 Existing M1 behaviour reserves `chars / 4` with a safety margin. M2 extends this to
 separate input and output assumptions and states the tolerated error.
 
-**The safety margin becomes configuration** (B3), alongside the output assumption
-it multiplies. The value is not yet fixed — see § *Clarifications Recorded* B1.
+**The output assumption is 1025 tokens, configurable globally** (B1). The
+**safety margin is configurable** (B3), alongside the assumption it multiplies.
+
+**The reservation is composed by the tracker, not the caller.** The caller
+estimates the *input*, because that is the part it can see; the tracker adds the
+output assumption it holds, because that is the part that is policy. The tracker
+therefore owns the whole reserved figure, and a caller cannot forget the output
+half the way it could forget the margin.
+
+**The breaker keeps using the input estimate.** A context-length refusal is about
+the *prompt* — a provider refusing 900k input tokens says nothing about how long
+the reply would have been — so the breaker's threshold is compared against the
+input estimate, not the reserved total.
 
 ### 4. Reconciliation
 
@@ -156,6 +167,20 @@ This closes the third open question from #36 by observing what the code already
 does deliberately, rather than by introducing new behaviour: `_Entry` carries both
 an estimate and an actual, and reconciliation writes the actual into the entries
 that reservation created.
+
+**The provider's own figure reaches the tracker.** `NormalizedResponse` gains a
+usage field, and both adapters populate it from what the provider reports —
+Gemini's `usageMetadata`, Mistral's `usage`. Until M1 the normalised response
+carried no usage, so every reconciliation received `None` and every reservation's
+estimate stood; the plumbing was already there and had nothing to read.
+
+**A provider figure that is implausibly large is not believed.** A cumulative
+counter reported as if it were per-request would inflate reconciliation without
+bound, so an actual more than an order of magnitude above the reservation is
+treated as implausible and the estimate stands. This is a heuristic, and it is
+recorded as one: the *authoritative* check on estimator drift is the console
+cross-check, which compares accumulated persisted counts against what the
+provider actually bills.
 
 **The estimate and the actual must be stored separately in persisted state** (not
 collapsed into one effective figure), because the estimator-drift measurement
@@ -421,6 +446,10 @@ served unaccounted.
 - **No payload in the database** (CONSTITUTION §9.1). The schema stores counts and
   timestamps. Prompt text, system instructions, tool declarations and completion
   content are never written.
+- **Token counts are not payload.** A count of tokens is operational metadata, not
+  content: it says how much was spent, not what was said. The provider's reported
+  usage is therefore safe to reconcile against and to persist, and unsafe to
+  derive from — the router never reconstructs text from a token count.
 - **No key material in the database** (§9.2). Aliases only. The database is
   therefore safe to inspect, and a state dump is safe to paste into an issue.
 - **Restore does not trust the database for secrets.** A persisted row can describe
@@ -467,7 +496,7 @@ recorded with its reasoning so it does not have to be reconstructed later.
 | B5 | `/v1/models`: `created` = config file mtime, `owned_by` = deployment owner, `permission`/`default` emitted |
 | B6 | `request_logs` population **deferred** |
 | B7 | Streaming: role delta emitted, `usage` in the final chunk, `stream_options.include_usage` honoured |
-| B1 | **Open** — awaiting the operator's decision, see below |
+| B1 | The output-token assumption is **1025**, configurable globally — see below |
 
 ### A1 — the OpenHands objective is deferred to M3
 
@@ -632,7 +661,7 @@ the milestone. Worth revisiting when a usage report is actually wanted.
 - **`stream_options: {"include_usage": true}` is honoured.** Usage is included
   when the client asks for it.
 
-### B1 — the output-token assumption (OPEN)
+### B1 — the output-token assumption: 1025, configurable globally
 
 **Still open, pending the operator's decision.** The supporting analysis is below
 so the decision can be made on evidence rather than intuition.
@@ -685,10 +714,22 @@ to behaviour M1 established and is **not** in M2's deliverables.
 | **C.** Honour `max_tokens` when present, fall back to the default | Most accurate. Changes the normalization contract M1 established, and widens M2. |
 | **D.** Per request, from the client | Not possible without C. |
 
-**Recommendation: option A**, with a default of **1024 tokens** — about 6× the
-measured short-paragraph output, costing ~8% of Gemini's TPM ceiling at the 15 RPM
-burst limit, and refunded on reconciliation. Option B becomes worth revisiting if
-a long-form workload appears.
+**Decision: option A, with a default of 1025 tokens, configurable globally.**
+
+1025 is about 6× the measured short-paragraph output, costs ~8% of Gemini's TPM
+ceiling at the 15 RPM burst limit, and is refunded on reconciliation. **Option B
+— per-model — becomes worth revisiting if a long-form workload appears**, and
+that is the reason the value is configuration rather than a constant.
+
+The output assumption is deliberately *not* per-model. It is a policy number
+rather than a measured one, and the measured part — the input estimate — is
+already per-model in effect, because it is computed from the request. A global
+default is one number to reason about; a per-model value invites the belief that
+it is calibrated, and a value that is not calibrated is worse than one that
+obviously is not.
+
+**The configuration is global, not per-model**, and lives in `config.yaml` under
+`quota.output_token_assumption`.
 
 ### D1 — Estimation error is tolerated on tokens only
 

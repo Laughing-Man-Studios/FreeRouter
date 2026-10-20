@@ -38,7 +38,6 @@ briefly exceed a limit it had already reached. Persistence is M2, and lands
 from __future__ import annotations
 
 import asyncio
-import math
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -47,11 +46,13 @@ from typing import Any
 
 from free_router.core.timestamps import from_iso, to_iso
 from free_router.quota.dimensions import DimensionResource, QuotaDimension, WindowReset
+from free_router.quota.estimation import (
+    DEFAULT_OUTPUT_TOKEN_ASSUMPTION,
+)
 
 __all__ = [
     "QuotaTracker",
     "Reservation",
-    "estimate_tokens",
 ]
 
 # Rough characters-per-token for English text. Deliberately a constant rather
@@ -61,26 +62,18 @@ __all__ = [
 # with a buffer, not an exact count.
 _CHARS_PER_TOKEN = 4
 
+_IMPLAUSIBLE_ACTUAL_FACTOR = 10
+"""How far above a reservation a reported figure may be before it is doubted.
+
+A per-request count cannot plausibly exceed the reservation by an order of
+magnitude. The threshold is deliberately generous: a legitimate long
+completion must not be mistaken for a cumulative counter, and the cost of
+believing a bad figure is unbounded while the cost of doubting a good one is
+one pessimistic count.
+"""
+
 _PRUNE_THRESHOLD = 256
 """Entry count above which a window is scanned for expired entries."""
-
-
-def estimate_tokens(request: Any) -> int:
-    """Estimate the prompt tokens a request will consume.
-
-    Args:
-        request: A :class:`~free_router.core.normalization.NormalizedRequest`, or
-            any object exposing a ``messages`` list of ``{role, content}`` dicts.
-
-    Returns:
-        A token estimate. Never zero for a request with any content.
-    """
-    characters = 0
-    for message in getattr(request, "messages", []) or []:
-        content = message.get("content", "") if isinstance(message, dict) else ""
-        if isinstance(content, str):
-            characters += len(content)
-    return max(1, math.ceil(characters / _CHARS_PER_TOKEN))
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,8 +92,12 @@ class Reservation:
     identifier: int
     provider: str
     model_id: str
+    estimated_input_tokens: int
+    """The caller's estimate of the request's own tokens."""
     estimated_tokens: int
+    """The total estimate -- input plus the assumed output -- before the margin."""
     reserved_tokens: int
+    """What was actually reserved, after the safety margin."""
     window_start: float
 
     def describe(self) -> str:
@@ -251,6 +248,7 @@ class QuotaTracker:
         dimensions_by_model: Mapping[tuple[str, str], Sequence[QuotaDimension]],
         *,
         safety_margin: float = 1.1,
+        output_token_assumption: int = DEFAULT_OUTPUT_TOKEN_ASSUMPTION,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
     ) -> None:
@@ -270,6 +268,10 @@ class QuotaTracker:
                 monotonic clock; the wall clock exists because a monotonic
                 value is only meaningful against the current boot, so a
                 persisted one would restore nonsense after a reboot.
+            output_token_assumption: Tokens assumed for a response that has not
+                been generated yet. The tracker adds it to the caller's *input*
+                estimate, so the caller supplies the part it can see and the
+                tracker owns the part that is policy.
 
         Raises:
             ValueError: If ``safety_margin`` is not greater than 1.0.
@@ -290,6 +292,7 @@ class QuotaTracker:
         # over-reservation, reproducible but for the wrong reason. Decimal keeps
         # the arithmetic exact so the configured margin is the applied margin.
         self._safety_margin = Decimal(str(safety_margin))
+        self._output_token_assumption = max(0, output_token_assumption)
         self._clock = clock
         self._wall_clock = wall_clock
         self._lock = asyncio.Lock()
@@ -321,15 +324,21 @@ class QuotaTracker:
         return all(window.has_room(now, 1.0) for window in self._windows_for(provider, model_id))
 
     async def reserve(
-        self, provider: str, model_id: str, estimated_tokens: int
+        self, provider: str, model_id: str, estimated_input_tokens: int
     ) -> Reservation | None:
         """Reserve capacity for one request, or return ``None`` if none is free.
+
+        The caller supplies the **input** estimate, because that is the part it
+        can see. The tracker adds the output assumption it holds, because that
+        is the part that is policy, and applies the safety margin. Composing it
+        here rather than in the caller means a caller cannot forget the output
+        half the way it could forget the margin.
 
         Args:
             provider: The provider owning the capacity.
             model_id: The provider-native model id.
-            estimated_tokens: Raw token estimate; the safety margin is applied
-                here so a caller cannot forget to.
+            estimated_input_tokens: The caller's estimate of the *request's* own
+                tokens. The output assumption is added on top of it.
 
         Returns:
             The :class:`Reservation`, or ``None`` when a dimension is exhausted.
@@ -337,6 +346,7 @@ class QuotaTracker:
             (``NoAvailableCapacityError``) belongs to Batch 5, which attaches
             cooldown and failover semantics to it.
         """
+        estimated_tokens = estimated_input_tokens + self._output_token_assumption
         reserved_tokens = max(
             1,
             int(
@@ -371,6 +381,7 @@ class QuotaTracker:
             identifier=identifier,
             provider=provider,
             model_id=model_id,
+            estimated_input_tokens=estimated_input_tokens,
             estimated_tokens=estimated_tokens,
             reserved_tokens=reserved_tokens,
             window_start=now,
@@ -391,10 +402,34 @@ class QuotaTracker:
                 # Already reconciled, or never reserved. Idempotent by design so
                 # a retry of the reconcile step cannot double-count.
                 return
-            if actual_tokens is not None:
-                for _window, entry in entries:
-                    entry.actual = float(actual_tokens)
+            if actual_tokens is not None and self._is_plausible(reservation, actual_tokens):
+                for window, entry in entries:
+                    # Only the *token* dimension is corrected. A provider's
+                    # token count says nothing about how many requests were
+                    # made, and the request dimension is exact -- one dispatched
+                    # attempt is one request, whatever the response contained.
+                    # Overwriting it would turn one request into seven.
+                    if not window.dimension.is_requests:
+                        entry.actual = float(actual_tokens)
             del self._pending[reservation.identifier]
+
+    def _is_plausible(self, reservation: Reservation, actual_tokens: int) -> bool:
+        """True when a provider-reported figure looks like a per-request count.
+
+        A cumulative counter reported as if it were per-request would inflate
+        reconciliation without bound -- every request would add the running
+        total to the window. A figure more than an order of magnitude above the
+        reservation is not a per-request count, so the estimate stands.
+
+        **This is a heuristic, and it is recorded as one.** The authoritative
+        check on estimator drift is the console cross-check, which compares
+        accumulated persisted counts against what the provider actually bills.
+        This guard exists to stop one obviously-wrong figure from doing damage
+        before that check runs, not to replace it.
+        """
+        if actual_tokens <= 0:
+            return False
+        return actual_tokens <= reservation.reserved_tokens * _IMPLAUSIBLE_ACTUAL_FACTOR
 
     def used(self, provider: str, model_id: str, resource: DimensionResource) -> float:
         """Current usage for one resource, for logging and diagnostics.
