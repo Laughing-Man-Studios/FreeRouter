@@ -141,7 +141,11 @@ def _build_dispatcher(config: Config, http_client: httpx.AsyncClient) -> Dispatc
     }
     return Dispatcher(
         key_manager=KeyManager(config.resolve_key_material()),
-        quota=QuotaTracker(dimensions, safety_margin=config.quota.estimation_safety_margin),
+        quota=QuotaTracker(
+            dimensions,
+            safety_margin=config.quota.estimation_safety_margin,
+            output_token_assumption=config.quota.output_token_assumption,
+        ),
         cooldown=CooldownManager(durations=durations),
         breaker=ContextBreaker(),
         http_client=http_client,

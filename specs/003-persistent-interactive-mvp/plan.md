@@ -74,19 +74,34 @@ M2 reserves:
 reserved = ceil((estimated_input + assumed_output) * safety_margin)
 ```
 
-with `assumed_output` configurable per deployment, and with the **safety margin
-itself configurable** (B3) — it is the multiplier on that assumption, so an
-operator tuning one would reasonably expect to tune the other.
+with `assumed_output` **1025** and configurable **globally** (B1), and with the
+**safety margin itself configurable** (B3) — it is the multiplier on that
+assumption, so an operator tuning one would reasonably expect to tune the other.
 
-**The output assumption is explicit configuration rather than a constant**, because
-it is a policy choice about how much headroom to buy, and a hidden constant would
-make that policy invisible and unchangeable without a code edit. Its value is
-still open — see `spec.md` § *Clarifications Recorded* B1, where the supporting
-measurement is recorded.
+**The tracker composes the reservation, not the caller.** The caller estimates
+the *input*, because that is the part it can see; the tracker adds the output
+assumption it holds, because that is the part that is policy. The tracker
+therefore owns the whole reserved figure, and a caller cannot forget the output
+half the way it could forget the margin.
+
+**The output assumption is global, not per-model.** It is a *policy* number, not
+a measured one, and the measured part — the input estimate — is already
+per-model in effect, because it is computed from the request. A global default is
+one number to reason about; a per-model value invites the belief that it is
+calibrated, and a value that is not calibrated is worse than one that obviously
+is not.
+
+**The breaker keeps using the input estimate.** A context-length refusal is about
+the prompt; a provider refusing 900k *input* tokens says nothing about how long
+the reply would have been. The breaker's threshold is therefore compared against
+the input estimate, not the reserved total.
 
 Provider-reported usage, where available, supersedes the estimate at reconcile time
 — which the code already supports (`_Entry` carries `actual`, and
 `reconcile(None)` deliberately stands the estimate down rather than releasing it).
+What M2 adds is the plumbing to *have* a provider figure to report:
+`NormalizedResponse` gains a usage field, and both adapters populate it from
+Gemini's `usageMetadata` and Mistral's `usage`.
 
 ### `/v1/models` is a projection of configuration
 
