@@ -470,7 +470,10 @@ class QuotaTracker:
         the window logic.
 
         Returns:
-            One row per configured dimension.
+            One row per dimension that has recorded usage. A window with no
+            entries is skipped: it carries no information, and writing it would
+            put a row in the table for every configured dimension on every
+            shutdown, whether or not the router had served a request.
         """
         now = self._clock()
         offset = self._wall_clock() - now
@@ -478,6 +481,8 @@ class QuotaTracker:
 
         for (provider, model_id), windows in self._dimensions.items():
             for window in windows:
+                if not window.entries:
+                    continue
                 dimension = window.dimension
                 reset_at: str | None = None
                 if dimension.reset is WindowReset.FIXED:
