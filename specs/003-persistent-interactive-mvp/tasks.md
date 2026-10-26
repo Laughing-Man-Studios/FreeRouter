@@ -311,6 +311,45 @@ boundary is now the boundary the code actually honours, expressed in wall-clock
 terms, and the docstring says so. No fixed window is configured, so nothing
 misbehaves today.
 
+**A correction, 2026-10-26: the layer was built, but the application never used
+it.**
+
+Batch 2 delivered `quota/persistence.py`, the migration, and every component's
+export and import, and verified them with two-process restart tests. What it did
+**not** do was connect them to the running application. `QuotaStateStore` and
+`PersistenceCoordinator` were imported by nothing outside their own module,
+`app.state.db_engine` was created and then used only to dispose of it, and there
+was no restore in lifespan and no flush task. **Every table stayed empty however
+much traffic the router served.**
+
+The restart tests passed because `tests/restart_helper.py` constructs the tracker
+and the store *by hand* in a subprocess. That proves the layer works; it cannot
+prove the router uses it. The gap was found by live traffic during Batch 3's
+T052 measurement — the persisted counters that task requires to exist did not
+exist — and it is why the wiring tests now start from `create_app`.
+
+The wiring, and the tests that would have caught its absence, are in the
+`M2-Batch2-Persistence-Wiring` change:
+
+- The store is built over the lifespan-owned engine and passed to the cooldown
+  manager and the breaker, so write-through genuinely writes through.
+- `restore()` runs **before the lifespan yields**, so no request can be served
+  against an unrestored counter.
+- The flush coordinator starts with the application and stops with it, flushing
+  once more on the way out.
+- `config.max_cooldown_seconds` is now passed to `CooldownManager`. It had been
+  declared, validated and silently ignored, so B4's configurable cap was not
+  configurable.
+- `export_windows` no longer persists a window with no entries. It had been
+  writing a row for every configured dimension on every shutdown, whether or not
+  a request had been served.
+
+**The lesson is about where the test boundary sat.** A test that assembles its
+own collaborators verifies the collaborators. It cannot witness a missing *edge*,
+and the edge is where the defect was.
+
+Full suite after the correction: **499 passing**, up from 491.
+
 **Verification & Stop:**
 
 1. Full `pytest`, `ruff`, `mypy --strict`.
