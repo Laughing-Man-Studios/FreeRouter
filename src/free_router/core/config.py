@@ -340,6 +340,32 @@ class Config(BaseSettings):
     A crash loses up to one interval of counters. Cooldowns are unaffected --
     they are written through the moment they are set.
     """
+    provider_read_timeout_seconds: float = Field(default=120.0, gt=0)
+    """How long one provider's response **body** may take to arrive, in seconds.
+
+    This is a different phase from the provider window. That window
+    (``ROUTER_PROVIDER_TIMEOUT``, 5 s) bounds connection and response headers,
+    which were measured at p50 743 ms and p90 2332 ms. This bound spans
+    *generation*, which is unbounded in principle, and the two must not be
+    conflated.
+
+    120 s is derived from the workload rather than picked for comfort. The router
+    reserves against an output assumption of 1025 tokens (B1); at the throughput
+    a loaded free tier actually delivers -- roughly 15-30 tokens/second -- a full
+    response takes 34-68 s. A bound below that refuses work the provider was
+    willing to do. Measured against ``gemini-3.5-flash-lite`` on 2026-10-26,
+    generation took 14.7 s, 26.1 s, 49.7 s and 66.7 s; the 66.7 s case was a
+    success once the bound allowed it.
+
+    The previous value was 10 s, inherited as an httpx client default and never
+    measured for this phase, and it failed **every** request once the provider
+    was slow -- with no way to adjust it short of editing the source. It is
+    configuration because the right value is a property of the workload and the
+    upstream, not of the router.
+
+    Streaming (Batch 5) supersedes this: an incremental read needs a per-chunk
+    bound, not a per-response one.
+    """
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
     def key_slots(self) -> dict[tuple[str, str], list[str]]:
