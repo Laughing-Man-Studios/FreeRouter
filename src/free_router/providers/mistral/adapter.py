@@ -53,6 +53,7 @@ from free_router.core.normalization import (
     FinishReason,
     NormalizedRequest,
     NormalizedResponse,
+    TokenUsage,
 )
 from free_router.keys.manager import KeyRef
 from free_router.providers.timeout import PROVIDER_TIMEOUT_SECONDS
@@ -271,6 +272,45 @@ def to_mistral_request(request: NormalizedRequest, provider_model_id: str) -> di
     return {"model": provider_model_id, "messages": messages, "stream": False}
 
 
+def _usage_from_mistral(raw: dict[str, Any]) -> TokenUsage | None:
+    """Translate Mistral's ``usage`` block into token counts.
+
+    Mistral reports the counts as numbers, unlike Gemini's strings.
+
+    Returns ``None`` when the body carries no usage at all, which leaves the
+    reservation's estimate standing rather than releasing capacity that may
+    well have been used.
+    """
+    usage = raw.get("usage")
+    if not isinstance(usage, dict):
+        return None
+
+    def _count(name: str) -> int:
+        value = usage.get(name)
+        if value is None:
+            return 0
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    input_tokens = _count("prompt_tokens")
+    output_tokens = _count("completion_tokens")
+    total = usage.get("total_tokens")
+    try:
+        total_count = None if total is None else max(0, int(total))
+    except (TypeError, ValueError):
+        total_count = None
+
+    if input_tokens == 0 and output_tokens == 0 and total_count is None:
+        return None
+    return TokenUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_count,
+    )
+
+
 def from_mistral_response(raw: dict[str, Any], provider_model_id: str) -> NormalizedResponse:
     """Translate a Mistral response into a :class:`NormalizedResponse`.
 
@@ -313,6 +353,7 @@ def from_mistral_response(raw: dict[str, Any], provider_model_id: str) -> Normal
         content=content,
         model_used=provider_model_id,
         finish_reason=finish_reason,
+        usage=_usage_from_mistral(raw),
     )
 
 

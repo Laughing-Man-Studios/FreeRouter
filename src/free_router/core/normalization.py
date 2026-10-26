@@ -52,6 +52,34 @@ class NormalizedRequest(BaseModel):
     messages: list[dict[str, Any]] = Field(min_length=1)
 
 
+class TokenUsage(BaseModel):
+    """Token counts a provider reported for one request.
+
+    **Counts, not content.** A token count says how much was spent, not what was
+    said, so it is operational metadata and is safe to reconcile against and to
+    persist (CONSTITUTION §9.1). The reverse is not true: a token count cannot
+    be used to reconstruct text, and nothing attempts to.
+
+    Attributes:
+        input_tokens: Tokens consumed by the request itself.
+        output_tokens: Tokens produced by the response.
+        total_tokens: The sum, when the provider reported it. Derived from the
+            other two when it did not.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+
+    def resolved_total(self) -> int:
+        """The total token count, derived when the provider did not report one."""
+        if self.total_tokens is not None:
+            return self.total_tokens
+        return self.input_tokens + self.output_tokens
+
+
 class NormalizedResponse(BaseModel):
     """A provider-agnostic chat completion result.
 
@@ -60,6 +88,10 @@ class NormalizedResponse(BaseModel):
         model_used: The provider-native model id that actually served the
             request, for operational logging.
         finish_reason: Why generation stopped.
+        usage: Token counts the provider reported, or ``None`` when it reported
+            none. A provider that does not report usage leaves the
+            reservation's estimate standing rather than releasing capacity that
+            may well have been used.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -67,6 +99,7 @@ class NormalizedResponse(BaseModel):
     content: str
     model_used: str
     finish_reason: FinishReason = "stop"
+    usage: TokenUsage | None = None
 
 
 def normalize_chat_completion_request(payload: dict[str, Any]) -> NormalizedRequest:

@@ -63,7 +63,8 @@ from free_router.keys.manager import KeyManager
 from free_router.providers.base import build_adapter
 from free_router.quota.breaker import ContextBreaker
 from free_router.quota.cooldown import CooldownManager
-from free_router.quota.tracker import QuotaTracker, estimate_tokens
+from free_router.quota.estimation import estimate_input_tokens
+from free_router.quota.tracker import QuotaTracker
 
 __all__ = ["DispatchOutcome", "Dispatcher"]
 
@@ -169,7 +170,10 @@ class Dispatcher:
                 retried.
             RetriesExhaustedError: If attempts were made and all failed.
         """
-        estimated = estimate_tokens(request)
+        # The *input* estimate. The tracker adds the output assumption and
+        # the safety margin; the breaker compares against this figure,
+        # because a context-length refusal is about the prompt.
+        estimated = estimate_input_tokens(request)
         aliases: list[str] = []
         failovers = 0
         last_error: RouterBaseError | None = None
@@ -366,14 +370,14 @@ class Dispatcher:
 def _usage_from(response: NormalizedResponse) -> int | None:
     """Token usage reported alongside a completion.
 
-    ``NormalizedResponse`` carries no usage field -- M0 does not surface token
-    counts to the client and the spec's OpenAI envelope reports zeros -- so
-    reconciliation receives ``None`` and the reservation's estimate stands.
+    The provider's figure is authoritative when it reports one, and the
+    reservation is settled against it.
 
-    That is the conservative direction: a provider figure is authoritative when
-    present, and assuming the estimate is right when absent costs at most a
-    slightly pessimistic quota count. Adding usage to the normalisation
-    boundary is M2 work, when quota state becomes persistent and the accuracy
-    starts to matter.
+    ``None`` when the provider reported no usage, and that is the conservative
+    direction: the estimate stands rather than capacity being released on the
+    assumption it was unused. Every dispatched attempt consumes quota whether or
+    not it produced output.
     """
-    return None
+    if response.usage is None:
+        return None
+    return response.usage.resolved_total()

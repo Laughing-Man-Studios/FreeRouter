@@ -45,6 +45,7 @@ from free_router.core.normalization import (
     FinishReason,
     NormalizedRequest,
     NormalizedResponse,
+    TokenUsage,
 )
 from free_router.keys.manager import KeyRef
 from free_router.providers.timeout import (
@@ -263,6 +264,46 @@ def to_gemini_request(request: NormalizedRequest) -> dict[str, Any]:
     return payload
 
 
+def _usage_from_gemini(raw: dict[str, Any]) -> TokenUsage | None:
+    """Translate Gemini's ``usageMetadata`` into token counts.
+
+    Gemini reports the counts as **strings**, not numbers, so they are parsed
+    rather than trusted.
+
+    Returns ``None`` when the body carries no usage at all, which leaves the
+    reservation's estimate standing rather than releasing capacity that may
+    well have been used.
+    """
+    metadata = raw.get("usageMetadata")
+    if not isinstance(metadata, dict):
+        return None
+
+    def _count(name: str) -> int:
+        value = metadata.get(name)
+        if value is None:
+            return 0
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    total = metadata.get("totalTokenCount")
+    try:
+        total_count = None if total is None else max(0, int(total))
+    except (TypeError, ValueError):
+        total_count = None
+
+    input_tokens = _count("promptTokenCount")
+    output_tokens = _count("candidatesTokenCount")
+    if input_tokens == 0 and output_tokens == 0 and total_count is None:
+        return None
+    return TokenUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_count,
+    )
+
+
 def from_gemini_response(raw: dict[str, Any], provider_model_id: str) -> NormalizedResponse:
     """Translate a Gemini response into a :class:`NormalizedResponse`.
 
@@ -293,6 +334,7 @@ def from_gemini_response(raw: dict[str, Any], provider_model_id: str) -> Normali
         content=text,
         model_used=provider_model_id,
         finish_reason=finish_reason,
+        usage=_usage_from_gemini(raw),
     )
 
 

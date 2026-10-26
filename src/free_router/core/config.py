@@ -250,6 +250,26 @@ class QuotaConfig(BaseModel):
     reservation cycle exists to prevent.
     """
 
+    output_token_assumption: int = Field(default=1025, ge=0)
+    """Tokens assumed for a response that has not been generated yet (B1).
+
+    The reservation must cover the response as well as the request, because
+    under-reserving output is what breaches a token-per-minute ceiling. The
+    output size is unknowable before dispatch, so it is an **assumption** -- and
+    an assumption hidden inside a constant is a policy nobody can see or change.
+
+    **Global rather than per-model.** It is a policy number, not a measured one;
+    the measured part, the input estimate, is already per-model in effect
+    because it is computed from the request. A per-model value would invite the
+    belief that it is calibrated, and a value that is not calibrated is worse
+    than one that obviously is not.
+
+    1025 is about 6x the measured output of a short-paragraph response -- 146
+    tokens on Gemini, 178 on Mistral -- and roughly 8% of Gemini's 250K TPM
+    ceiling at the 15 RPM burst limit. It is refunded on reconciliation, so
+    over-reserving costs a transient reservation rather than capacity.
+    """
+
 
 class DispatchConfig(BaseModel):
     """Retry budget and failure policy for the dispatch loop.

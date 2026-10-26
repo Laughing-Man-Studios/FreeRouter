@@ -44,9 +44,8 @@ reserved = ceil((estimated_input + assumed_output) * safety_margin)
 
 - **Input** is estimated from the normalized request's message content, retaining
   M1's `chars / 4` calibration as the starting point.
-- **Output** is an **explicitly configured assumption** per deployment, not a
-  constant. **Its value is still open** — see `spec.md` § *Clarifications
-  Recorded* B1, where the supporting measurement is recorded.
+- **Output** is an **explicitly configured assumption**, not a constant.
+  **Agreed 2026-10-20: 1025 tokens, configurable globally.** See §3.1.
 - **The safety margin is also configurable.** It is currently a constructor
   parameter defaulting to `1.1`, unreachable from `config.yaml`. The margin is the
   multiplier on the output assumption, so an operator tuning one would reasonably
@@ -74,6 +73,30 @@ error budget belongs to the dimension that actually has one.
 **Under-reserving output is the real risk.** Input is knowable before dispatch;
 output is not. A ceiling breached by output tokens is also the harder failure to
 diagnose, because the request looked small.
+
+### 3.1 The output assumption is 1025 tokens, configured globally
+
+Agreed 2026-10-20, from measurement rather than intuition. The supporting
+figures are recorded in `spec.md` § *Clarifications Recorded* B1:
+
+| Provider | Prompt | Input tokens | Output tokens |
+| :--- | :--- | :--- | :--- |
+| `gemini-3.5-flash-lite` | single word | 8 | 1 |
+| `gemini-3.5-flash-lite` | short paragraph | 28 | **146** |
+| `ministral-3b-2512` | single word | 11 | 3 |
+| `ministral-3b-2512` | short paragraph | 33 | **178** |
+
+1025 is about 6× the measured short-paragraph output, and costs roughly 8% of
+Gemini's 250K TPM ceiling at the 15 RPM burst limit. It is refunded on
+reconciliation, so over-reserving costs a transient reservation rather than
+capacity.
+
+**Global rather than per-model.** It is a *policy* number, not a measured one.
+The measured part — the input estimate — is already per-model in effect, because
+it is computed from the request. A global default is one number to reason about;
+a per-model value invites the belief that it is calibrated, and a value that is
+not calibrated is worse than one that obviously is not. Per-model becomes worth
+revisiting if a long-form workload appears.
 
 **The output assumption must be configurable because it is a policy choice.** How
 much headroom to buy is a deployment decision — a client sending 4K completions
@@ -116,6 +139,14 @@ requests that failed.
 **Store every request event and reconstruct windows on restore.** Rejected. Correct
 but expensive, and it makes a corrupt row fatal to startup. Counter buckets persist
 directly; see ADR-0005.
+
+**Trust the provider's reported figure without a plausibility check.** Rejected.
+A cumulative counter reported as if it were per-request would inflate
+reconciliation without bound, so an actual more than an order of magnitude above
+the reservation is treated as implausible and the estimate stands. This is a
+heuristic and is recorded as one: the *authoritative* check on estimator drift is
+the console cross-check, which compares accumulated persisted counts against what
+the provider actually bills.
 
 **Retroactive reconciliation across windows.** Rejected for §3's reasons.
 
