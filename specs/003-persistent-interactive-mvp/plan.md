@@ -172,8 +172,14 @@ contract, its decision logic and its measured behaviour are unchanged. The
 alternative — scheduling the write as a background task — would have preserved
 the letter of the rule and lost the guarantee the rule was protecting.
 
-`core/config.py` gains two fields: `max_cooldown_seconds` (B4) and
-`quota_flush_interval_seconds` (B2).
+`core/config.py` gains three fields: `max_cooldown_seconds` (B4),
+`quota_flush_interval_seconds` (B2) and `provider_read_timeout_seconds`.
+
+The third was added on 2026-10-26, after the first two: the provider read timeout
+had been a module constant, which made every request from a slow provider a `504`
+with no way to adjust it. Only `read` is configuration — `connect`, `pool` and
+`write` describe the router's own connection behaviour and do not vary by orders
+of magnitude. See issue #73 and the dated note in `tasks.md`.
 
 ## Interfaces
 

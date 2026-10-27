@@ -480,6 +480,43 @@ estimator drift, and this batch has made it *possible* rather than performed it.
    Record the figure and its conditions.
 5. **STOP**, review, then update #13.
 
+**A second blocker, 2026-10-26: the read timeout was a constant.**
+
+T052 could not be performed because the router refused every live request. The
+cause was not the provider. `HTTP_CLIENT_TIMEOUT` in `api/main.py` fixed the
+response **read** timeout at 10 seconds, as a module constant with no
+configuration path, so a provider answering in 15–50 s produced a `504` on every
+request and no setting could change it.
+
+Two timeouts already existed and only one had been measured. The provider window
+(`ROUTER_PROVIDER_TIMEOUT`, 5 s) bounds connection and response **headers**, and
+was measured at p50 743 ms and p90 2332 ms. `read` bounds the response **body**,
+which spans generation — unbounded in principle — and the 10 s figure was an
+inherited httpx default with no measurement behind it for that phase. Conflating
+the two is the same mistake the 400 ms routing window made.
+
+`attempt_budget_seconds` did not cover the gap: the deadline is checked only
+*before* each attempt, never during one, so a single slow attempt runs straight
+past it.
+
+`provider_read_timeout_seconds` is now configuration, defaulting to 120 s. That
+default is derived from the workload rather than chosen to feel generous: the
+router reserves against a 1025-token output assumption, and at the 15–30
+tokens/second a loaded free tier delivers, a full response takes 34–68 s. The
+longest generation measured during this investigation was 66.7 s, and it
+succeeded once the bound allowed it. `connect`, `pool` and `write` stay
+constants: they describe the router's own local connection behaviour, and only
+`read` varies by orders of magnitude.
+Streaming (Batch 5) supersedes this value rather than extending it — an
+incremental read wants a per-chunk bound, not a per-response one.
+
+The same change fixed a third instance of the silent-ignore class:
+`quota_flush_interval_seconds` was declared and validated but never passed to
+`PersistenceCoordinator`, so B2's 20 s default was the only value that could
+take effect.
+
+Full suite after the correction: **509 passing**, up from 499.
+
 ---
 
 ## Batch 4: `GET /v1/models`

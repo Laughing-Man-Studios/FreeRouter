@@ -61,8 +61,47 @@ logger = logging.getLogger(__name__)
 
 REQUEST_ID_HEADER = "X-Request-ID"
 
-HTTP_CLIENT_TIMEOUT = httpx.Timeout(connect=0.25, pool=0.05, write=1.0, read=10.0)
-"""Aggressive client timeouts so a hung provider cannot stall the event loop."""
+CONNECT_TIMEOUT_SECONDS = 0.25
+"""How long a TCP+TLS connection to a provider may take.
+
+A constant, not configuration: it describes the router's own local connection
+behaviour, which does not vary by orders of magnitude between deployments.
+"""
+
+POOL_TIMEOUT_SECONDS = 0.05
+"""How long to wait for a free connection from the pool."""
+
+WRITE_TIMEOUT_SECONDS = 1.0
+"""How long sending the request body may take.
+
+The bodies here are small -- a chat completion request, not an upload -- so this
+is generous by an order of magnitude.
+"""
+
+
+def http_client_timeout(config: Config) -> httpx.Timeout:
+    """Build the provider client's timeout.
+
+    **Only ``read`` is configuration.** ``connect``, ``pool`` and ``write``
+    describe the router's own connection behaviour and are stable constants.
+    ``read`` spans the provider's *generation*, which is unbounded in principle
+    and is the only phase that varies by orders of magnitude -- a value baked
+    into the source meant a slow provider produced a 504 on every request with
+    no way to adjust it short of a rebuild.
+
+    Args:
+        config: The validated configuration.
+
+    Returns:
+        The timeout applied to the shared provider client.
+    """
+    return httpx.Timeout(
+        connect=CONNECT_TIMEOUT_SECONDS,
+        pool=POOL_TIMEOUT_SECONDS,
+        write=WRITE_TIMEOUT_SECONDS,
+        read=config.provider_read_timeout_seconds,
+    )
+
 
 PROVIDER_ERROR_STATUS_MAP: dict[type[RouterBaseError], int] = {
     # Order is significant: _status_for returns the first isinstance match, so
@@ -113,7 +152,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # constructed once and shared: each holds in-memory state that a per-request
     # construction would silently discard, which would defeat the quota
     # reservation cycle entirely.
-    app.state.http_client = httpx.AsyncClient(timeout=HTTP_CLIENT_TIMEOUT)
+    app.state.http_client = httpx.AsyncClient(timeout=http_client_timeout(app.state.config))
     app.state.dispatcher = _build_dispatcher(app.state.config, app.state.http_client, quota_store)
 
     # Restored **before** the listener accepts anything. A request dispatched
@@ -140,6 +179,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.persistence = PersistenceCoordinator(
         quota_store,
         snapshot=lambda: _quota_snapshot(app.state.dispatcher),
+        flush_interval=app.state.config.quota_flush_interval_seconds,
     )
     app.state.persistence.start()
 
@@ -426,11 +466,11 @@ def create_app() -> FastAPI:
 app = create_app()
 
 __all__ = [
-    "HTTP_CLIENT_TIMEOUT",
     "PROVIDER_ERROR_STATUS_MAP",
     "REQUEST_ID_HEADER",
     "app",
     "create_app",
+    "http_client_timeout",
     "lifespan",
     "register_exception_handlers",
     "request_context_middleware",
