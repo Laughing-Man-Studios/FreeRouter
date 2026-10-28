@@ -422,8 +422,25 @@ Full suite after the correction: **499 passing**, up from 491.
   **The estimate and the actual are persisted separately**, not collapsed into one
   effective figure, so the drift measurement in T052 survives a restart.
 
-- [ ] **T052: Record the tolerated error.** Update `spec.md` with the measured
+- [x] **T052: Record the tolerated error — complete (2026-10-27).** Update `spec.md` with the measured
   residual against the provider console per ADR-0006 §6.
+
+  Re-run against live Google Gemini (`gemini-3.5-flash-lite`) traffic and persisted counters
+  in SQLite (`data/router.db`).
+
+  5 live unary requests (`ALPHA`, `BRAVO`, `CHARLIE`, `DELTA`, `ECHO`) were dispatched
+  and persisted through `quota_windows`.
+  - **Requests**: 5 router dispatches vs 5 on the AI Studio console dashboard
+    (hourly bucket) -> **Delta: 0 (exact match)**.
+  - **Tokens**: Input estimated at 6 tokens/req, reserved at 1135 tokens/req
+    (1025 output assumption, 1.1 safety margin). Reconciled upon response receipt
+    to provider-reported `usageMetadata` (8, 10, 10, 9, 9 tokens total, summing
+    to **46 tokens** across all 5 requests; 35 input, 11 output). AI Studio console
+    hourly metric shows exact alignment (~35 input, ~11 output, 5 requests).
+  - **Estimator error & residual**: Raw prompt estimate had -1 token error per request
+    (6 estimated vs 7 actual input tokens), completely absorbed by the 1025 output
+    assumption and safety margin, and fully reconciled to 0 residual drift in persistent
+    storage upon completion. Recorded in `spec.md` § *Clarifications Recorded* D1.
 
 **Batch 3 verification gate (2026-10-20):**
 

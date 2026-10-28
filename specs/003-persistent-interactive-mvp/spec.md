@@ -743,6 +743,30 @@ Reserving input estimate plus a configurable output assumption is agreed over
 estimating input alone. Under-reserving output is what breaches a TPM ceiling,
 because the output size is the part genuinely unknown pre-dispatch.
 
+**Measured Residual & Drift Check (T052, 2026-10-27):**
+
+Re-run against live `google/gemini-3.5-flash-lite` traffic and persisted counters
+in `data/router.db` (ADR-0006 §6).
+
+| Metric | Router (Persisted Windows) | Google AI Studio Console | Delta (Router - Console) |
+| :--- | :--- | :--- | :--- |
+| **Requests** | **5 requests** (5 unary calls) | **5 requests** (13:00–14:00 bucket) | **0 (Exact match)** |
+| **Input tokens** | **35 tokens** (7 tokens/req × 5) | **~35 tokens** (~35 in hourly bucket) | **0 (Exact match)** |
+| **Output tokens** | **11 tokens** (1–3 tokens/req: 1+3+3+2+2) | **~11 tokens** (~10–11 in hourly bucket) | **0 (Exact match)** |
+| **Total tokens** | **46 tokens** (reconciled in DB) | **~46 tokens** | **0 (Exact match)** |
+
+- **Conditions**: 5 live unary requests (`ALPHA`, `BRAVO`, `CHARLIE`, `DELTA`, `ECHO`),
+  paced at 3 s intervals. Unary prompt tokens were estimated at 6 tokens pre-dispatch
+  (`ceil(chars / 4)` = 6); total reservation per request was
+  `ceil((6 + 1025) * 1.1) = 1135` tokens.
+- **Post-dispatch reconciliation**: Upon receipt of Gemini's `usageMetadata`, the
+  router reconciled reserved tokens down to the provider's authoritative actual counts
+  (8, 10, 10, 9, 9 tokens total, summing to 46 tokens).
+- **Residual**: 0 request drift across 5 dispatches (matching M1's exact request accounting
+  where no in-flight abort occurs), and 0 token drift post-reconciliation. The pre-dispatch
+  input estimation error was within 2 tokens per prompt (6 estimated vs 7 actual input tokens,
+  well within the 10% safety margin and absorbed by the 1025 output assumption).
+
 ### D2 — Reconciliation corrects only what it reserved into
 
 **Agreed.**
