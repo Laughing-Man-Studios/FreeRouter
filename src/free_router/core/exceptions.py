@@ -22,6 +22,7 @@ __all__ = [
     "ProviderValidationError",
     "RetriesExhaustedError",
     "RouterBaseError",
+    "StreamingUnsupportedError",
     "UnsupportedModelError",
     "ValidationError",
 ]
@@ -90,6 +91,21 @@ class UnsupportedModelError(ValidationError):
     """
 
     code = "unsupported_model"
+
+
+class StreamingUnsupportedError(ValidationError):
+    """The requested model's provider cannot stream (ADR-0007).
+
+    Raised **before** any dispatch. The alternative -- buffering the whole
+    response and emitting it as SSE -- would appear to stream while removing the
+    only practical reason to stream, first-token latency, and would make fallback
+    invisible to the client.
+
+    It is a request error rather than a provider fault because nothing was sent:
+    the client asked for a capability this route cannot provide for that model.
+    """
+
+    code = "streaming_unsupported"
 
 
 class ProviderBaseError(RouterBaseError):

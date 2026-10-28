@@ -14,8 +14,11 @@ import time
 from datetime import UTC, datetime
 from typing import Any, cast
 
+import httpx
 from fastapi import APIRouter, Depends, Request
+from fastapi.responses import StreamingResponse
 
+from free_router.api import stream_dispatch
 from free_router.core.config import Config
 from free_router.core.debug_logging import debug_payload
 from free_router.core.dispatch import Dispatcher
@@ -85,26 +88,33 @@ def resolve_model(config: Config, model: str) -> tuple[str, str]:
     )
 
 
-@router.post("/chat/completions")
+@router.post("/chat/completions", response_model=None)
 async def chat_completions(
     request: Request,
     config: Config = Depends(get_config),
     dispatcher: Dispatcher = Depends(get_dispatcher),
-) -> dict[str, Any]:
+) -> dict[str, Any] | StreamingResponse:
     """Handle an OpenAI-compatible chat completion request.
 
     The payload is read as raw JSON rather than through a FastAPI body model.
-    That is intentional: M0 honours only ``model`` and ``messages``, and a
-    strict body model would reject requests carrying ``temperature`` instead of
-    stripping those parameters as the spec requires (spec 3). The normalizer is
-    the only place that decides which fields are meaningful.
+    That is intentional: the normalizer is the only place that decides which
+    fields are meaningful, and a strict body model would reject requests carrying
+    ``temperature`` instead of stripping those parameters as the spec requires
+    (spec 3).
+
+    ``stream`` is the one behavioural branch in this handler, and it branches
+    **after** model resolution so both paths reject an unknown model identically.
+    The unary path below is deliberately unchanged: it is the path M1 measured at
+    100/100, and a streaming change that altered it would invalidate that.
 
     Raises:
         ValidationError: If the payload is not a JSON object, or fails ingress
             normalization.
         UnsupportedModelError: If the requested model is not configured.
-        NoAvailableCapacityError: If no capacity is available. Raised by the
-            dispatcher *before* anything is dispatched.
+        StreamingUnsupportedError: If streaming was requested for a model whose
+            provider cannot stream. Raised before anything is dispatched.
+        NoAvailableCapacityError: If no capacity is available. Raised *before*
+            anything is dispatched.
         ProviderRateLimitError: If the provider rate limited the request.
         RetriesExhaustedError: If attempts were made and all of them failed.
     """
@@ -128,6 +138,16 @@ async def chat_completions(
         model=normalized.model,
         data={"client_request": payload, "normalized": normalized.model_dump()},
     )
+
+    if normalized.stream:
+        return await _stream_response(
+            request=request,
+            config=config,
+            dispatcher=dispatcher,
+            normalized=normalized,
+            provider=provider,
+            provider_id=provider_id,
+        )
 
     # The context is opened here rather than inside the dispatcher so that every
     # record the dispatcher emits -- provider_dispatched, provider_rate_limited,
@@ -161,6 +181,66 @@ async def chat_completions(
         data=completion,
     )
     return completion
+
+
+async def _stream_response(
+    *,
+    request: Request,
+    config: Config,
+    dispatcher: Dispatcher,
+    normalized: NormalizedRequest,
+    provider: str,
+    provider_id: str,
+) -> StreamingResponse:
+    """Open an SSE response, or raise before any bytes are committed.
+
+    The first provider chunk is consumed here, inside the handler, **before** a
+    ``StreamingResponse`` exists. That ordering is what makes fail-fast precise:
+    while nothing has been written the failure can still become a retry or a JSON
+    error, and once the response object is returned the status line is already
+    decided. See :mod:`free_router.api.stream_dispatch`.
+
+    Returns:
+        A ``text/event-stream`` response.
+
+    Raises:
+        StreamingUnsupportedError: If the provider cannot stream.
+        RouterBaseError: Any pre-delivery failure, mapped to JSON by the handlers
+            in :mod:`free_router.api.main`.
+    """
+    http_client = cast("httpx.AsyncClient", request.app.state.http_client)
+    started = time.perf_counter()
+
+    with log_context(model=normalized.model, provider=provider):
+        prepared = await stream_dispatch.start_stream(
+            dispatcher=dispatcher,
+            policy=config.dispatch,
+            http_client=http_client,
+            request=normalized,
+            provider=provider,
+            model_id=provider_id,
+        )
+        logger.info(
+            "dispatch_completed",
+            extra={
+                "event": "dispatch_completed",
+                "attempt": prepared.attempts,
+                "failovers": prepared.failovers,
+                "stream": True,
+                "latency_ms": round((time.perf_counter() - started) * 1000, 3),
+            },
+        )
+
+    return StreamingResponse(
+        prepared.events,
+        media_type="text/event-stream",
+        headers={
+            # No buffering anywhere: a buffered SSE response is an unstreamed one.
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 async def _read_json_object(request: Request) -> dict[str, Any]:

@@ -14,12 +14,13 @@ singleton from the lifespan, which is passed in.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Protocol, runtime_checkable
 
 import httpx
 
 from free_router.core.exceptions import UnsupportedModelError
-from free_router.core.normalization import NormalizedRequest, NormalizedResponse
+from free_router.core.normalization import NormalizedChunk, NormalizedRequest, NormalizedResponse
 from free_router.keys.manager import KeyRef
 
 __all__ = ["ProviderAdapter", "build_adapter", "supported_providers"]
@@ -27,7 +28,23 @@ __all__ = ["ProviderAdapter", "build_adapter", "supported_providers"]
 
 @runtime_checkable
 class ProviderAdapter(Protocol):
-    """The interface every provider adapter implements."""
+    """The interface every provider adapter implements.
+
+    Streaming is a **sibling method, not a flag** (ADR-0007). The two contracts
+    genuinely differ: one returns a complete body, the other returns a sequence
+    that can fail partway. A ``stream: bool`` parameter would force every caller
+    to handle the union, and would put the decision about where a partial answer
+    stops in the wrong layer -- the adapter cannot know whether anything reached
+    the client.
+    """
+
+    supports_streaming: bool
+    """Whether this provider can stream at all.
+
+    Read before dispatch so an unsupported request fails as
+    :class:`StreamingUnsupportedError` without sending anything. A false value is
+    a capability statement, not a runtime surprise.
+    """
 
     async def chat_completion(
         self, request: NormalizedRequest, provider_model_id: str, key: KeyRef
@@ -53,6 +70,35 @@ class ProviderAdapter(Protocol):
         Raises:
             ProviderBaseError: If the provider rejects the request, fails, or
                 does not respond inside the routing envelope.
+        """
+        ...
+
+    def stream_chat_completion(
+        self, request: NormalizedRequest, provider_model_id: str, key: KeyRef
+    ) -> AsyncIterator[NormalizedChunk]:
+        """Dispatch one chat completion and yield its chunks as they arrive.
+
+        Returns the iterator rather than awaiting it, so the caller controls
+        consumption and can stop early. Implementations must release the HTTP
+        connection on every exit path, including abandonment part-way.
+
+        Args:
+            request: The provider-agnostic request.
+            provider_model_id: The provider-native model id resolved from
+                configuration.
+            key: The credential to dispatch with.
+
+        Yields:
+            One :class:`NormalizedChunk` per provider event that carries content,
+            a finish reason, or usage.
+
+        Raises:
+            StreamingUnsupportedError: If this adapter cannot stream. An empty
+                iterator would be indistinguishable from a provider that returned
+                nothing, and the two failures must not share an outcome.
+            ProviderBaseError: If the provider rejects the request or fails
+                before the first chunk. Failures *after* the first chunk surface
+                while iterating, and the route handles them as fail-fast.
         """
         ...
 

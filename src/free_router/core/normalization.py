@@ -24,6 +24,7 @@ from free_router.core.exceptions import ValidationError
 __all__ = [
     "SUPPORTED_INGRESS_FIELDS",
     "FinishReason",
+    "NormalizedChunk",
     "NormalizedRequest",
     "NormalizedResponse",
     "normalize_chat_completion_request",
@@ -44,12 +45,20 @@ class NormalizedRequest(BaseModel):
         model: The externally-addressable model id, e.g.
             ``google/gemini-3.5-flash-lite``.
         messages: The conversation so far, in OpenAI ``{role, content}`` shape.
+        stream: Whether the client asked for a streamed response.
+        include_usage: Whether the client asked for token usage in the stream.
+            Ignored unless ``stream`` is set. Providers differ here -- Gemini
+            always reports usage on the final chunk, Mistral only when asked --
+            so the adapter needs the client's preference to translate it, not to
+            invent one.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     model: str
     messages: list[dict[str, Any]] = Field(min_length=1)
+    stream: bool = False
+    include_usage: bool = False
 
 
 class TokenUsage(BaseModel):
@@ -102,12 +111,51 @@ class NormalizedResponse(BaseModel):
     usage: TokenUsage | None = None
 
 
+class NormalizedChunk(BaseModel):
+    """**One** increment of a streamed completion.
+
+    The streaming sibling of :class:`NormalizedResponse`, and deliberately
+    *smaller*: a chunk carries only what a provider actually told us, and the
+    OpenAI chunk envelope (ids, ``object``, the leading role delta) is the
+    writer's business rather than the adapter's.
+
+    This split is what keeps provider knowledge in the adapters and OpenAI
+    envelope knowledge in :mod:`free_router.api.streaming`. An adapter that had
+    to emit ``chat.completion.chunk`` objects would encode the client protocol in
+    two more places.
+
+    Attributes:
+        delta: Text appended by this chunk. Often empty -- a provider may send a
+            usage-only or finish-only chunk, and those carry no content.
+        finish_reason: Set on the chunk that terminates generation, ``None``
+            before that. Absent is not the same as ``stop``: a stream cut short
+            never sets it, which is how the route distinguishes a truncated
+            answer from a finished one.
+        usage: Token counts, when the provider reports them. Gemini reports usage
+            on the final chunk; Mistral only when asked. ``None`` means the
+            reservation's estimate stands, which is the conservative direction.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    delta: str = ""
+    finish_reason: FinishReason | None = None
+    usage: TokenUsage | None = None
+
+
 def normalize_chat_completion_request(payload: dict[str, Any]) -> NormalizedRequest:
     """Translate an OpenAI-style request body into a :class:`NormalizedRequest`.
 
-    Only ``model`` and ``messages`` are read. Any other parameter -- including
-    ``temperature``, ``max_tokens``, and ``top_p`` -- is discarded here and can
-    therefore never reach a provider adapter (spec 3, Scenario 5).
+    Only ``model``, ``messages``, ``stream`` and ``stream_options.include_usage``
+    are read. Any other parameter -- including ``temperature``, ``max_tokens``,
+    and ``top_p`` -- is discarded here and can therefore never reach a provider
+    adapter (spec 3, Scenario 5).
+
+    The two streaming fields are read because the route must branch on them and
+    the adapter must honour them (B7). They are still read *here* rather than in
+    the route, because normalization is the single place that decides which
+    fields are meaningful -- a second reader would be a second list of honoured
+    fields to keep in step.
 
     Args:
         payload: The decoded JSON request body.
@@ -157,7 +205,58 @@ def normalize_chat_completion_request(payload: dict[str, Any]) -> NormalizedRequ
                     param=f"messages[{index}].{field}",
                 )
 
-    return NormalizedRequest(model=payload["model"], messages=messages)
+    return NormalizedRequest(
+        model=payload["model"],
+        messages=messages,
+        stream=_optional_bool(payload, "stream") or False,
+        include_usage=_include_usage(payload),
+    )
+
+
+def _optional_bool(payload: dict[str, Any], name: str) -> bool | None:
+    """Read an optional boolean field, rejecting a non-boolean rather than coercing.
+
+    ``"stream": "true"`` is a client bug. Coercing it would hide the bug; passing
+    the string through would make ``if request.stream`` true for ``"false"``,
+    which is worse. So a wrong type is a request error with the field named.
+
+    Raises:
+        ValidationError: If the field is present and is not a boolean.
+    """
+    if name not in payload:
+        return None
+    value = payload[name]
+    if not isinstance(value, bool):
+        raise ValidationError(
+            f"'{name}' must be a boolean.",
+            code="invalid_field_type",
+            param=name,
+        )
+    return value
+
+
+def _include_usage(payload: dict[str, Any]) -> bool:
+    """Read ``stream_options.include_usage``, defaulting to absent.
+
+    Only the one key is read. ``stream_options`` is an extensible OpenAI object
+    and a client may legitimately send fields this router does not implement;
+    rejecting the whole object because of one unknown key would be stricter than
+    the protocol it is imitating.
+
+    Raises:
+        ValidationError: If ``stream_options`` is not an object, or
+            ``include_usage`` is not a boolean.
+    """
+    options = payload.get("stream_options")
+    if options is None:
+        return False
+    if not isinstance(options, dict):
+        raise ValidationError(
+            "'stream_options' must be an object.",
+            code="invalid_field_type",
+            param="stream_options",
+        )
+    return bool(_optional_bool(options, "include_usage"))
 
 
 def to_openai_completion(

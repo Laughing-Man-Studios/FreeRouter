@@ -171,7 +171,12 @@ def test_multi_turn_conversation_preserves_order(client: TestClient) -> None:
 
 @respx.mock
 def test_unsupported_parameters_never_reach_the_provider(client: TestClient) -> None:
-    """Scenario 5: stripped parameters are absent from the provider payload."""
+    """Scenario 5: stripped parameters are absent from the provider payload.
+
+    ``stream`` was in this set through M0, when it was one of the parameters the
+    router discarded. T059 makes it honoured, so it is exercised by the streaming
+    suite instead and must not be asserted away here.
+    """
     route = mock_google()
 
     response = client.post(
@@ -182,7 +187,6 @@ def test_unsupported_parameters_never_reach_the_provider(client: TestClient) -> 
             "temperature": 0.7,
             "max_tokens": 100,
             "top_p": 0.9,
-            "stream": True,
         },
     )
 
