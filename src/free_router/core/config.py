@@ -28,6 +28,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     SecretStr,
     ValidationError,
     field_validator,
@@ -366,6 +367,17 @@ class Config(BaseSettings):
     Streaming (Batch 5) supersedes this: an incremental read needs a per-chunk
     bound, not a per-response one.
     """
+    owned_by: str = "free-router"
+    """The deployment owner reported by ``GET /v1/models`` (clarification B5).
+
+    The identity the router is operating as, not the provider. The provider is
+    already carried by the model id (``google/...``, ``mistral/...``), so
+    repeating it there would add no information.
+
+    No routing decision depends on it, so it is policy rather than a gate -- but
+    it is the *operator's* identity rather than the code's, which is why it is
+    configuration.
+    """
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
     def key_slots(self) -> dict[tuple[str, str], list[str]]:
@@ -422,6 +434,24 @@ class Config(BaseSettings):
                 slots[alias] = SecretStr(material)
             resolved[(entry.provider, entry.provider_id)] = slots
         return resolved
+
+    _config_mtime: int = PrivateAttr(default=0)
+
+    @property
+    def config_mtime(self) -> int:
+        """When the configuration file behind this instance was last modified.
+
+        Captured once by :func:`load_config` rather than computed per request.
+        ``GET /v1/models`` reports it as every model's ``created`` (B5), and the
+        value has to describe the configuration the router actually loaded: a
+        per-request ``stat()`` would drift from a model list that was frozen at
+        startup, so the listing would claim to have changed when nothing the
+        router serves had.
+
+        ``0`` means "not loaded from a file" -- an instance constructed directly,
+        or a file that vanished between being read and being stat-ed.
+        """
+        return self._config_mtime
 
     @classmethod
     def settings_customise_sources(
@@ -574,9 +604,24 @@ def load_config(path: str | Path | None = None, *, resolve_keys: bool = True) ->
     finally:
         _config_path_override.reset(token)
 
+    config._config_mtime = _modified_at(resolved)
+
     if resolve_keys:
         config.resolve_key_material()
     return config
+
+
+def _modified_at(path: Path) -> int:
+    """The file's modification time in whole seconds, or ``0`` if unreadable.
+
+    Captured here rather than in the route because the model list is frozen at
+    load: reporting a later mtime would claim the listing had changed when the
+    served configuration had not.
+    """
+    try:
+        return int(path.stat().st_mtime)
+    except OSError:
+        return 0
 
 
 def _format_validation_error(exc: ValidationError) -> str:
