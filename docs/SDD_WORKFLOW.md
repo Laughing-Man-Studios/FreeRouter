@@ -741,6 +741,48 @@ Manual tests remain appropriate for:
 - OpenHands compatibility,
 - provider-specific behavior.
 
+### Continuous integration
+
+`.github/workflows/ci.yml` is the gate. `.github/workflows/pr-review.yml` is an
+advisory AI review: it comments, but never approves, blocks, or fails a build.
+
+**Every job mirrors a command a developer runs locally**, so a green local run
+means CI will be green. `make check` runs the four fast jobs in the same order:
+
+```text
+make check     # ruff check, ruff format --check, mypy --strict, pytest, markdownlint
+make docker    # the Docker job, up to but not including the container smoke test
+```
+
+| CI job | Local command | What it proves |
+| :--- | :--- | :--- |
+| Lint & Format | `uv run ruff check .` then `uv run ruff format --check .` | Style and formatting; two steps so a failure names which half disagreed |
+| Type Check | `uv run mypy --strict src/` | Typing, in strict mode |
+| Test | `uv run pytest -v` | Behaviour |
+| Markdown Lint | `npx --yes markdownlint-cli2` | Documentation formats; globs and rule overrides come from `.markdownlint-cli2.yaml` |
+| Docker Build | `make docker` | Non-root user, a `HEALTHCHECK`, and Python 3.13 |
+| Dependency Audit | `pip-audit --strict` | Known CVEs — **advisory**, downgraded to a warning so a new CVE never turns an unrelated PR red |
+
+Rules that are easy to break by accident:
+
+- **CI runs with no provider credential set.** A missing key must fail at startup,
+  and the test suite must be fully mocked. CI fails deliberately if a credential is
+  present in the environment, because a suite that needs one cannot be trusted not
+  to spend quota. `make test-hermetic` reproduces that condition locally.
+- **The Docker smoke test is the only check that the shipped `config.yaml` and a
+  container's environment agree.** Every credential a model declares is required, so
+  adding a model to `config.yaml` means adding its credential to `ci.yml` and
+  `docker-compose.yml` in the same change. The unit suite cannot catch this: it
+  writes its own configuration.
+- **CI runs on pull requests, and on pushes to `main` (plus the historical `M0`).**
+  Pushing a batch or milestone branch does not run CI — the checks appear once a PR
+  exists.
+- `pull_request` includes `synchronize`, so every new commit re-runs the gate.
+
+A failing gate is answered by fixing the cause, not by relaxing the check. Adding a
+lint suppression or a test exclusion to make CI green is the same category of
+mistake as editing the specification to make an implementation appear compliant.
+
 ---
 
 ## 20. Verification / Convergence

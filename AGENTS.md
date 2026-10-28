@@ -10,7 +10,8 @@ Do not implement functionality outside the current specification.
 Prefer the simplest implementation that satisfies the current
 milestone.
 
-Run relevant tests after changes.
+Run relevant tests after changes. `make check` is the gate that mirrors CI
+(see *Verification*).
 
 Do not modify the Roadmap, Constitution, or specification merely to
 make an implementation appear compliant.
@@ -51,6 +52,30 @@ established conventions rather than assuming defaults. Note that label
 vocabularies and custom field vocabularies may differ (for example
 `effort:S/M/L` labels versus High/Medium/Low field options); derive the
 mapping from existing issues instead of guessing.
+
+## Verification
+
+CI is `.github/workflows/ci.yml`. `make check` runs the same four fast gates in
+the same order, so a green local run means the `Lint & Format`, `Type Check`,
+`Test` and `Markdown Lint` jobs will pass:
+
+```bash
+make check   # ruff check, ruff format --check, mypy --strict src/, pytest, markdownlint
+```
+
+`make docker` covers the `Docker Build` job up to the container smoke test, which
+only matters when `config.yaml` or the Dockerfile changes.
+
+CI runs on **pull requests**, and on pushes to `main` (plus the historical `M0`).
+Pushing a batch or milestone branch does not run CI; the checks appear once a PR
+exists.
+
+The suite must pass with **no provider credential set**. CI fails if one is
+present, because a suite that needs a key cannot be trusted not to spend quota.
+`make test-hermetic` reproduces that condition locally.
+
+Job-by-job detail, including the traps, is in `docs/SDD_WORKFLOW.md` section 19
+under *Continuous integration*.
 
 ## Branches and milestone integration
 
