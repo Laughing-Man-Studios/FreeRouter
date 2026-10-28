@@ -540,7 +540,7 @@ Full suite after the correction: **509 passing**, up from 499.
 
 **Maps to GitHub Issue:** `#14 GET /v1/models Model Discovery Endpoint`
 
-- [ ] **T053: `api/models_route.py`.** OpenAI-compatible shape from
+- [x] **T053: `api/models_route.py`.** OpenAI-compatible shape from
   `config.models` — the same list that drives routing. No discovery call, no cache
   to invalidate, no second source of truth.
 
@@ -549,7 +549,7 @@ Full suite after the correction: **509 passing**, up from 499.
   the operator changes it, so a client re-fetching does not see a spurious
   "model updated".
 
-- [ ] **T054: Availability as a separate field.** **A configured model is always
+- [x] **T054: Availability as a separate field.** **A configured model is always
   listed, including while in cooldown.** Hiding it would make a client's model list
   oscillate with transient provider state, and a client re-fetching on that basis
   would flip-flop between requests.
@@ -562,6 +562,40 @@ Full suite after the correction: **509 passing**, up from 499.
 4. No new source of truth: every listed id is dispatchable or explicitly marked
    unavailable.
 5. **STOP**, review, then update #14.
+
+**Batch 4 verification gate (2026-10-28):**
+
+1. `ruff check .`, `ruff format --check .`, `mypy --strict src/`, full `pytest` —
+   clean. **521 passing**, up from 509.
+2. **Scenario 8 passes**, and the cooldown is produced by a real `429` dispatched
+   through the router rather than by inserting a record. A test that built its own
+   `CooldownManager` would pass even if nothing were wired — the failure mode the
+   Batch 2 correction was about.
+3. The shape matches the OpenAI model object, including `object: "model"`, which
+   is required by spec §5 and easy to omit. Ids come from `config.models` in
+   declaration order.
+4. **No second source of truth.** `GET /v1/models` moves no quota counter, proven
+   by comparing `export_windows()` either side of a call.
+5. `created` is the config file's mtime and is **stable across requests**. The test
+   backdates the file, because a file written moments earlier has an mtime
+   indistinguishable from "now" and would let a `time.time()` bug pass.
+
+**A deviation, recorded rather than papered over.** Verification criterion 4 reads
+"every listed id is dispatchable **or** explicitly marked unavailable". The
+`available` field reflects **cooldown only**. Quota exhaustion and key depletion do
+not appear in it, so a model whose daily budget is spent is listed as
+`available: true` and would be refused on dispatch.
+
+That gap is deliberate. Those are per-request capacity decisions the dispatcher
+makes against a *specific* token estimate, not a property of the model; projecting
+them would mean inventing an estimate and would make the listing change on nearly
+every request — the oscillation `available` exists to prevent. The stricter reading
+of criterion 4 is therefore **not** met, and it is recorded here rather than
+satisfied by a field that would be wrong in the other direction.
+
+**Not implemented:** `GET /v1/models/{id}`. Spec §5 defines the listing only, and an
+unspecified endpoint is surface area nothing tests. A test pins the 404 so it is
+obvious the omission was a decision.
 
 ---
 
