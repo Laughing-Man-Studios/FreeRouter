@@ -61,6 +61,7 @@ from free_router.keys.manager import KeyRef
 from free_router.providers.sse import SSEDecodeError, iter_sse_data, response_lines
 from free_router.providers.timeout import PROVIDER_TIMEOUT_SECONDS
 from free_router.quota.breaker import is_context_length_error
+from free_router.quota.cooldown import parse_retry_after_seconds
 
 __all__ = [
     "MISTRAL_API_BASE",
@@ -491,11 +492,11 @@ def body_indicates_context_length_error(raw: bytes) -> bool:
 async def _raise_for_status(response: httpx.Response) -> httpx.Response:
     """Translate a provider status code into the matching router exception.
 
-    The response body is deliberately not read and never echoed into the error
-    message: it can contain a reflected prompt, and this project never logs
-    prompt text. Mistral's envelope does identify auth failures with a
-    ``type`` of ``authentication_error``, but its status codes already
-    distinguish them, so the body is not needed for classification here.
+    The response body is never echoed into the error message: it can contain a
+    reflected prompt, and this project never logs prompt text. It is parsed only
+    for ``provider_code`` -- Mistral's own ``invalid_api_key`` and friends --
+    so a client can tell a credential problem from a payload problem without
+    reading prose (A4 item 1).
 
     The stream is always closed before raising, otherwise the pooled connection
     leaks on every provider error.
@@ -525,17 +526,59 @@ async def _raise_for_status(response: httpx.Response) -> httpx.Response:
     finally:
         await response.aclose()
 
+    provider_code = _mistral_provider_code(raw)
+
     if status == 429:
-        raise ProviderRateLimitError("The upstream provider is rate limiting this key.")
+        # Mistral's hint is a standard ``Retry-After`` header; it does not put a
+        # delay in the body. Used where present, per A4 item 4.
+        raise ProviderRateLimitError(
+            "The upstream provider is rate limiting this key.",
+            retry_after=parse_retry_after_seconds(response.headers),
+            provider_code=provider_code,
+        )
     if status in (401, 403):
-        raise ProviderAuthError("The upstream provider rejected the API credentials.")
+        raise ProviderAuthError(
+            "The upstream provider rejected the API credentials.",
+            provider_code=provider_code,
+        )
     if 400 <= status < 500:
         # 422 is included here: Mistral's OpenAPI spec documents it as a
         # FastAPI-shaped validation error ({detail: [...]}) rather than the
-        # documented {object, message, type, param, code} envelope, so the body
-        # is not parsed for classification.
+        # documented {object, message, type, param, code} envelope, so
+        # ``provider_code`` is simply absent for it.
         raise ProviderValidationError(
             f"The upstream provider rejected the request with status {status}.",
             context_length=body_indicates_context_length_error(raw),
+            provider_code=provider_code,
         )
-    raise ProviderServerError(f"The upstream provider returned status {status}.")
+    # Mistral supplies no in-body retryable signal, so the status is the signal:
+    # 502/503/504 mean "busy", 500 means the service is broken and a retry will
+    # reproduce it (A4 item 3).
+    raise ProviderServerError(
+        f"The upstream provider returned status {status}.",
+        provider_code=provider_code,
+        retryable=status in _RETRYABLE_SERVER_STATUSES,
+    )
+
+
+_RETRYABLE_SERVER_STATUSES = frozenset({502, 503, 504})
+"""HTTP 5xx statuses that mean "busy", not "broken"."""
+
+
+def _mistral_provider_code(raw: bytes) -> str | None:
+    """Read Mistral's error ``code``, e.g. ``invalid_api_key``.
+
+    Falls back to ``type`` because the envelope documents both and older
+    responses populate only the latter. Never returns the ``message``.
+    """
+    try:
+        decoded: Any = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    for key in ("code", "type"):
+        value = decoded.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None

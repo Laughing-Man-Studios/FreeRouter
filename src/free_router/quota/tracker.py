@@ -75,6 +75,14 @@ one pessimistic count.
 _PRUNE_THRESHOLD = 256
 """Entry count above which a window is scanned for expired entries."""
 
+_MINIMUM_DAILY_WINDOW_SECONDS = 86_400.0
+"""Shortest window that counts as "daily" when classifying a 429.
+
+A day, by definition. Stated as a threshold rather than imported from the
+dimension module so a provider that declares a slightly shorter day -- a 23-hour
+budget, say -- is still treated as daily, while an hourly window is not.
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class Reservation:
@@ -322,6 +330,31 @@ class QuotaTracker:
         """
         now = self._clock()
         return all(window.has_room(now, 1.0) for window in self._windows_for(provider, model_id))
+
+    def daily_requests_exhausted(self, provider: str, model_id: str) -> bool:
+        """True when the per-day request budget for a model has no room left.
+
+        This is the only evidence the router owns for separating a daily-cap
+        ``429`` from a burst ``429`` (A4 item 2). The two are identical on the
+        wire, and neither provider publishes a signal that distinguishes them,
+        so the router asks the question it can actually answer: has the window
+        that resets once a day run out?
+
+        A model with no daily request dimension configured answers ``False``.
+        An unverified limit stays unenforced rather than being guessed at, and
+        the caller falls back to the provider's own retry hint.
+
+        Advisory like :meth:`available`: a read without the lock, used to
+        *classify* a refusal the provider has already issued, never to admit or
+        refuse one.
+        """
+        now = self._clock()
+        return any(
+            window.dimension.resource is DimensionResource.REQUESTS
+            and window.dimension.window_seconds >= _MINIMUM_DAILY_WINDOW_SECONDS
+            and not window.has_room(now, 1.0)
+            for window in self._windows_for(provider, model_id)
+        )
 
     async def reserve(
         self, provider: str, model_id: str, estimated_input_tokens: int

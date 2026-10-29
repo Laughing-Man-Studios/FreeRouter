@@ -51,6 +51,7 @@ from free_router.core.exceptions import (
     NoAvailableCapacityError,
     PersistenceUnavailableError,
     ProviderAuthError,
+    ProviderDailyQuotaExhaustedError,
     ProviderRateLimitError,
     ProviderServerError,
     ProviderTimeoutError,
@@ -87,6 +88,45 @@ class DispatchOutcome:
     attempts: int
     key_aliases: tuple[str, ...]
     failovers: int
+
+
+_DAILY_CAP_HINT_SECONDS = 3_600.0
+"""Shortest provider retry hint treated as evidence of a daily cap.
+
+An hour. Burst windows on these providers are per-second and per-minute, so a
+hint this long is not describing one. Below it the hint says nothing about the
+limit's scope and the router must not guess.
+"""
+
+
+def is_daily_cap(
+    quota: QuotaTracker,
+    provider: str,
+    model_id: str,
+    exc: ProviderRateLimitError,
+) -> bool:
+    """Decide whether a 429 was the day's budget rather than a burst.
+
+    A free function, not a method, because the streaming path must reach the
+    same verdict from the same evidence. Two copies of this rule would drift in
+    the direction that matters least obviously: a burst reported as a daily cap
+    tells a client to give up for the rest of a day it could still use.
+
+    Two pieces of evidence, in order of trust:
+
+    1. The router's own daily request window, when one is configured and
+       exhausted. This is a count the router keeps itself, so it is the
+       strongest claim available.
+    2. The provider's retry hint, when it is at least an hour: nothing but a
+       daily reset waits that long on these providers, and a per-second or
+       per-minute burst window cannot produce it.
+
+    With neither, the answer is "burst", because that is the failure the
+    cooldown already handles.
+    """
+    if quota.daily_requests_exhausted(provider, model_id):
+        return True
+    return exc.retry_after is not None and exc.retry_after >= _DAILY_CAP_HINT_SECONDS
 
 
 class Dispatcher:
@@ -228,6 +268,17 @@ class Dispatcher:
                 await self._cooldown.enter(
                     provider, model_id, provider_hint=exc.retry_after, reason="rate_limited"
                 )
+                # A burst and a daily cap arrive as the same 429 and demand
+                # opposite things from the client: "wait a minute" versus "come
+                # back tomorrow". Reporting both as a rate limit leaves an
+                # operator guessing which.
+                daily = is_daily_cap(self._quota, provider, model_id, exc)
+                if daily:
+                    exc = ProviderDailyQuotaExhaustedError(
+                        f"Model '{model_id}' has exhausted its daily request budget.",
+                        retry_after=exc.retry_after,
+                        provider_code=exc.provider_code,
+                    )
                 last_error = exc
                 logger.info(
                     "provider_rate_limited",
@@ -236,12 +287,13 @@ class Dispatcher:
                         "key_alias": key.alias,
                         "attempt": attempt,
                         "retry_after": exc.retry_after,
+                        "limit_scope": "daily" if daily else "burst",
                     },
                 )
                 # No failover, no retry. The capacity unit is now cooling, and the
                 # next iteration's gate refuses to dispatch. See the module
                 # docstring for why a second key would learn nothing.
-                raise
+                raise exc
 
             except ProviderAuthError as exc:
                 # The credential itself is dead. Suspend it so later requests do
@@ -285,6 +337,22 @@ class Dispatcher:
 
             except (ProviderServerError, ProviderTimeoutError) as exc:
                 await self._quota.reconcile(reservation, None)
+                if not exc.retryable:
+                    # A defect, not overload: the same call will fail the same
+                    # way, and the retry spends quota to learn nothing (A4 item
+                    # 3). The provider's own signal decided this in the adapter;
+                    # the dispatcher only honours it.
+                    logger.info(
+                        "provider_defect",
+                        extra={
+                            "event": "provider_defect",
+                            "key_alias": key.alias,
+                            "attempt": attempt,
+                            "error_category": type(exc).__name__,
+                            "provider_code": exc.provider_code,
+                        },
+                    )
+                    raise
                 last_error = exc
                 failovers += 1
                 logger.info(

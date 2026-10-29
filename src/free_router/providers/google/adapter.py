@@ -55,6 +55,7 @@ from free_router.providers.timeout import (
     PROVIDER_TIMEOUT_SECONDS,
 )
 from free_router.quota.breaker import is_context_length_error
+from free_router.quota.cooldown import parse_retry_after_seconds
 
 __all__ = [
     "DEFAULT_PROVIDER_TIMEOUT_SECONDS",
@@ -478,20 +479,53 @@ async def _raise_for_status(response: httpx.Response) -> httpx.Response:
         raw = b""
 
     try:
-        return _raise_for_status_sync(status, raw)
+        return _raise_for_status_sync(status, raw, response.headers)
     finally:
         await response.aclose()
 
 
-def _raise_for_status_sync(status: int, raw: bytes) -> httpx.Response:
-    """Raise the exception matching ``status``, using ``raw`` for classification."""
+def _raise_for_status_sync(
+    status: int,
+    raw: bytes,
+    headers: Mapping[str, str] | None = None,
+) -> httpx.Response:
+    """Raise the exception matching ``status``, using ``raw`` for classification.
+
+    Gemini's own vocabulary is carried on every error as ``provider_code`` --
+    ``INVALID_ARGUMENT``, ``RESOURCE_EXHAUSTED``, ``UNAVAILABLE`` -- because the
+    HTTP status alone cannot separate a payload Google disliked from a
+    credential it rejected, and both arrive as ``400``.
+
+    Args:
+        status: The HTTP status.
+        raw: The error body. Read only to classify; never echoed into a message.
+        headers: The response headers, for a standard ``Retry-After``.
+
+    Returns:
+        Never: every branch raises.
+    """
+    envelope = _google_error_envelope(raw)
+    provider_code = _google_provider_code(envelope)
+
     if status in (401, 403):
-        raise ProviderAuthError("The upstream provider rejected the API credentials.")
+        raise ProviderAuthError(
+            "The upstream provider rejected the API credentials.",
+            provider_code=provider_code,
+        )
     if status == 429:
         # A rate limit is a capacity signal, not a malformed request. Mapping it
         # to the generic 4xx branch reported it to the client as
         # 400 invalid_request_error, which reads as "your payload is wrong".
-        raise ProviderRateLimitError("The upstream provider is rate limiting this key.")
+        #
+        # The provider's own hint is taken where it exists -- the header first,
+        # then google.rpc.RetryInfo in the body, which Gemini sends when the
+        # header is absent. Trusting it is A4 item 4; guessing is what the
+        # cooldown's configured floor is for.
+        raise ProviderRateLimitError(
+            "The upstream provider is rate limiting this key.",
+            retry_after=parse_retry_after_seconds(headers) or _retry_info_seconds(envelope),
+            provider_code=provider_code,
+        )
     if status == 400:
         # Google reports an invalid API key as 400 INVALID_ARGUMENT rather than
         # 401, with the message "API key not valid. Please pass a valid API key."
@@ -499,17 +533,86 @@ def _raise_for_status_sync(status: int, raw: bytes) -> httpx.Response:
         # auth failure as a bad request, sending an operator to debug their
         # payload instead of their credentials.
         if _body_indicates_auth_failure(raw):
-            raise ProviderAuthError("The upstream provider rejected the API credentials.")
+            raise ProviderAuthError(
+                "The upstream provider rejected the API credentials.",
+                provider_code=provider_code,
+            )
         raise ProviderValidationError(
             "The upstream provider rejected the request payload.",
             context_length=body_indicates_context_length_error(raw),
+            provider_code=provider_code,
         )
     if 400 <= status < 500:
         raise ProviderValidationError(
             f"The upstream provider rejected the request with status {status}.",
             context_length=body_indicates_context_length_error(raw),
+            provider_code=provider_code,
         )
-    raise ProviderServerError(f"The upstream provider returned status {status}.")
+    # A 5xx is retryable *only* when it reads as overload rather than a defect
+    # (A4 item 3). Retrying a provider bug spends another call and learns
+    # nothing, which is precisely the quota this router exists not to burn.
+    raise ProviderServerError(
+        f"The upstream provider returned status {status}.",
+        provider_code=provider_code,
+        retryable=status in _RETRYABLE_SERVER_STATUSES
+        or provider_code in _RETRYABLE_GOOGLE_STATUSES,
+    )
+
+
+_RETRYABLE_SERVER_STATUSES = frozenset({502, 503, 504})
+"""HTTP 5xx statuses that mean "busy", not "broken"."""
+
+_RETRYABLE_GOOGLE_STATUSES = frozenset({"UNAVAILABLE", "DEADLINE_EXCEEDED", "RESOURCE_EXHAUSTED"})
+"""Gemini's own retryable set, per its published error guidance.
+
+``INTERNAL`` is deliberately absent: it maps to 500 and is the defect case
+A4 item 3 asks to stop retrying.
+"""
+
+
+def _google_error_envelope(raw: bytes) -> dict[str, Any]:
+    """Extract ``error`` from a Gemini error body, or an empty mapping."""
+    try:
+        decoded: Any = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return {}
+    if not isinstance(decoded, dict):
+        return {}
+    error = decoded.get("error")
+    return error if isinstance(error, dict) else {}
+
+
+def _google_provider_code(envelope: Mapping[str, Any]) -> str | None:
+    """Gemini's canonical error code, e.g. ``INVALID_ARGUMENT``.
+
+    ``status`` rather than the numeric ``code``: the string is the value people
+    search for and the one Google's own guidance is written in terms of.
+    """
+    code = envelope.get("status")
+    return str(code) if code else None
+
+
+def _retry_info_seconds(envelope: Mapping[str, Any]) -> float | None:
+    """Read ``google.rpc.RetryInfo.retryDelay`` such as ``"37s"``.
+
+    Gemini frequently omits ``Retry-After`` while still saying how long to wait
+    in the body, so ignoring this field would discard the only hint available.
+    """
+    details = envelope.get("details")
+    if not isinstance(details, list):
+        return None
+    for detail in details:
+        if not isinstance(detail, dict):
+            continue
+        if not str(detail.get("@type", "")).endswith("google.rpc.RetryInfo"):
+            continue
+        delay = detail.get("retryDelay")
+        if isinstance(delay, str) and delay.endswith("s"):
+            try:
+                return max(0.0, float(delay[:-1]))
+            except ValueError:
+                return None
+    return None
 
 
 def body_indicates_context_length_error(raw: bytes) -> bool:

@@ -196,8 +196,12 @@ async def test_a_sustained_5xx_surfaces_as_502_not_503(http_client: httpx.AsyncC
     `retries_exhausted` (503) is reserved for never having dispatched at all.
     Reporting an upstream fault as a capacity problem would send an operator
     looking at quota instead of at the provider.
+
+    ``503`` rather than ``500`` since T060: a 503 is overload and is retried,
+    which is what "survived its retries" means. A 500 is a defect and raises on
+    the first attempt, which is covered in ``test_error_classification``.
     """
-    respx.post(GENERATE_URL).mock(return_value=httpx.Response(500, json={}))
+    respx.post(GENERATE_URL).mock(return_value=httpx.Response(503, json={}))
 
     with pytest.raises(ProviderServerError):
         await _dispatcher(http_client).dispatch(_request(), PROVIDER, MODEL)
