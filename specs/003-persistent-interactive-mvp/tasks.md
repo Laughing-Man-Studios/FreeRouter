@@ -603,7 +603,7 @@ obvious the omission was a decision.
 
 **Maps to GitHub Issue:** `#15 OpenAI-Compatible SSE Streaming Translation & Fail-Fast Mechanics`
 
-- [ ] **T055: `stream_chat_completion` on the adapter protocol,** as a sibling of
+- [x] **T055: `stream_chat_completion` on the adapter protocol,** as a sibling of
   `chat_completion` rather than a `stream: bool` parameter (ADR-0007). The two have
   different contracts: one returns a complete body, the other a sequence that can
   fail partway, and a flag would force every caller to handle the union.
@@ -612,13 +612,13 @@ obvious the omission was a decision.
   `StreamingUnsupportedError` — **an empty iterator and an unsupported stream are
   different failures and must not share an outcome.**
 
-- [ ] **T056: `api/streaming.py`.** Translate provider chunks to OpenAI-compatible
+- [x] **T056: `api/streaming.py`.** Translate provider chunks to OpenAI-compatible
   SSE, terminated by `data: [DONE]`, for both Gemini and Mistral.
 
   **A `role` delta is emitted first, `usage` is included on the final chunk, and
   `stream_options: {"include_usage": true}` is honoured** (B7).
 
-- [ ] **T057: Fail-fast at the first delivered chunk** (ADR-0007). Enforced in the
+- [x] **T057: Fail-fast at the first delivered chunk** (ADR-0007). Enforced in the
   route layer, because the adapter cannot know whether anything reached the client.
 
   **Zero chunks is not "after stream start"** — nothing was delivered, so it retries
@@ -630,12 +630,12 @@ obvious the omission was a decision.
   retry budget, and must re-implement them **identically** — including taking
   exactly one `(provider, model)` pair, so CONSTITUTION §7.2 holds there too.
 
-- [ ] **T058: Reservation lifecycle under streaming.** An interrupted stream
+- [x] **T058: Reservation lifecycle under streaming.** An interrupted stream
   reconciles with whatever usage was reported; **no reservation leaks**. Streaming
   holds a reservation far longer than a unary request, so a leak here is materially
   worse than M1's case.
 
-- [ ] **T059: Route branch.** `routes.py` branches on `stream`. **The unary path is
+- [x] **T059: Route branch.** `routes.py` branches on `stream`. **The unary path is
   unchanged** — it is the path M1 measured at 100/100, and a streaming change that
   alters it would invalidate that measurement.
 
@@ -650,6 +650,71 @@ obvious the omission was a decision.
 5. A non-streaming adapter raises rather than returning an empty iterator.
 6. `CONSTITUTION` §7.2 intact: the model never varies after delivery begins.
 7. **STOP**, review, then update #15.
+
+**Batch 5 verification gate (2026-10-28):**
+
+1. Full `pytest`, `ruff`, `mypy --strict`, `markdownlint` — clean. **568 passing**,
+   up from 521.
+2. **Scenario 9 passes.** A Google stream delivers one chunk and then sends a
+   malformed event. The response ends there, and the mistral endpoint — declared in
+   the same configuration and therefore reachable — is **never called**. The test
+   asserts on the call count, every call's URL, and the request body, so a silent
+   substitution of provider or payload would fail it.
+3. **A zero-chunk interruption retries.** A `200` containing only `data: [DONE]`
+   is retried inside the existing budget and the second attempt's content reaches
+   the client. An empty stream that never recovers is a `502`, not a `200` with no
+   body.
+4. **An interrupted stream leaves no pending reservation.** `_pending` is empty
+   after both the interrupted and the completed paths, and the interrupted stream
+   settles against whatever usage arrived before the fault.
+5. A provider that cannot stream is refused with `400 streaming_unsupported`
+   rather than served an empty iterator. **See the deviation below**: the refusal
+   is raised by the route from `supports_streaming`, because both shipped adapters
+   can stream and there is nothing to exercise the adapter-level raise against.
+6. `CONSTITUTION` §7.2 intact: the streaming path binds one `(provider, model)`
+   pair before the loop and never varies it. Fail-fast is **structural** — the
+   route consumes the first chunk before a `StreamingResponse` exists, so there is
+   no code path that could retry after delivery.
+
+**Design notes, recorded because they depart from the written plan.**
+
+- **`api/stream_dispatch.py` is a second new module.** `plan.md` names only
+  `api/streaming.py`. Rendering (chunks in, SSE out) and orchestration (capacity,
+  retry, reservation) are different jobs with different test stories, and keeping
+  them together would have made one 700-line module whose two halves are never
+  read together.
+- **`NormalizedChunk` was added to `core/normalization.py`.** `plan.md` lists that
+  module as explicitly unchanged. The claim is about the request/response
+  translation logic, which is untouched; the new type is additive and colocates
+  the streaming sibling with `NormalizedResponse` and `TokenUsage`. It is recorded
+  here rather than relocated to a module of its own.
+- **The protocol signature is `(request, provider_model_id, key)`.** `plan.md`
+  writes `(request, key, provider_model_id)`. That order differs from the
+  existing `chat_completion` sibling for no reason, and two sibling methods with
+  transposed arguments is a bug waiting to be written.
+- **`stream_options.include_usage` is read as a *provider* preference, not a
+  client output filter.** B7 says both that usage is on the final chunk and that
+  the flag is honoured. The only reading that satisfies both is: usage is always
+  emitted when known, and the flag is forwarded so Mistral — which reports usage
+  only when asked — actually has a number to report. Gemini ignores it.
+- **A mid-stream timeout is classified as `ProviderTimeoutError`, not
+  `ProviderServerError`.** The provider accepted the request and then went silent,
+  which is a 504-class fault. It matters only before delivery; after delivery both
+  end the stream identically.
+
+**A deviation, recorded rather than papered over.** Criterion 5 asks that a
+"non-streaming adapter raises rather than returning an empty iterator". The
+protocol requires that behaviour and documents it, but neither shipped adapter is
+non-streaming, so no adapter-level raise exists to test. What is enforced instead
+is the outcome the criterion is protecting: the route reads `supports_streaming`
+**before dispatch** and raises `400 streaming_unsupported`, so an unsupported
+stream is never confused with a stream that produced nothing. The adapter-level
+raise is specified but unexercised.
+
+**Not changed:** `core/dispatch.py` and the unary path in `api/routes.py` beyond
+the branch itself. A2's premise is that the measured M1 path is worth more than
+avoiding duplication; a test posts a non-streaming request and pins the JSON
+envelope it returned before this batch.
 
 ---
 

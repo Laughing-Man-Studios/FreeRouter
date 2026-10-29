@@ -28,7 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
 import httpx
@@ -43,11 +43,13 @@ from free_router.core.exceptions import (
 )
 from free_router.core.normalization import (
     FinishReason,
+    NormalizedChunk,
     NormalizedRequest,
     NormalizedResponse,
     TokenUsage,
 )
 from free_router.keys.manager import KeyRef
+from free_router.providers.sse import SSEDecodeError, iter_sse_data, response_lines
 from free_router.providers.timeout import (
     DEFAULT_PROVIDER_TIMEOUT_SECONDS,
     PROVIDER_TIMEOUT_SECONDS,
@@ -79,6 +81,9 @@ _FINISH_REASON_MAP: Mapping[str, FinishReason] = {
 
 class GoogleAdapter:
     """Dispatch chat completions to the Gemini ``generateContent`` API."""
+
+    supports_streaming = True
+    """Gemini streams via ``:streamGenerateContent``. See ``stream_chat_completion``."""
 
     def __init__(self, *, http_client: httpx.AsyncClient) -> None:
         """Store the shared HTTP client.
@@ -129,6 +134,74 @@ class GoogleAdapter:
         raw = await self._read_body(response)
         debug_payload(phase="wire_response", provider="google", model=provider_model_id, data=raw)
         return from_gemini_response(raw, provider_model_id)
+
+    async def stream_chat_completion(
+        self, request: NormalizedRequest, provider_model_id: str, key: KeyRef
+    ) -> AsyncIterator[NormalizedChunk]:
+        """Stream one completion from Gemini's ``:streamGenerateContent``.
+
+        ``alt=sse`` is not optional. Without it Gemini answers with a JSON array
+        that arrives only once the whole answer is generated, which would defeat
+        streaming entirely while looking like it worked.
+
+        The method is an async generator, so the header timeout in :meth:`_send`
+        still runs before the first chunk, but the connection is held open for as
+        long as generation takes. That asymmetry is why the route, not this
+        adapter, enforces the fail-fast policy: only the route knows whether a
+        chunk reached the client.
+
+        Args:
+            request: The internal normalized request.
+            provider_model_id: The Gemini-side model id.
+            key: The credential to dispatch with.
+
+        Yields:
+            One :class:`NormalizedChunk` per Gemini event carrying text, a finish
+            reason, or usage.
+
+        Raises:
+            ProviderTimeoutError: If connection or headers exceed 0.4 s.
+            ProviderAuthError: If Gemini rejects the API key.
+            ProviderValidationError: If Gemini rejects the payload.
+            ProviderServerError: If Gemini returns 5xx, an undecodable event, or
+                the connection fails mid-stream.
+        """
+        url = (
+            f"{GOOGLE_API_BASE}/{API_VERSION}/models/{provider_model_id}"
+            ":streamGenerateContent?alt=sse"
+        )
+        headers = {
+            "x-goog-api-key": key.secret.get_secret_value(),
+            "Content-Type": "application/json",
+        }
+        payload = to_gemini_request(request)
+
+        # Only the request is logged. A streamed body has no single response to
+        # log, and logging every chunk would turn one debug line into one line per
+        # token -- too much noise to read and too much content to justify keeping.
+        debug_payload(
+            phase="wire_request", provider="google", model=provider_model_id, data=payload
+        )
+        response = await self._send(url, headers, payload)
+
+        try:
+            async for event in iter_sse_data(response_lines(response)):
+                chunk = _chunk_from_gemini(event)
+                if chunk is not None:
+                    yield chunk
+        except SSEDecodeError as exc:
+            # A malformed event is an upstream fault, so it joins the rest of the
+            # provider failures rather than escaping as a decode error.
+            raise ProviderServerError(
+                "The upstream provider returned a stream event that could not be decoded."
+            ) from exc
+        except (httpx.TimeoutException, TimeoutError) as exc:
+            # A mid-stream silence is a timeout, not a server fault: the provider
+            # accepted the request and then stopped sending. Classified
+            # separately so the pre-delivery status is 504 rather than 502.
+            raise ProviderTimeoutError("The upstream provider stream stalled.") from exc
+        except httpx.HTTPError as exc:
+            raise ProviderServerError("The upstream provider stream failed.") from exc
 
     async def _send(
         self, url: str, headers: dict[str, str], payload: dict[str, Any]
@@ -302,6 +375,42 @@ def _usage_from_gemini(raw: dict[str, Any]) -> TokenUsage | None:
         output_tokens=output_tokens,
         total_tokens=total_count,
     )
+
+
+def _chunk_from_gemini(event: dict[str, Any]) -> NormalizedChunk | None:
+    """Translate one Gemini stream event, or drop it if it carries nothing.
+
+    Gemini's stream is not one event per token with a uniform shape. It sends
+    events with no candidates at all (usage only), and ``finishReason`` appears
+    on the same event as the last text rather than on one of its own. Returning
+    ``None`` for an event with no content, no finish reason and no usage keeps
+    the writer from emitting empty deltas the client would have to filter.
+
+    Args:
+        event: One decoded ``data:`` payload.
+
+    Returns:
+        The normalized chunk, or ``None`` if the event carries nothing usable.
+    """
+    candidates = event.get("candidates") or []
+    delta = ""
+    finish_reason: FinishReason | None = None
+
+    if candidates and isinstance(candidates[0], dict):
+        candidate = candidates[0]
+        parts = (candidate.get("content") or {}).get("parts") or []
+        delta = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
+        raw_finish_reason = candidate.get("finishReason")
+        if raw_finish_reason:
+            # An unrecognised reason maps to "stop" for the same reason the unary
+            # path does it: the OpenAI vocabulary has three values and a client
+            # needs one of them.
+            finish_reason = _FINISH_REASON_MAP.get(str(raw_finish_reason).upper(), "stop")
+
+    usage = _usage_from_gemini(event)
+    if not delta and finish_reason is None and usage is None:
+        return None
+    return NormalizedChunk(delta=delta, finish_reason=finish_reason, usage=usage)
 
 
 def from_gemini_response(raw: dict[str, Any], provider_model_id: str) -> NormalizedResponse:

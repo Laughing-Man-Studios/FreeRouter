@@ -15,8 +15,14 @@ VALID_PAYLOAD = {
 }
 
 
-def test_normalizer_keeps_only_model_and_messages() -> None:
-    """Scenario 5: unsupported parameters are discarded, not forwarded."""
+def test_normalizer_keeps_only_honoured_fields() -> None:
+    """Scenario 5: unsupported parameters are discarded, not forwarded.
+
+    ``stream`` and ``include_usage`` are honoured since M2 (T059, B7) and so are
+    expected in the dump. Everything else -- including generation controls the
+    providers would happily accept -- must not survive, which is what the
+    exclusion assertions pin.
+    """
     payload = {**VALID_PAYLOAD, "temperature": 0.7, "max_tokens": 100, "top_p": 0.9}
 
     normalized = normalize_chat_completion_request(payload)
@@ -25,7 +31,12 @@ def test_normalizer_keeps_only_model_and_messages() -> None:
     assert normalized.model == "google/gemini-3.5-flash-lite"
     assert normalized.messages == [{"role": "user", "content": "hello"}]
     dumped = normalized.model_dump()
-    assert set(dumped) == {"model", "messages"}
+    assert set(dumped) == {"model", "messages", "stream", "include_usage"}
+    assert "temperature" not in dumped
+    assert "max_tokens" not in dumped
+    assert "top_p" not in dumped
+    assert normalized.stream is False
+    assert normalized.include_usage is False
 
 
 def test_normalized_request_forbids_extra_fields() -> None:

@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -51,11 +52,13 @@ from free_router.core.exceptions import (
 )
 from free_router.core.normalization import (
     FinishReason,
+    NormalizedChunk,
     NormalizedRequest,
     NormalizedResponse,
     TokenUsage,
 )
 from free_router.keys.manager import KeyRef
+from free_router.providers.sse import SSEDecodeError, iter_sse_data, response_lines
 from free_router.providers.timeout import PROVIDER_TIMEOUT_SECONDS
 from free_router.quota.breaker import is_context_length_error
 
@@ -93,6 +96,9 @@ _FINISH_REASON_MAP: dict[str, FinishReason] = {
 
 class MistralAdapter:
     """Dispatch chat completions to the Mistral ``/v1/chat/completions`` API."""
+
+    supports_streaming = True
+    """Mistral streams from the same endpoint when the body says ``stream: true``."""
 
     def __init__(self, *, http_client: httpx.AsyncClient) -> None:
         """Store the shared HTTP client.
@@ -145,6 +151,72 @@ class MistralAdapter:
         raw = await self._read_body(response)
         debug_payload(phase="wire_response", provider="mistral", model=provider_model_id, data=raw)
         return from_mistral_response(raw, provider_model_id)
+
+    async def stream_chat_completion(
+        self, request: NormalizedRequest, provider_model_id: str, key: KeyRef
+    ) -> AsyncIterator[NormalizedChunk]:
+        """Stream one completion from Mistral's ``/v1/chat/completions``.
+
+        The streamed and unary calls differ only in the body and how the response
+        is read, so the payload is built by the same translator and then marked
+        as streaming. That keeps the message mapping in one place.
+
+        ``stream_options.include_usage`` is forwarded only when the client asked
+        for it. Mistral reports usage in a stream only on request, unlike Gemini
+        which always does, so forwarding the flag unconditionally would change
+        the provider's payload for a reason the client did not ask for.
+
+        Args:
+            request: The internal normalized request.
+            provider_model_id: The Mistral-side model id.
+            key: The credential to dispatch with.
+
+        Yields:
+            One :class:`NormalizedChunk` per Mistral event carrying text, a finish
+            reason, or usage.
+
+        Raises:
+            ProviderRateLimitError: If Mistral returns 429.
+            ProviderAuthError: If Mistral rejects the API key.
+            ProviderValidationError: If Mistral rejects the payload.
+            ProviderServerError: If Mistral returns 5xx, sends an undecodable
+                event, or the connection fails mid-stream.
+            ProviderTimeoutError: If connection or headers exceed the budget.
+        """
+        url = f"{MISTRAL_API_BASE}{MISTRAL_CHAT_PATH}"
+        headers = {
+            "Authorization": f"Bearer {key.secret.get_secret_value()}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        payload = to_mistral_request(request, provider_model_id)
+        payload["stream"] = True
+        if request.include_usage:
+            payload["stream_options"] = {"include_usage": True}
+
+        # Only the request is logged: a streamed body has no single response to
+        # log, and one line per chunk would be one line per token.
+        debug_payload(
+            phase="wire_request", provider="mistral", model=provider_model_id, data=payload
+        )
+        response = await self._send(url, headers, payload)
+
+        try:
+            async for event in iter_sse_data(response_lines(response)):
+                chunk = _chunk_from_mistral(event)
+                if chunk is not None:
+                    yield chunk
+        except SSEDecodeError as exc:
+            raise ProviderServerError(
+                "The upstream provider returned a stream event that could not be decoded."
+            ) from exc
+        except (httpx.TimeoutException, TimeoutError) as exc:
+            # A mid-stream silence is a timeout, not a server fault: the provider
+            # accepted the request and then stopped sending. Classified
+            # separately so the pre-delivery status is 504 rather than 502.
+            raise ProviderTimeoutError("The upstream provider stream stalled.") from exc
+        except httpx.HTTPError as exc:
+            raise ProviderServerError("The upstream provider stream failed.") from exc
 
     async def _send(
         self, url: str, headers: dict[str, str], payload: dict[str, Any]
@@ -270,6 +342,44 @@ def to_mistral_request(request: NormalizedRequest, provider_model_id: str) -> di
     # aread() outside the header timeout, which requires a complete body, and
     # relying on Mistral's default would make that an implicit coupling.
     return {"model": provider_model_id, "messages": messages, "stream": False}
+
+
+def _chunk_from_mistral(event: dict[str, Any]) -> NormalizedChunk | None:
+    """Translate one Mistral stream event, or drop it if it carries nothing.
+
+    Mistral's chunks are already OpenAI-shaped, so the translation is mostly
+    reading the first choice's ``delta.content``. The role arrives on the first
+    chunk and is deliberately **discarded**: emitting it is the writer's job, so
+    that the role delta appears exactly once regardless of what a provider does.
+
+    A usage-only event has an empty ``choices`` array, which is why the choice
+    handling is guarded rather than indexed.
+
+    Args:
+        event: One decoded ``data:`` payload.
+
+    Returns:
+        The normalized chunk, or ``None`` if the event carries nothing usable.
+    """
+    delta = ""
+    finish_reason: FinishReason | None = None
+
+    choices = event.get("choices") or []
+    if choices and isinstance(choices[0], dict):
+        choice = choices[0]
+        delta_block = choice.get("delta")
+        if isinstance(delta_block, dict):
+            content = delta_block.get("content")
+            if isinstance(content, str):
+                delta = content
+        raw_finish_reason = choice.get("finish_reason")
+        if raw_finish_reason:
+            finish_reason = _FINISH_REASON_MAP.get(str(raw_finish_reason).lower(), "stop")
+
+    usage = _usage_from_mistral(event)
+    if not delta and finish_reason is None and usage is None:
+        return None
+    return NormalizedChunk(delta=delta, finish_reason=finish_reason, usage=usage)
 
 
 def _usage_from_mistral(raw: dict[str, Any]) -> TokenUsage | None:

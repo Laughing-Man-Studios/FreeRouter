@@ -42,6 +42,7 @@ from free_router.core.exceptions import (
     ProviderValidationError,
     RetriesExhaustedError,
     RouterBaseError,
+    StreamingUnsupportedError,
     UnsupportedModelError,
     ValidationError,
 )
@@ -117,6 +118,7 @@ PROVIDER_ERROR_STATUS_MAP: dict[type[RouterBaseError], int] = {
     ProviderAuthError: 401,
     ProviderValidationError: 400,
     ProviderServerError: 502,
+    StreamingUnsupportedError: 400,
     ValidationError: 400,
     UnsupportedModelError: 400,
 }
