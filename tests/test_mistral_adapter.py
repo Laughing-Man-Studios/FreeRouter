@@ -16,6 +16,7 @@ Fixture shapes here are taken from Mistral's published OpenAPI spec
   422 therefore cannot be classified by parsing the body.
 """
 
+import asyncio
 import json
 from typing import Any
 
@@ -381,6 +382,32 @@ async def test_timeout_maps_to_timeout_error(http_client: httpx.AsyncClient, key
 
     with pytest.raises(ProviderTimeoutError):
         await MistralAdapter(http_client=http_client).chat_completion(_request(), MODEL_ID, key)
+
+
+@respx.mock
+async def test_the_unary_path_has_no_header_window(
+    http_client: httpx.AsyncClient, key: KeyRef
+) -> None:
+    """Same rule as Google: a unary answer's headers arrive with the answer.
+
+    Bounding them bounds the generation, so the unary path passes
+    ``header_window=None`` and the read timeout governs instead. Asserted here
+    as well as in the Google tests because the two adapters are separate copies
+    of the rule, and only one of them drifting would be silent.
+    """
+
+    async def _slow_generation(_: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(PROVIDER_TIMEOUT_SECONDS * 2)
+        return httpx.Response(200, json=SUCCESS_BODY)
+
+    route = respx.post(CHAT_URL).mock(side_effect=_slow_generation)
+
+    result = await MistralAdapter(http_client=http_client).chat_completion(
+        _request(), MODEL_ID, key
+    )
+
+    assert route.call_count == 1
+    assert result.content == "hello from mistral"
 
 
 @respx.mock

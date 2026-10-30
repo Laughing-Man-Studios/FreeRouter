@@ -796,8 +796,7 @@ remaining work with no issue of its own)
   the request. That asymmetry between the two paths was not designed — it follows
   from what each provider endpoint does with its headers.
 
-  Two consequences, stated rather than acted on in this batch because both are
-  behaviour changes beyond a measurement task:
+  Two consequences followed, both behaviour changes beyond a measurement task:
 
   1. `attempt_budget_seconds` (10 s) and the provider window (5 s) mean a unary
      request whose first two attempts each take over 5 s cannot succeed, however
@@ -806,8 +805,62 @@ remaining work with no issue of its own)
   2. A longer unary generation than 5 s is unservable **unary** while the same
      generation streams fine. Today's prompts completed in 0.6–3.0 s, so it did
      not bite; earlier measurement recorded generations of 14.7 s, 26.1 s,
-     49.7 s and 66.7 s on larger prompts, which would all have failed unary. That
-     inconsistency is recorded for the milestone report and is **not** fixed here.
+     49.7 s and 66.7 s on larger prompts, which would all have failed unary.
+
+  **Fix applied 2026-10-30, in M2, on the user's direction — the window is
+  scoped, not raised.** The instruction was to raise the 5 s window. Raising the
+  constant would have been the wrong fix, and the reason is that the constant
+  was never one policy: it was two phases sharing a transport signal.
+
+  - On `:streamGenerateContent` the headers *are* a handshake. Measured p50
+    743 ms, p90 2332 ms, and one attempt in this run stalled exactly at 5.0 s and
+    recovered on retry for 4.3 s. A short window there is right: it makes a
+    stalled handshake cheap to retry.
+  - On `:generateContent` there is no handshake. The provider sends nothing until
+    the answer exists, so the "header" phase *is* the generation. Bounding it at
+    5 s bounded generation at 5 s, which is why a prompt that streams for 50 s
+    fails unary.
+
+  So `_send` in both adapters now takes `header_window: float | None`, defaults
+  to `PROVIDER_TIMEOUT_SECONDS` (unchanged at 5 s) for the streaming path, and
+  receives `None` from the unary path. A unary request is bounded instead by the
+  configured read timeout (`provider_read_timeout_seconds`, 120 s), which is
+  already the documented span for generation; connection stays bounded by the
+  client's connect timeout (0.25 s), so a dead provider still fails fast. Raising
+  the constant to 120 s would have made a stalled stream hang for two minutes
+  instead of retrying after five seconds; lowering the unary bound to a new
+  separate number would have added a third timeout to a system that already had
+  one too many.
+
+  Verified live on the same server after the change, with a prompt long enough to
+  force a slow generation:
+
+  | Mode | Status | Latency | Attempts |
+  | :--- | :--- | ---: | ---: |
+  | Unary (1,200-word prompt) | `200` | **10.37 s** | 1 |
+  | Streamed (same prompt) | `200`, `[DONE]`, 110 chunks | 9.74 s | 1 |
+
+  The unary row is the regression test in practice: it exceeds the old 5 s
+  window, and before the change it could not have returned `200` at any attempt
+  count. Routing overhead remains irrelevant to these figures; the waiter is the
+  provider.
+
+  Two follow-on edits were required by the change, and both are declared rather
+  than quietly absorbed:
+
+  - `test_asyncio_timeout_is_enforced_on_slow_headers` **asserted the defect** —
+    it drove a slow response at the unary URL and required a
+    `ProviderTimeoutError`, i.e. it pinned the five-second cap on generation. It
+    is now `test_asyncio_timeout_is_enforced_on_a_streaming_handshake` (same
+    assertion, streaming URL), and
+    `test_a_unary_generation_slower_than_the_header_window_succeeds` plus a
+    Mistral equivalent assert the new behaviour.
+  - `attempt_budget_seconds` is documented as gating the **start** of an attempt,
+    not one in flight. That was already true of the code — the deadline is
+    checked before each attempt — but the old wording ("wall-clock ceiling for
+    all attempts") read as a total latency cap, which the unscoped unary path now
+    visibly is not. Correcting the docstring was the point: a budget that reads
+    as a ceiling and behaves as a retry gate is how this trap gets re-set.
 
   **The console comparison is not done in this entry.** T063 owns it: whether
   this window's console-reported usage matches the router's counters is a

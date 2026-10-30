@@ -13,6 +13,12 @@ default is retuned from measurement. See that module for why the window covers
 provider I/O rather than routing decisions, and why it bounds headers but not
 generation.
 
+That window applies to the **streaming** call only. ``generateContent`` sends no
+headers until the answer exists, so its header phase *is* the generation; the
+unary path passes ``header_window=None`` and is bounded by the client's read
+timeout instead. A single window cannot mean both things, and a 5 s one silently
+capped unary generation at five seconds.
+
 **Only the messages the normalizer kept are sent.** M0 honours ``model`` and
 ``messages`` exclusively; ``temperature`` and ``max_tokens`` were already
 stripped at ingress and have no representation here. Adding a generationConfig
@@ -80,6 +86,19 @@ _FINISH_REASON_MAP: Mapping[str, FinishReason] = {
 """Gemini ``finishReason`` values mapped to the OpenAI vocabulary."""
 
 
+def _timeout_message(header_window: float | None) -> str:
+    """Describe which bound the provider exceeded.
+
+    A message that always names the same number would be wrong half the time
+    now that the two phases are bounded differently: a unary request has no
+    header window at all, and reporting "5s" for a request that waited two
+    minutes would send whoever reads it looking at the wrong setting.
+    """
+    if header_window is None:
+        return "The upstream provider did not respond within the configured read timeout."
+    return f"The upstream provider did not respond within {header_window}s."
+
+
 class GoogleAdapter:
     """Dispatch chat completions to the Gemini ``generateContent`` API."""
 
@@ -131,7 +150,9 @@ class GoogleAdapter:
         debug_payload(
             phase="wire_request", provider="google", model=provider_model_id, data=payload
         )
-        response = await self._send(url, headers, payload)
+        # No header window: see ``_send``. A unary Gemini response's headers are
+        # its generation, so the read timeout is the bound that fits.
+        response = await self._send(url, headers, payload, header_window=None)
         raw = await self._read_body(response)
         debug_payload(phase="wire_response", provider="google", model=provider_model_id, data=raw)
         return from_gemini_response(raw, provider_model_id)
@@ -205,9 +226,32 @@ class GoogleAdapter:
             raise ProviderServerError("The upstream provider stream failed.") from exc
 
     async def _send(
-        self, url: str, headers: dict[str, str], payload: dict[str, Any]
+        self,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, Any],
+        *,
+        header_window: float | None = PROVIDER_TIMEOUT_SECONDS,
     ) -> httpx.Response:
-        """Dispatch under the strict header-receipt timeout.
+        """Dispatch, optionally under the strict header-receipt timeout.
+
+        Args:
+            url: The endpoint.
+            headers: Request headers.
+            payload: The provider-shaped request body.
+            header_window: Seconds allowed for connection and response headers,
+                or ``None`` to leave the wait bounded by the client's read
+                timeout instead.
+
+                ``None`` is correct for a **unary** request and wrong for a
+                streaming one, because the same phase means two different
+                things. ``:generateContent`` sends no headers until the answer
+                has been generated, so bounding its headers bounds the whole
+                generation; a 5 s window there means a 6 s generation cannot be
+                served unary however patient the client is. ``:streamGenerateContent``
+                sends headers as soon as it starts talking, so the same window
+                bounds only the handshake -- and a short one is exactly what
+                makes a stalled handshake cheap to retry.
 
         Raises:
             ProviderTimeoutError: If connection or headers exceed the budget.
@@ -215,11 +259,16 @@ class GoogleAdapter:
         """
         try:
             build = self._http_client.build_request("POST", url, json=payload, headers=headers)
-            async with asyncio.timeout(PROVIDER_TIMEOUT_SECONDS):
-                # stream=True returns once response headers arrive, so the
-                # timeout bounds connection + headers only. The body is read
-                # afterwards, outside this window.
+            if header_window is None:
+                # Bounded by the client's read timeout, which is the configured
+                # span for generation (``provider_read_timeout_seconds``).
                 response = await self._http_client.send(build, stream=True)
+            else:
+                async with asyncio.timeout(header_window):
+                    # stream=True returns once response headers arrive, so the
+                    # timeout bounds connection + headers only. The body is read
+                    # afterwards, outside this window.
+                    response = await self._http_client.send(build, stream=True)
         except httpx.TimeoutException as exc:
             # Checked before the broader httpx.HTTPError below, since a timeout
             # is a subclass of it and must map to 504, not 502.
@@ -227,9 +276,7 @@ class GoogleAdapter:
                 "provider_timeout",
                 extra={"event": "provider_timeout", "error_category": "provider_timeout"},
             )
-            raise ProviderTimeoutError(
-                f"The upstream provider did not respond within {PROVIDER_TIMEOUT_SECONDS}s."
-            ) from exc
+            raise ProviderTimeoutError(_timeout_message(header_window)) from exc
         except httpx.HTTPError as exc:
             # Transport failures (connection refused, DNS, TLS, reset) are
             # raised as exceptions rather than returned as responses, so they
@@ -252,9 +299,7 @@ class GoogleAdapter:
                 "provider_timeout",
                 extra={"event": "provider_timeout", "error_category": "provider_timeout"},
             )
-            raise ProviderTimeoutError(
-                f"The upstream provider did not respond within {PROVIDER_TIMEOUT_SECONDS}s."
-            ) from exc
+            raise ProviderTimeoutError(_timeout_message(header_window)) from exc
 
         try:
             return await _raise_for_status(response)
