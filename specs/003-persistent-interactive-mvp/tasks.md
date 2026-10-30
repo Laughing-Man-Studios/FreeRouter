@@ -720,9 +720,11 @@ envelope it returned before this batch.
 
 ## Batch 6: Error Classification, Measurement & Milestone Verification
 
-**Maps to GitHub Issues:** `#12`, `#15`
+**Maps to GitHub Issues:** `#79` (created 2026-10-29; previously mapped to `#12`
+and `#15`, both closed before this batch started, which left the milestone's
+remaining work with no issue of its own)
 
-- [ ] **T060: Improved provider error classification** (A4). All four:
+- [x] **T060: Improved provider error classification** (A4). All four:
 
   1. **Provider-specific error codes surfaced to the client** — Gemini's
      `INVALID_ARGUMENT`, Mistral's `invalid_api_key`, so a client distinguishes a
@@ -738,6 +740,9 @@ envelope it returned before this batch.
 
   Ordinary `400`s must not degrade a model; only a genuine context-length refusal
   does.
+
+  **Implemented 2026-10-29** on `M2-Batch6-ErrorClassification`. Verification gate
+  and the decisions the spec left open are recorded below.
 
 - [ ] **T061: Manual integration-test matrix** (#36 deliverable). Success, `429`,
   `4xx`, `5xx`, timeout, **mid-stream interruption**, and **post-restart behaviour**,
@@ -769,6 +774,66 @@ envelope it returned before this batch.
   met by M2 and is not claimed to be. What M2 demonstrates: survival across
   restart with cooldown and counter state intact (Batches 1–2), and streaming plus
   model discovery serving an interactive client (Batches 4–5).
+
+### T060 verification gate (2026-10-29)
+
+1. **The provider's own code is a second field, not a replacement.**
+   `error.provider_code` carries `INVALID_ARGUMENT`, `invalid_api_key`,
+   `RESOURCE_EXHAUSTED`, `INTERNAL`; `error.code` keeps the router's vocabulary.
+   The key is **omitted when the provider supplied no code**, so an ordinary
+   error envelope stays byte-identical to OpenAI's four keys. A client that
+   validates the envelope sees no change; one that wants the extra detail asks
+   for it.
+2. **A retry hint is read wherever the provider puts it.** `Retry-After` first,
+   then Gemini's `google.rpc.RetryInfo.retryDelay`. Gemini often sends only the
+   latter, and discarding it would leave the cooldown guessing.
+3. **Retryability is decided in the adapter and honoured, not re-derived, in the
+   dispatcher.** `RouterBaseError.retryable` defaults to `False`;
+   `ProviderServerError` and `ProviderTimeoutError` set it `True`; the adapter
+   overrides it per response. `502`/`503`/`504` and Google's
+   `UNAVAILABLE`/`DEADLINE_EXCEEDED`/`RESOURCE_EXHAUSTED` are retryable; `500`
+   and `INTERNAL` are not. A `500` now raises on the first attempt.
+4. **A daily cap is called on evidence, and otherwise called a burst.** Two
+   signals: an exhausted daily `requests` window in the router's own tracker
+   (`QuotaTracker.daily_requests_exhausted`), or a provider hint of an hour or
+   more. With neither, the answer is "burst", because a wrong "daily" tells a
+   client to give up on a day it could still use. A model with no daily dimension
+   configured never answers "daily" from the tracker — an unverified limit stays
+   unenforced, per the dimensions module.
+5. **A `400` still does not degrade a model.** Pinned by a test that sends two
+   consecutive `400`s and asserts both were dispatched, with the second only
+   possible if no breaker entry was recorded.
+6. Both paths share one verdict: `is_daily_cap` is a free function in
+   `core/dispatch.py` called by the dispatcher and by `api/stream_dispatch.py`,
+   and a test asserts the streaming module references the same object rather than
+   a copy. The route-level tests cover `500`-not-retried over both unary and SSE.
+
+**Decisions the spec left open, recorded because they are contract choices.**
+
+- **`provider_code` rather than overloading `error.code`.** A4 item 1 asks for the
+  provider's code to be surfaced; it does not say where. Overloading `code` would
+  silently break any client switching on `provider_rate_limited`, and the router's
+  vocabulary would stop being stable across providers. Additive is the only
+  option that satisfies both.
+- **A new code for the daily cap: `provider_daily_quota_exhausted`, still `429`.**
+  The spec's *Error Behavior* table has one rate-limit row. A4 item 2 requires the
+  two cases be distinguishable, and they are only distinguishable to a client if
+  the code differs — a `provider_code` would be identical, because the wire is.
+  `ProviderDailyQuotaExhaustedError` subclasses `ProviderRateLimitError`, so every
+  existing handler and every `isinstance` check still treats it as a rate limit,
+  and the table's row remains true for the burst case. It is an addition to the
+  table, not a correction of it.
+- **`_DAILY_CAP_HINT_SECONDS = 3600`.** Burst windows on both providers are
+  per-second and per-minute, so a hint of an hour or more cannot be describing
+  one. Lower would misreport a slow burst as a daily cap.
+- **The daily cap does not lengthen the cooldown.** The cooldown still applies the
+  configured floor and the provider hint. Cooling *until the reset* would be the
+  more literal reading of "retrying cannot help", but the reset boundary is not
+  modelled yet (see `WindowReset.FIXED`: no fixed window is configured, and the
+  boundary is the monotonic epoch rather than midnight Pacific). Guessing a
+  duration there would be worse than the 60 s floor, and the client now has the
+  code that says not to retry regardless. Recorded as an open item, not silently
+  done.
 
 **Verification & Stop:**
 

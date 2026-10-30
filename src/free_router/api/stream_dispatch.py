@@ -38,11 +38,12 @@ import httpx
 
 from free_router.api.streaming import StreamRenderer
 from free_router.core.config import DispatchConfig
-from free_router.core.dispatch import Dispatcher
+from free_router.core.dispatch import Dispatcher, is_daily_cap
 from free_router.core.exceptions import (
     NoAvailableCapacityError,
     PersistenceUnavailableError,
     ProviderAuthError,
+    ProviderDailyQuotaExhaustedError,
     ProviderRateLimitError,
     ProviderServerError,
     ProviderTimeoutError,
@@ -200,6 +201,16 @@ async def start_stream(
             await dispatcher.cooldown.enter(
                 provider, model_id, provider_hint=exc.retry_after, reason="rate_limited"
             )
+            # Same verdict as the unary path, from the same function: a client
+            # that falls back to streaming must not be told a different story
+            # about the same upstream 429.
+            daily = is_daily_cap(dispatcher.quota, provider, model_id, exc)
+            if daily:
+                exc = ProviderDailyQuotaExhaustedError(
+                    f"Model '{model_id}' has exhausted its daily request budget.",
+                    retry_after=exc.retry_after,
+                    provider_code=exc.provider_code,
+                )
             logger.info(
                 "provider_rate_limited",
                 extra={
@@ -207,10 +218,11 @@ async def start_stream(
                     "key_alias": key.alias,
                     "attempt": attempt,
                     "retry_after": exc.retry_after,
+                    "limit_scope": "daily" if daily else "burst",
                     "stream": True,
                 },
             )
-            raise
+            raise exc
         except ProviderAuthError as exc:
             await dispatcher.quota.reconcile(reservation, None)
             await dispatcher.key_manager.suspend(provider, model_id, key.alias)
@@ -243,6 +255,19 @@ async def start_stream(
             raise
         except (ProviderServerError, ProviderTimeoutError) as exc:
             await dispatcher.quota.reconcile(reservation, None)
+            if not exc.retryable:
+                logger.info(
+                    "provider_defect",
+                    extra={
+                        "event": "provider_defect",
+                        "key_alias": key.alias,
+                        "attempt": attempt,
+                        "error_category": type(exc).__name__,
+                        "provider_code": exc.provider_code,
+                        "stream": True,
+                    },
+                )
+                raise
             last_error = exc
             failovers += 1
             logger.info(

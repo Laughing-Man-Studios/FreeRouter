@@ -16,6 +16,7 @@ __all__ = [
     "NoAvailableCapacityError",
     "ProviderAuthError",
     "ProviderBaseError",
+    "ProviderDailyQuotaExhaustedError",
     "ProviderRateLimitError",
     "ProviderServerError",
     "ProviderTimeoutError",
@@ -37,11 +38,22 @@ class RouterBaseError(Exception):
         error_type: The OpenAI ``error.type`` value, e.g. ``invalid_request_error``.
         code: A stable machine-readable identifier, e.g. ``unsupported_model``.
         param: The offending request field, or ``None``.
+        provider_code: The provider's own error code, when it supplied one.
+            Additive and separate from ``code`` on purpose (A4 item 1): a client
+            that switches on the router's vocabulary keeps working, and one that
+            needs to tell ``INVALID_ARGUMENT`` from ``invalid_api_key`` can,
+            without parsing prose.
+        retryable: Whether a second attempt could plausibly succeed. Set by the
+            adapter from the provider's own signal where one exists (A4 item 4),
+            so the dispatcher retries on evidence rather than on a guess about
+            what a status class implies.
     """
 
     error_type: str = "api_error"
     code: str = "router_error"
     param: str | None = None
+    provider_code: str | None = None
+    retryable: bool = False
 
     def __init__(
         self,
@@ -50,6 +62,8 @@ class RouterBaseError(Exception):
         error_type: str | None = None,
         code: str | None = None,
         param: str | None = None,
+        provider_code: str | None = None,
+        retryable: bool | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -59,17 +73,30 @@ class RouterBaseError(Exception):
             self.code = code
         if param is not None:
             self.param = param
+        if provider_code is not None:
+            self.provider_code = provider_code
+        if retryable is not None:
+            self.retryable = retryable
 
     def to_payload(self) -> dict[str, object]:
-        """Render the OpenAI-compatible error envelope for this error."""
-        return {
-            "error": {
-                "message": self.message,
-                "type": self.error_type,
-                "param": self.param,
-                "code": self.code,
-            }
+        """Render the OpenAI-compatible error envelope for this error.
+
+        ``provider_code`` is emitted **only** when the provider supplied one.
+        OpenAI's envelope has exactly four keys, and a fifth that is usually
+        ``null`` would turn an occasional addition into a permanent change in
+        shape -- every client that validates the envelope would see it on the
+        errors that have nothing extra to say. Omitting it keeps the common case
+        byte-identical to OpenAI and makes its presence mean something.
+        """
+        error: dict[str, object] = {
+            "message": self.message,
+            "type": self.error_type,
+            "param": self.param,
+            "code": self.code,
         }
+        if self.provider_code is not None:
+            error["provider_code"] = self.provider_code
+        return {"error": error}
 
 
 class ValidationError(RouterBaseError):
@@ -182,8 +209,15 @@ class ProviderValidationError(ProviderBaseError):
         error_type: str | None = None,
         code: str | None = None,
         param: str | None = None,
+        provider_code: str | None = None,
     ) -> None:
-        super().__init__(message, error_type=error_type, code=code, param=param)
+        super().__init__(
+            message,
+            error_type=error_type,
+            code=code,
+            param=param,
+            provider_code=provider_code,
+        )
         self.context_length = context_length
 
 
@@ -211,6 +245,7 @@ class ProviderRateLimitError(ProviderBaseError):
         error_type: str | None = None,
         code: str | None = None,
         param: str | None = None,
+        provider_code: str | None = None,
     ) -> None:
         """Record the provider's own retry hint, when it gave one.
 
@@ -220,9 +255,34 @@ class ProviderRateLimitError(ProviderBaseError):
         shorter hint than the configured floor would mean retrying into a rate
         limit, which CONSTITUTION §6.1 prohibits. See
         :class:`~free_router.quota.cooldown.CooldownManager`.
+
+        The hint is also the tiebreak when the wire does not say whether a 429
+        was a burst or a daily cap (A4 item 2): a long hint is evidence of a
+        daily reset, and no hint is not evidence of a burst.
         """
-        super().__init__(message, error_type=error_type, code=code, param=param)
+        super().__init__(
+            message,
+            error_type=error_type,
+            code=code,
+            param=param,
+            provider_code=provider_code,
+        )
         self.retry_after = retry_after
+
+
+class ProviderDailyQuotaExhaustedError(ProviderRateLimitError):
+    """The provider's **daily** budget is spent, not a transient burst.
+
+    Both look identical on the wire -- the same 429, often the same body -- and
+    only the consequence differs: a burst clears in seconds to minutes, while a
+    daily cap means no retry today can succeed. Reporting them as one code makes
+    an operator's only options "wait and see" and "guess".
+
+    A subclass so every existing handler that treats a rate limit as a rate
+    limit keeps working; the status stays 429.
+    """
+
+    code = "provider_daily_quota_exhausted"
 
 
 class RetriesExhaustedError(ProviderBaseError):
@@ -243,13 +303,22 @@ class RetriesExhaustedError(ProviderBaseError):
 
 
 class ProviderServerError(ProviderBaseError):
-    """The provider returned 5xx; maps to HTTP 502."""
+    """The provider returned 5xx; maps to HTTP 502.
+
+    ``retryable`` is True by default but is not decided here: a ``503`` with an
+    overload signal is a transient upstream problem a second attempt can fix,
+    while a ``500`` from a provider bug will fail identically and cost another
+    call to learn nothing (A4 item 3). The adapter sets it from the response it
+    actually saw, which is the only place that can know.
+    """
 
     code = "provider_server_error"
+    retryable = True
 
 
 class ProviderTimeoutError(ProviderBaseError):
     """The provider did not respond inside the routing envelope; maps to HTTP 504."""
 
     error_type = "timeout_error"
+    retryable = True
     code = "provider_timeout"

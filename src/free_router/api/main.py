@@ -36,6 +36,7 @@ from free_router.core.exceptions import (
     PersistenceUnavailableError,
     ProviderAuthError,
     ProviderBaseError,
+    ProviderDailyQuotaExhaustedError,
     ProviderRateLimitError,
     ProviderServerError,
     ProviderTimeoutError,
@@ -111,6 +112,7 @@ PROVIDER_ERROR_STATUS_MAP: dict[type[RouterBaseError], int] = {
     # by. ProviderValidationError must precede ProviderBaseError's 502 fallback,
     # and ProviderAuthError must precede ProviderValidationError's 400.
     ProviderTimeoutError: 504,
+    ProviderDailyQuotaExhaustedError: 429,
     ProviderRateLimitError: 429,
     NoAvailableCapacityError: 503,
     PersistenceUnavailableError: 503,

@@ -8,8 +8,9 @@ Fixture shapes here are taken from Mistral's published OpenAPI spec
   already ``stop`` and the content lives at ``choices[0].message.content``.
 - ``ERROR_BODY`` mirrors the documented error envelope,
   ``{object, message, type, param, code}``, which is the same shape this router
-  emits. There is deliberately no assertion that the adapter parses it: Mistral
-  status codes already distinguish the cases, so the body is never read.
+  emits. Its ``code`` is read for ``provider_code`` (T060), so a client can tell
+  a credential problem from a payload problem; the ``message`` is never read,
+  because it can echo prompt content.
 - ``VALIDATION_BODY_422`` mirrors the spec's ``HTTPValidationError``, which is
   FastAPI-shaped (``{detail: [...]}``) and *not* the documented envelope. A
   422 therefore cannot be classified by parsing the body.
