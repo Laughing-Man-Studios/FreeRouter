@@ -748,7 +748,7 @@ remaining work with no issue of its own)
   `4xx`, `5xx`, timeout, **mid-stream interruption**, and **post-restart behaviour**,
   per provider. Recorded with conditions, not as pass/fail assertions alone.
 
-- [ ] **T062: Re-measure the success rate, streamed and unstreamed separately.**
+- [x] **T062: Re-measure the success rate, streamed and unstreamed separately.**
   M1's 100/100 covers unary requests only. Streaming holds connections open longer,
   so the same fault rate produces more interruptions — and interruption after the
   first chunk is **not** recoverable by retry. Reusing M1's figure for streamed
@@ -756,6 +756,63 @@ remaining work with no issue of its own)
 
   Record per `spec.md` § *Measuring the success rate*, including request volume and
   whether the window coincided with console-reported usage.
+
+  **Measured 2026-10-30, 17:19–17:24 UTC**, against the live Google free tier
+  through the router on `127.0.0.1:8111` (shipped model, console-sourced quota
+  dimensions declared: 15 RPM, 250k TPM, 500 RPD).
+
+  | Mode | Volume | Successes | Rate | Median latency | Max |
+  | :--- | ---: | ---: | ---: | ---: | ---: |
+  | Unary | 20 | 19 | **95%** | 0.93 s | 3.99 s |
+  | Streamed | 20 | 20 | **100%** | 0.85 s | 9.33 s |
+
+  Zero streams were interrupted: every one ended with `data: [DONE]`, carried
+  real provider usage on the final chunk, and arrived in 4 chunks. Requests were
+  sequential with a 4.5 s minimum gap, so the window sits at ~13 RPM — under the
+  measured 15 RPM ceiling by design, not by luck.
+
+  One *attempt* did hit the 5 s window on the streaming leg, and it is worth
+  recording separately from the request-level rate: the router logged
+  `provider_timeout` at exactly 5.0 s, retried, and the retry succeeded in 4.3 s,
+  so the request still counted as a success. Attempt-level timeouts are not
+  request-level failures, and collapsing the two would have made this look like
+  100% first-attempt reliability when it was not.
+
+  **The single unary failure is the interesting result, and it is not a provider
+  fault.** It returned `504 provider_timeout` at 10.21 s after *two* attempts
+  each exceeded the 5 s provider window (`ROUTER_PROVIDER_TIMEOUT`), at which
+  point the 10 s `attempt_budget_seconds` refused a third. Two consecutive
+  latency spikes, not two failures.
+
+  **What that reveals: both paths hit the same 5 s window, but they pay for it
+  differently — which is the opposite of what this task predicted.** T062 assumed
+  streaming would be *less* reliable because it holds connections open longer.
+  The measurement says the reverse. A stream's headers arrive before generation
+  starts, so the 5 s window covers only the handshake and the 120 s read bound
+  then spans generation; a unary `generateContent` sends no headers until
+  generation *finishes*, so its 5 s window is effectively a five-second cap on
+  total generation. A slow handshake costs a stream one cheap retry; a slow
+  generation costs a unary request the entire attempt, and two in a row cost it
+  the request. That asymmetry between the two paths was not designed — it follows
+  from what each provider endpoint does with its headers.
+
+  Two consequences, stated rather than acted on in this batch because both are
+  behaviour changes beyond a measurement task:
+
+  1. `attempt_budget_seconds` (10 s) and the provider window (5 s) mean a unary
+     request whose first two attempts each take over 5 s cannot succeed, however
+     patient the client is. The budget is doing what it says; the 5 s window is
+     the surprising bound.
+  2. A longer unary generation than 5 s is unservable **unary** while the same
+     generation streams fine. Today's prompts completed in 0.6–3.0 s, so it did
+     not bite; earlier measurement recorded generations of 14.7 s, 26.1 s,
+     49.7 s and 66.7 s on larger prompts, which would all have failed unary. That
+     inconsistency is recorded for the milestone report and is **not** fixed here.
+
+  **The console comparison is not done in this entry.** T063 owns it: whether
+  this window's console-reported usage matches the router's counters is a
+  separate reading, and claiming the success rate "coincided with console usage"
+  without reading the console would be an unfounded claim.
 
 - [ ] **T063: Re-run the console cross-check against durable counters** (ADR-0006
   §6), confirming drift has not accumulated.
