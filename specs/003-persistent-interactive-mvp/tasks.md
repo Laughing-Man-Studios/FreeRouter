@@ -760,8 +760,33 @@ remaining work with no issue of its own)
 - [ ] **T063: Re-run the console cross-check against durable counters** (ADR-0006
   §6), confirming drift has not accumulated.
 
-- [ ] **T064: Confirm the §8.3 deviation stays closed** and remove the M1 entry only
+- [x] **T064: Confirm the §8.3 deviation stays closed** and remove the M1 entry only
   once Scenarios 1–4 pass against a real restart.
+
+  **Re-confirmed 2026-10-30.** The restart scenarios were re-run after Batches 4
+  and 5 rather than trusted from their 2026-10-19 pass, because both batches
+  changed the request path and a persistence regression would not announce
+  itself:
+
+  ```text
+  uv run pytest tests/test_quota_persistence.py tests/test_app_persistence_wiring.py
+  18 passed
+  ```
+
+  The tests that matter here run **two separate Python processes** through
+  `tests/restart_helper.py`: one writes state and exits, the second constructs
+  fresh objects and restores from the database. A single process clearing its own
+  objects would pass even if the state only ever lived in memory, which is the
+  failure §8.3 exists to prevent. Covered: a cooldown survives, counters survive,
+  an expired cooldown is not resurrected, a corrupt row degrades rather than
+  crashing startup, suspension is written but not restored, the LRU ordinal is
+  seeded above the restored value, and the event loop keeps ticking under
+  concurrent reservation.
+
+  **The M1 entry stays as it is** — closed, with the removal recorded in
+  `specs/002-mvp-openai-proxy/spec.md` § *Recorded Deviations*. T064 asks to
+  confirm the closure holds, not to re-edit it; removing the record of a closed
+  deviation a second time would erase the evidence that it was ever open.
 
 - [ ] **T065: ~~Revisit OpenHands~~ — DEFERRED to M3 (A1).** The OpenHands objective
   is moved to M3, where capability-aware routing and tool support converge. M2
