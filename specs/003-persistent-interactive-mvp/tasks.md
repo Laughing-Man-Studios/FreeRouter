@@ -744,9 +744,91 @@ remaining work with no issue of its own)
   **Implemented 2026-10-29** on `M2-Batch6-ErrorClassification`. Verification gate
   and the decisions the spec left open are recorded below.
 
-- [ ] **T061: Manual integration-test matrix** (#36 deliverable). Success, `429`,
+- [x] **T061: Manual integration-test matrix** (#36 deliverable). Success, `429`,
   `4xx`, `5xx`, timeout, **mid-stream interruption**, and **post-restart behaviour**,
   per provider. Recorded with conditions, not as pass/fail assertions alone.
+
+  **Run 2026-10-30 20:23–20:26 local (2026-10-31 00:23–00:26 UTC)**, both providers,
+  live keys from the environment. Conditions matter more than the verdicts here, so
+  they are stated per row: the router ran on `127.0.0.1:8113` over a **fresh**
+  database with a config declaring **both** models and **no quota dimensions**.
+
+  Declaring no quota was the point of the `429` row, not laziness. A declared
+  15 RPM would have made the router answer `429` itself and the row would have
+  proved nothing about the provider. With the dimension absent (an unverified limit
+  stays unenforced), the request is forwarded and the provider's own `429` is what
+  surfaces.
+
+  | Row | Provider | Condition | Observed | Verdict |
+  | :--- | :--- | :--- | :--- | :--- |
+  | Success, unary | Google | live, short prompt | `200`, 0.73 s | pass |
+  | Success, streamed | Google | live, `stream: true` | `200`, 4 chunks, `[DONE]`, usage 25, 0.59 s | pass |
+  | Success, unary | Mistral | live, short prompt | `200`, 0.40 s | pass |
+  | Success, streamed | Mistral | live, `stream: true` | `200`, 12 chunks, `[DONE]`, usage 25, 0.53 s | pass |
+  | `4xx` payload | Google | live; assistant-first turn | `400 provider_validation_error`, `provider_code INVALID_ARGUMENT`, 0.23 s | pass |
+  | `4xx` payload | Mistral | live; same body | `400 provider_validation_error`, `provider_code 3230`, 0.36 s | pass |
+  | `400` does not degrade | Google | success issued immediately after the `400` | `200`, 0.64 s; `model_status` remains empty | pass |
+  | Auth `4xx` | Google | live, deliberately invalid key | `401 provider_auth_error`, `provider_code INVALID_ARGUMENT`, 0.10 s | pass |
+  | Auth follow-up | Google | second request, same server | `503 no_available_capacity` in 0.7 ms — the key was suspended by the first rejection | pass, with a consequence (below) |
+  | Auth `4xx` | Mistral | live, deliberately invalid key | `401 provider_auth_error`, 0.19 s | pass |
+  | Auth follow-up | Mistral | second request, same server | `503 no_available_capacity` in 0.6 ms | pass, same consequence |
+  | `429` burst | Google | live, 11 rapid sequential requests | #1–8 `200`; #9 `429 provider_rate_limited` + `provider_code RESOURCE_EXHAUSTED` in 0.16 s; #10–11 `429` with **no** `provider_code` in ~1 ms | pass |
+  | `429` burst | Mistral | live, 16 concurrent requests | 16 × `200` | **not observed** |
+  | Post-restart | Google | restart with a live cooldown in the database | `quota_state_restored ... cooldowns=1 ... keys=2`; `429` in 33 ms while cooling; `200` in 1.66 s after expiry | pass |
+  | `5xx` overload vs defect | both | **injected** (see below) | `503` retried, `500` not; client sees `502` after one attempt | pass, injected |
+  | Timeout | both | **injected** (see below) | `504 provider_timeout`; a mid-stream stall is a timeout, not a `502` | pass, injected |
+  | Mid-stream interruption | both | **injected** (see below) | stream ends without `[DONE]`, no re-dispatch, reservation settled | pass, injected |
+
+  **Injection is named rather than implied.** A live provider will not produce a
+  `500`, a `503`, or a stall on demand, and the adapters reach the provider through
+  module-level base URLs, so there is no supported way to redirect a running
+  process at a fault-injecting proxy. Those three rows are therefore injected at
+  the **httpx transport** (`respx`) and run as tests, which is the same boundary a
+  proxy would stand on:
+
+  ```text
+  uv run pytest tests/test_error_classification.py::test_a_500_is_not_retried \
+    ... tests/test_streaming_route.py::test_a_provider_that_only_ever_returns_nothing_is_reported_as_a_fault
+  11 passed
+  ```
+
+  The set covers `500` not retried and `503` retried, `502` at the client after one
+  attempt on both paths, per-provider retryability, the timeout route mapping, both
+  adapters' mid-stream stall classification, interruption-after-first-chunk with no
+  re-dispatch, and the reservation being settled afterwards. **These rows are
+  recorded as injected, not as observed**, which is the distinction T061 asked for.
+
+  **What the live rows taught that the matrix did not anticipate:**
+
+  1. **`provider_code` turned out to separate "the provider refused" from "we
+     refused".** The first `429` carried `RESOURCE_EXHAUSTED`; the next two, answered
+     locally from the cooldown, carried no `provider_code` at all. That distinction
+     was not designed for this — it falls out of omitting the key when the provider
+     supplied none — but it is the fastest way to tell a client whether waiting can
+     help or the router is simply holding the door shut. It is now the recommended
+     reading and worth keeping in mind before anything makes that key always-present.
+  2. **Google answers a bad API key with HTTP `400 INVALID_ARGUMENT`, not `401`.**
+     The status alone would have classed a credential problem as a payload problem.
+     The adapter's classification is what makes it `provider_auth_error`; a client
+     reading only the status would be misled. This is the clearest live evidence for
+     A4 item 1, which asked for provider codes so a payload problem is
+     distinguishable from a credential problem without parsing prose.
+  3. **Suspending the only key turns the next request into `503`, not `401`.** After
+     the rejection the router reports `no_available_capacity` in under a millisecond.
+     That is the strict reading of "a rejected credential must not be retried", and
+     it is deliberate, but a second request to a misconfigured router therefore
+     looks like a capacity problem rather than a credential problem. Recorded as a
+     known consequence, not changed here: the fix is a startup validation question,
+     not a classification one.
+  4. **The Mistral `429` row was not observed.** Sixteen concurrent requests all
+     returned `200`, so the declared 12.5 RPS limit did not trip under a burst that
+     should have exceeded it. The Mistral rate-limit path therefore rests on the
+     unit coverage above, not on a live observation, and the row says so rather than
+     borrowing Google's result.
+  5. **Mistral's provider codes are numeric strings** (`3230`, `3051`) where Google's
+     are symbolic (`INVALID_ARGUMENT`). Both are surfaced verbatim, which is the
+     contract — the router does not translate a provider's vocabulary, only adds the
+     field.
 
 - [x] **T062: Re-measure the success rate, streamed and unstreamed separately.**
   M1's 100/100 covers unary requests only. Streaming holds connections open longer,
