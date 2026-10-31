@@ -865,10 +865,71 @@ remaining work with no issue of its own)
   **The console comparison is not done in this entry.** T063 owns it: whether
   this window's console-reported usage matches the router's counters is a
   separate reading, and claiming the success rate "coincided with console usage"
-  without reading the console would be an unfounded claim.
+  without reading the console would be an unfounded claim. It was read on the
+  same date and is recorded under T063 below: requests match exactly (50 of 50),
+  errors differ by definition, and the token split is not verifiable.
 
-- [ ] **T063: Re-run the console cross-check against durable counters** (ADR-0006
+- [x] **T063: Re-run the console cross-check against durable counters** (ADR-0006
   §6), confirming drift has not accumulated.
+
+  **Read 2026-10-30 from the Google console** (project *Parashoe*, time range
+  *1 Day*, UTC−8 axis; the only traffic in the window is the one spike at
+  ~09:19–09:33, which is the T062 run plus the post-fix check). Console figures
+  as shown: **Total API Requests 50**, success rate **100%**, *Total API Errors*
+  **"No data available"**, model *Gemini 3.5 Flash Lite*, input tokens peaking at
+  roughly the 1,000 gridline and output tokens just under the 10K gridline. The
+  charts carry no point values, so token readings are chart-resolution only.
+
+  Router side, from the durable counters in the two run databases
+  (`quota_windows`, `resource` = requests/tokens, 86400 s window):
+
+  | Server | Provider calls | Calls with usage | Provider-reported tokens |
+  | :--- | ---: | ---: | ---: |
+  | T062 run (`router.db`) | 48 | 45 | 3,690 |
+  | Post-fix check (`router2.db`) | 2 | 2 | 5,704 |
+  | **Total** | **50** | 47 | **9,394** |
+
+  **Requests: exact, zero drift — but only after saying which number is being
+  compared.** The router's counters held **50** provider calls, matching the
+  console's 50. Those 50 calls served **48 client requests**: one stream attempt
+  timed out at 5.0 s and was retried, and the failed unary request consumed two
+  attempts. The 2-call gap is therefore the retry count, which is the expected
+  difference between "requests the client made" and "requests the provider
+  served". A cross-check that compared the console against 48 would have
+  reported drift where there is none; one that compared against attempts found
+  none. Both numbers are recorded here because the distinction is the whole
+  point of the check.
+
+  Attribution is only partly possible, and that is a finding rather than an
+  omission. 44 client requests are attributable to a recorded run (2 smoke, 40
+  measured, 2 post-fix). The remaining **4** are calls at 17:24:38–17:25:01 UTC
+  carrying 596–732 tokens each, issued after the measurement window closed and
+  **not attributable to any harness run**, because `request_logs` is deferred for
+  this milestone: the counters record that traffic happened, not who asked for
+  it. They are counted in the table above rather than dropped, since dropping
+  them would have manufactured a 46-vs-50 "drift" out of missing bookkeeping.
+
+  **Errors: console 0, router 1, and the gap is definitional, not lost data.**
+  The console's error panel is empty and its success rate is 100%, while the
+  router recorded one `504 provider_timeout`. Both are correct: the router
+  abandoned those calls at its own 5 s deadline, and a client-side abort is not
+  an API error from Google's side — the calls were received, counted, and
+  returned no error status. The practical consequence is worth stating plainly:
+  **the console cannot witness a client-side abort, so it is not an error oracle
+  for this router.** That is precisely the class M2 cares about (an interrupted
+  stream is a client-side abort), which is why the router's own counters, not the
+  console, are the authority for failures.
+
+  **Tokens: totals consistent; the input/output split is not verifiable from the
+  router.** 9,394 provider-reported tokens against a console reading of ≈1K input
+  plus ≈8–9K output agrees at chart resolution. It cannot be checked further
+  because `quota_windows.actual` stores the composed total only —
+  `NormalizedResponse.usage` carries the split per request, but nothing persists
+  it. So a future token audit will have the same limitation; recording it here
+  rather than implying a precision the data does not support.
+
+  **Verdict: no drift on the request dimension (50 of 50), and the two apparent
+  disagreements are explained by definition and by resolution rather than waived.**
 
 - [x] **T064: Confirm the §8.3 deviation stays closed** and remove the M1 entry only
   once Scenarios 1–4 pass against a real restart.
