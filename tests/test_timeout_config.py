@@ -29,15 +29,22 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[pytest.MonkeyPatch]:
 
 
 def test_default_budget_fits_observed_provider_latency() -> None:
-    """The default must exceed real provider header latency.
+    """The default must exceed real provider header latency with real headroom.
 
     Fifteen live calls to gemini-3.5-flash-lite measured p50 743 ms, p90 2332 ms,
     and 2893 ms maximum. The default is deliberately above that maximum: a
     budget the provider cannot meet turns working traffic into 504s, which is
     exactly the defect the original 0.4 s window caused.
+
+    It was 5 s until 2026-10-31, sized from the p90 with 2.1x headroom. T062 then
+    measured one streaming attempt stalling at exactly 5.0 s and recovering on
+    retry -- the retry saved the request, which is why the window is paired with
+    ``attempt_budget_seconds`` rather than raised alone. Ten seconds is 4.3x the
+    p90, which is the margin the tail (cold start, large prompt) needs.
     """
-    assert adapter_module.DEFAULT_PROVIDER_TIMEOUT_SECONDS == 5.0
+    assert adapter_module.DEFAULT_PROVIDER_TIMEOUT_SECONDS == 10.0
     assert adapter_module.PROVIDER_TIMEOUT_SECONDS >= 2.9
+    assert adapter_module.DEFAULT_PROVIDER_TIMEOUT_SECONDS >= 4.0 * 2.332
 
 
 def test_default_exceeds_the_original_budget_by_a_wide_margin() -> None:

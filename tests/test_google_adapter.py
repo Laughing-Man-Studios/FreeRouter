@@ -473,7 +473,8 @@ async def test_asyncio_timeout_is_enforced_on_a_streaming_handshake(
     """
 
     async def _slow_response(_: httpx.Request) -> httpx.Response:
-        await asyncio.sleep(PROVIDER_TIMEOUT_SECONDS * 3)
+        # Only has to outlast the window: asyncio.timeout cancels the sleep.
+        await asyncio.sleep(PROVIDER_TIMEOUT_SECONDS + 1.0)
         return httpx.Response(200, text="")
 
     respx.post(STREAM_URL).mock(side_effect=_slow_response)
@@ -499,7 +500,7 @@ async def test_a_unary_generation_slower_than_the_header_window_succeeds(
     """
 
     async def _slow_generation(_: httpx.Request) -> httpx.Response:
-        await asyncio.sleep(PROVIDER_TIMEOUT_SECONDS * 2)
+        await asyncio.sleep(PROVIDER_TIMEOUT_SECONDS + 0.5)
         return httpx.Response(200, json=SUCCESS_BODY)
 
     respx.post(GENERATE_URL).mock(side_effect=_slow_generation)
@@ -544,5 +545,5 @@ class _SlowBody(httpx.AsyncByteStream):
         self._payload = payload
 
     async def __aiter__(self) -> Any:
-        await asyncio.sleep(PROVIDER_TIMEOUT_SECONDS * 2)
+        await asyncio.sleep(PROVIDER_TIMEOUT_SECONDS + 0.5)
         yield self._payload
