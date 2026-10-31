@@ -508,3 +508,44 @@ def test_a_zero_budget_is_refused() -> None:
 
     with pytest.raises(ValidationError):
         DispatchConfig(attempt_budget_seconds=0)
+
+
+def test_a_budget_that_cannot_cover_a_retry_is_refused() -> None:
+    """The budget gates *starting* an attempt, so it must clear the window.
+
+    A budget at or below the provider handshake window is spent by the first
+    attempt, which makes the second attempt unreachable and ``max_attempts=2``
+    meaningless. Before 2026-10-31 that relationship was documented in prose and
+    held by hand; raising the window from 5 s to 10 s without moving the budget
+    would have disabled retries while every test still passed.
+    """
+    from pydantic import ValidationError
+
+    from free_router.providers.timeout import PROVIDER_TIMEOUT_SECONDS
+
+    minimum = PROVIDER_TIMEOUT_SECONDS + DispatchConfig().backoff_seconds
+
+    assert DispatchConfig(attempt_budget_seconds=minimum).attempt_budget_seconds == minimum
+
+    with pytest.raises(ValidationError, match="second attempt can never start"):
+        DispatchConfig(attempt_budget_seconds=minimum - 0.01)
+
+
+def test_an_override_that_outgrows_the_budget_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deployment override must not disable retries silently either.
+
+    ``ROUTER_PROVIDER_TIMEOUT`` can raise the window past the default budget. The
+    validator reads the value in force at call time rather than a copy bound at
+    import, so the operator gets a startup error naming the conflict instead of a
+    router that quietly never retries.
+    """
+    from pydantic import ValidationError
+
+    import free_router.providers.timeout as timeout_module
+
+    monkeypatch.setattr(timeout_module, "PROVIDER_TIMEOUT_SECONDS", 20.0)
+
+    with pytest.raises(ValidationError, match="second attempt can never start"):
+        DispatchConfig()

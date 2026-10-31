@@ -397,7 +397,7 @@ async def test_the_unary_path_has_no_header_window(
     """
 
     async def _slow_generation(_: httpx.Request) -> httpx.Response:
-        await asyncio.sleep(PROVIDER_TIMEOUT_SECONDS * 2)
+        await asyncio.sleep(PROVIDER_TIMEOUT_SECONDS + 0.5)
         return httpx.Response(200, json=SUCCESS_BODY)
 
     route = respx.post(CHAT_URL).mock(side_effect=_slow_generation)
