@@ -293,11 +293,19 @@ class DispatchConfig(BaseModel):
     """
 
     attempt_budget_seconds: float = Field(default=10.0, gt=0)
-    """Wall-clock ceiling for all attempts of one request.
+    """How long the dispatcher keeps *starting* new attempts, in seconds.
 
-    A second bound alongside the attempt count, because the two fail differently.
-    An attempt budget alone lets a few very slow attempts run long past any
-    sensible client timeout.
+    A second bound alongside the attempt count, because the two fail differently:
+    an attempt count alone lets a few very slow attempts run long past any
+    sensible client deadline.
+
+    It gates **starting** an attempt, not an attempt already in flight. That
+    distinction became load-bearing on 2026-10-30, when the unary path stopped
+    being capped by the 5 s streaming window: a unary generation may now run for
+    as long as the read timeout allows, and this budget decides only whether
+    there is time left to try again after it fails. Reading it as a hard ceiling
+    on total latency would be wrong, and would reintroduce the cap that was just
+    removed.
     """
 
     backoff_seconds: float = Field(default=0.2, ge=0)

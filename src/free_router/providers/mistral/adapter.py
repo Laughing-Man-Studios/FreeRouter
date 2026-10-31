@@ -95,6 +95,17 @@ _FINISH_REASON_MAP: dict[str, FinishReason] = {
 }
 
 
+def _timeout_message(header_window: float | None) -> str:
+    """Describe which bound the provider exceeded.
+
+    The unary path has no header window, so naming a fixed number would
+    misattribute a two-minute wait to a setting that was never applied.
+    """
+    if header_window is None:
+        return "The upstream provider did not respond within the configured read timeout."
+    return f"The upstream provider did not respond within {header_window}s."
+
+
 class MistralAdapter:
     """Dispatch chat completions to the Mistral ``/v1/chat/completions`` API."""
 
@@ -148,7 +159,9 @@ class MistralAdapter:
         debug_payload(
             phase="wire_request", provider="mistral", model=provider_model_id, data=payload
         )
-        response = await self._send(url, headers, payload)
+        # No header window: a unary answer's headers arrive with the answer, so
+        # the read timeout is the bound that fits. See ``_send``.
+        response = await self._send(url, headers, payload, header_window=None)
         raw = await self._read_body(response)
         debug_payload(phase="wire_response", provider="mistral", model=provider_model_id, data=raw)
         return from_mistral_response(raw, provider_model_id)
@@ -220,9 +233,20 @@ class MistralAdapter:
             raise ProviderServerError("The upstream provider stream failed.") from exc
 
     async def _send(
-        self, url: str, headers: dict[str, str], payload: dict[str, Any]
+        self,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, Any],
+        *,
+        header_window: float | None = PROVIDER_TIMEOUT_SECONDS,
     ) -> httpx.Response:
-        """Dispatch under the strict header-receipt timeout.
+        """Dispatch, optionally under the strict header-receipt timeout.
+
+        ``header_window=None`` is used by the unary path: a non-streaming
+        answer's headers arrive with the answer, so bounding them bounds the
+        generation. The read timeout is the bound that fits there. See
+        :mod:`free_router.providers.timeout` and the Google adapter, which
+        carries the fuller explanation of why one number cannot serve both.
 
         Raises:
             ProviderTimeoutError: If connection or headers exceed the budget.
@@ -230,12 +254,14 @@ class MistralAdapter:
         """
         try:
             build = self._http_client.build_request("POST", url, json=payload, headers=headers)
-            async with asyncio.timeout(PROVIDER_TIMEOUT_SECONDS):
-                # stream=True returns once response headers arrive, so the
-                # timeout bounds connection + headers only. The body is read
-                # afterwards, outside this window. See providers.timeout for why
-                # that distinction matters.
+            if header_window is None:
                 response = await self._http_client.send(build, stream=True)
+            else:
+                async with asyncio.timeout(header_window):
+                    # stream=True returns once response headers arrive, so the
+                    # timeout bounds connection + headers only. The body is read
+                    # afterwards, outside this window.
+                    response = await self._http_client.send(build, stream=True)
         except httpx.TimeoutException as exc:
             # Checked before the broader httpx.HTTPError below, since a timeout
             # is a subclass of it and must map to 504, not 502.
@@ -243,9 +269,7 @@ class MistralAdapter:
                 "provider_timeout",
                 extra={"event": "provider_timeout", "error_category": "provider_timeout"},
             )
-            raise ProviderTimeoutError(
-                f"The upstream provider did not respond within {PROVIDER_TIMEOUT_SECONDS}s."
-            ) from exc
+            raise ProviderTimeoutError(_timeout_message(header_window)) from exc
         except httpx.HTTPError as exc:
             # Transport failures (connection refused, DNS, TLS, reset) are
             # raised as exceptions rather than returned as responses, so they
@@ -268,9 +292,7 @@ class MistralAdapter:
                 "provider_timeout",
                 extra={"event": "provider_timeout", "error_category": "provider_timeout"},
             )
-            raise ProviderTimeoutError(
-                f"The upstream provider did not respond within {PROVIDER_TIMEOUT_SECONDS}s."
-            ) from exc
+            raise ProviderTimeoutError(_timeout_message(header_window)) from exc
 
         try:
             return await _raise_for_status(response)

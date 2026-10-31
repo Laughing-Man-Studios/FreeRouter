@@ -744,11 +744,93 @@ remaining work with no issue of its own)
   **Implemented 2026-10-29** on `M2-Batch6-ErrorClassification`. Verification gate
   and the decisions the spec left open are recorded below.
 
-- [ ] **T061: Manual integration-test matrix** (#36 deliverable). Success, `429`,
+- [x] **T061: Manual integration-test matrix** (#36 deliverable). Success, `429`,
   `4xx`, `5xx`, timeout, **mid-stream interruption**, and **post-restart behaviour**,
   per provider. Recorded with conditions, not as pass/fail assertions alone.
 
-- [ ] **T062: Re-measure the success rate, streamed and unstreamed separately.**
+  **Run 2026-10-30 20:23–20:26 local (2026-10-31 00:23–00:26 UTC)**, both providers,
+  live keys from the environment. Conditions matter more than the verdicts here, so
+  they are stated per row: the router ran on `127.0.0.1:8113` over a **fresh**
+  database with a config declaring **both** models and **no quota dimensions**.
+
+  Declaring no quota was the point of the `429` row, not laziness. A declared
+  15 RPM would have made the router answer `429` itself and the row would have
+  proved nothing about the provider. With the dimension absent (an unverified limit
+  stays unenforced), the request is forwarded and the provider's own `429` is what
+  surfaces.
+
+  | Row | Provider | Condition | Observed | Verdict |
+  | :--- | :--- | :--- | :--- | :--- |
+  | Success, unary | Google | live, short prompt | `200`, 0.73 s | pass |
+  | Success, streamed | Google | live, `stream: true` | `200`, 4 chunks, `[DONE]`, usage 25, 0.59 s | pass |
+  | Success, unary | Mistral | live, short prompt | `200`, 0.40 s | pass |
+  | Success, streamed | Mistral | live, `stream: true` | `200`, 12 chunks, `[DONE]`, usage 25, 0.53 s | pass |
+  | `4xx` payload | Google | live; assistant-first turn | `400 provider_validation_error`, `provider_code INVALID_ARGUMENT`, 0.23 s | pass |
+  | `4xx` payload | Mistral | live; same body | `400 provider_validation_error`, `provider_code 3230`, 0.36 s | pass |
+  | `400` does not degrade | Google | success issued immediately after the `400` | `200`, 0.64 s; `model_status` remains empty | pass |
+  | Auth `4xx` | Google | live, deliberately invalid key | `401 provider_auth_error`, `provider_code INVALID_ARGUMENT`, 0.10 s | pass |
+  | Auth follow-up | Google | second request, same server | `503 no_available_capacity` in 0.7 ms — the key was suspended by the first rejection | pass, with a consequence (below) |
+  | Auth `4xx` | Mistral | live, deliberately invalid key | `401 provider_auth_error`, 0.19 s | pass |
+  | Auth follow-up | Mistral | second request, same server | `503 no_available_capacity` in 0.6 ms | pass, same consequence |
+  | `429` burst | Google | live, 11 rapid sequential requests | #1–8 `200`; #9 `429 provider_rate_limited` + `provider_code RESOURCE_EXHAUSTED` in 0.16 s; #10–11 `429` with **no** `provider_code` in ~1 ms | pass |
+  | `429` burst | Mistral | live, 16 concurrent requests | 16 × `200` | **not observed** |
+  | Post-restart | Google | restart with a live cooldown in the database | `quota_state_restored ... cooldowns=1 ... keys=2`; `429` in 33 ms while cooling; `200` in 1.66 s after expiry | pass |
+  | `5xx` overload vs defect | both | **injected** (see below) | `503` retried, `500` not; client sees `502` after one attempt | pass, injected |
+  | Timeout | both | **injected** (see below) | `504 provider_timeout`; a mid-stream stall is a timeout, not a `502` | pass, injected |
+  | Mid-stream interruption | both | **injected** (see below) | stream ends without `[DONE]`, no re-dispatch, reservation settled | pass, injected |
+
+  **Injection is named rather than implied.** A live provider will not produce a
+  `500`, a `503`, or a stall on demand, and the adapters reach the provider through
+  module-level base URLs, so there is no supported way to redirect a running
+  process at a fault-injecting proxy. Those three rows are therefore injected at
+  the **httpx transport** (`respx`) and run as tests, which is the same boundary a
+  proxy would stand on:
+
+  ```text
+  uv run pytest tests/test_error_classification.py::test_a_500_is_not_retried \
+    ... tests/test_streaming_route.py::test_a_provider_that_only_ever_returns_nothing_is_reported_as_a_fault
+  11 passed
+  ```
+
+  The set covers `500` not retried and `503` retried, `502` at the client after one
+  attempt on both paths, per-provider retryability, the timeout route mapping, both
+  adapters' mid-stream stall classification, interruption-after-first-chunk with no
+  re-dispatch, and the reservation being settled afterwards. **These rows are
+  recorded as injected, not as observed**, which is the distinction T061 asked for.
+
+  **What the live rows taught that the matrix did not anticipate:**
+
+  1. **`provider_code` turned out to separate "the provider refused" from "we
+     refused".** The first `429` carried `RESOURCE_EXHAUSTED`; the next two, answered
+     locally from the cooldown, carried no `provider_code` at all. That distinction
+     was not designed for this — it falls out of omitting the key when the provider
+     supplied none — but it is the fastest way to tell a client whether waiting can
+     help or the router is simply holding the door shut. It is now the recommended
+     reading and worth keeping in mind before anything makes that key always-present.
+  2. **Google answers a bad API key with HTTP `400 INVALID_ARGUMENT`, not `401`.**
+     The status alone would have classed a credential problem as a payload problem.
+     The adapter's classification is what makes it `provider_auth_error`; a client
+     reading only the status would be misled. This is the clearest live evidence for
+     A4 item 1, which asked for provider codes so a payload problem is
+     distinguishable from a credential problem without parsing prose.
+  3. **Suspending the only key turns the next request into `503`, not `401`.** After
+     the rejection the router reports `no_available_capacity` in under a millisecond.
+     That is the strict reading of "a rejected credential must not be retried", and
+     it is deliberate, but a second request to a misconfigured router therefore
+     looks like a capacity problem rather than a credential problem. Recorded as a
+     known consequence, not changed here: the fix is a startup validation question,
+     not a classification one.
+  4. **The Mistral `429` row was not observed.** Sixteen concurrent requests all
+     returned `200`, so the declared 12.5 RPS limit did not trip under a burst that
+     should have exceeded it. The Mistral rate-limit path therefore rests on the
+     unit coverage above, not on a live observation, and the row says so rather than
+     borrowing Google's result.
+  5. **Mistral's provider codes are numeric strings** (`3230`, `3051`) where Google's
+     are symbolic (`INVALID_ARGUMENT`). Both are surfaced verbatim, which is the
+     contract — the router does not translate a provider's vocabulary, only adds the
+     field.
+
+- [x] **T062: Re-measure the success rate, streamed and unstreamed separately.**
   M1's 100/100 covers unary requests only. Streaming holds connections open longer,
   so the same fault rate produces more interruptions — and interruption after the
   first chunk is **not** recoverable by retry. Reusing M1's figure for streamed
@@ -757,11 +839,207 @@ remaining work with no issue of its own)
   Record per `spec.md` § *Measuring the success rate*, including request volume and
   whether the window coincided with console-reported usage.
 
-- [ ] **T063: Re-run the console cross-check against durable counters** (ADR-0006
+  **Measured 2026-10-30, 17:19–17:24 UTC**, against the live Google free tier
+  through the router on `127.0.0.1:8111` (shipped model, console-sourced quota
+  dimensions declared: 15 RPM, 250k TPM, 500 RPD).
+
+  | Mode | Volume | Successes | Rate | Median latency | Max |
+  | :--- | ---: | ---: | ---: | ---: | ---: |
+  | Unary | 20 | 19 | **95%** | 0.93 s | 3.99 s |
+  | Streamed | 20 | 20 | **100%** | 0.85 s | 9.33 s |
+
+  Zero streams were interrupted: every one ended with `data: [DONE]`, carried
+  real provider usage on the final chunk, and arrived in 4 chunks. Requests were
+  sequential with a 4.5 s minimum gap, so the window sits at ~13 RPM — under the
+  measured 15 RPM ceiling by design, not by luck.
+
+  One *attempt* did hit the 5 s window on the streaming leg, and it is worth
+  recording separately from the request-level rate: the router logged
+  `provider_timeout` at exactly 5.0 s, retried, and the retry succeeded in 4.3 s,
+  so the request still counted as a success. Attempt-level timeouts are not
+  request-level failures, and collapsing the two would have made this look like
+  100% first-attempt reliability when it was not.
+
+  **The single unary failure is the interesting result, and it is not a provider
+  fault.** It returned `504 provider_timeout` at 10.21 s after *two* attempts
+  each exceeded the 5 s provider window (`ROUTER_PROVIDER_TIMEOUT`), at which
+  point the 10 s `attempt_budget_seconds` refused a third. Two consecutive
+  latency spikes, not two failures.
+
+  **What that reveals: both paths hit the same 5 s window, but they pay for it
+  differently — which is the opposite of what this task predicted.** T062 assumed
+  streaming would be *less* reliable because it holds connections open longer.
+  The measurement says the reverse. A stream's headers arrive before generation
+  starts, so the 5 s window covers only the handshake and the 120 s read bound
+  then spans generation; a unary `generateContent` sends no headers until
+  generation *finishes*, so its 5 s window is effectively a five-second cap on
+  total generation. A slow handshake costs a stream one cheap retry; a slow
+  generation costs a unary request the entire attempt, and two in a row cost it
+  the request. That asymmetry between the two paths was not designed — it follows
+  from what each provider endpoint does with its headers.
+
+  Two consequences followed, both behaviour changes beyond a measurement task:
+
+  1. `attempt_budget_seconds` (10 s) and the provider window (5 s) mean a unary
+     request whose first two attempts each take over 5 s cannot succeed, however
+     patient the client is. The budget is doing what it says; the 5 s window is
+     the surprising bound.
+  2. A longer unary generation than 5 s is unservable **unary** while the same
+     generation streams fine. Today's prompts completed in 0.6–3.0 s, so it did
+     not bite; earlier measurement recorded generations of 14.7 s, 26.1 s,
+     49.7 s and 66.7 s on larger prompts, which would all have failed unary.
+
+  **Fix applied 2026-10-30, in M2, on the user's direction — the window is
+  scoped, not raised.** The instruction was to raise the 5 s window. Raising the
+  constant would have been the wrong fix, and the reason is that the constant
+  was never one policy: it was two phases sharing a transport signal.
+
+  - On `:streamGenerateContent` the headers *are* a handshake. Measured p50
+    743 ms, p90 2332 ms, and one attempt in this run stalled exactly at 5.0 s and
+    recovered on retry for 4.3 s. A short window there is right: it makes a
+    stalled handshake cheap to retry.
+  - On `:generateContent` there is no handshake. The provider sends nothing until
+    the answer exists, so the "header" phase *is* the generation. Bounding it at
+    5 s bounded generation at 5 s, which is why a prompt that streams for 50 s
+    fails unary.
+
+  So `_send` in both adapters now takes `header_window: float | None`, defaults
+  to `PROVIDER_TIMEOUT_SECONDS` (unchanged at 5 s) for the streaming path, and
+  receives `None` from the unary path. A unary request is bounded instead by the
+  configured read timeout (`provider_read_timeout_seconds`, 120 s), which is
+  already the documented span for generation; connection stays bounded by the
+  client's connect timeout (0.25 s), so a dead provider still fails fast. Raising
+  the constant to 120 s would have made a stalled stream hang for two minutes
+  instead of retrying after five seconds; lowering the unary bound to a new
+  separate number would have added a third timeout to a system that already had
+  one too many.
+
+  Verified live on the same server after the change, with a prompt long enough to
+  force a slow generation:
+
+  | Mode | Status | Latency | Attempts |
+  | :--- | :--- | ---: | ---: |
+  | Unary (1,200-word prompt) | `200` | **10.37 s** | 1 |
+  | Streamed (same prompt) | `200`, `[DONE]`, 110 chunks | 9.74 s | 1 |
+
+  The unary row is the regression test in practice: it exceeds the old 5 s
+  window, and before the change it could not have returned `200` at any attempt
+  count. Routing overhead remains irrelevant to these figures; the waiter is the
+  provider.
+
+  Two follow-on edits were required by the change, and both are declared rather
+  than quietly absorbed:
+
+  - `test_asyncio_timeout_is_enforced_on_slow_headers` **asserted the defect** —
+    it drove a slow response at the unary URL and required a
+    `ProviderTimeoutError`, i.e. it pinned the five-second cap on generation. It
+    is now `test_asyncio_timeout_is_enforced_on_a_streaming_handshake` (same
+    assertion, streaming URL), and
+    `test_a_unary_generation_slower_than_the_header_window_succeeds` plus a
+    Mistral equivalent assert the new behaviour.
+  - `attempt_budget_seconds` is documented as gating the **start** of an attempt,
+    not one in flight. That was already true of the code — the deadline is
+    checked before each attempt — but the old wording ("wall-clock ceiling for
+    all attempts") read as a total latency cap, which the unscoped unary path now
+    visibly is not. Correcting the docstring was the point: a budget that reads
+    as a ceiling and behaves as a retry gate is how this trap gets re-set.
+
+  **The console comparison is not done in this entry.** T063 owns it: whether
+  this window's console-reported usage matches the router's counters is a
+  separate reading, and claiming the success rate "coincided with console usage"
+  without reading the console would be an unfounded claim. It was read on the
+  same date and is recorded under T063 below: requests match exactly (50 of 50),
+  errors differ by definition, and the token split is not verifiable.
+
+- [x] **T063: Re-run the console cross-check against durable counters** (ADR-0006
   §6), confirming drift has not accumulated.
 
-- [ ] **T064: Confirm the §8.3 deviation stays closed** and remove the M1 entry only
+  **Read 2026-10-30 from the Google console** (project *Parashoe*, time range
+  *1 Day*, UTC−8 axis; the only traffic in the window is the one spike at
+  ~09:19–09:33, which is the T062 run plus the post-fix check). Console figures
+  as shown: **Total API Requests 50**, success rate **100%**, *Total API Errors*
+  **"No data available"**, model *Gemini 3.5 Flash Lite*, input tokens peaking at
+  roughly the 1,000 gridline and output tokens just under the 10K gridline. The
+  charts carry no point values, so token readings are chart-resolution only.
+
+  Router side, from the durable counters in the two run databases
+  (`quota_windows`, `resource` = requests/tokens, 86400 s window):
+
+  | Server | Provider calls | Calls with usage | Provider-reported tokens |
+  | :--- | ---: | ---: | ---: |
+  | T062 run (`router.db`) | 48 | 45 | 3,690 |
+  | Post-fix check (`router2.db`) | 2 | 2 | 5,704 |
+  | **Total** | **50** | 47 | **9,394** |
+
+  **Requests: exact, zero drift — but only after saying which number is being
+  compared.** The router's counters held **50** provider calls, matching the
+  console's 50. Those 50 calls served **48 client requests**: one stream attempt
+  timed out at 5.0 s and was retried, and the failed unary request consumed two
+  attempts. The 2-call gap is therefore the retry count, which is the expected
+  difference between "requests the client made" and "requests the provider
+  served". A cross-check that compared the console against 48 would have
+  reported drift where there is none; one that compared against attempts found
+  none. Both numbers are recorded here because the distinction is the whole
+  point of the check.
+
+  Attribution is only partly possible, and that is a finding rather than an
+  omission. 44 client requests are attributable to a recorded run (2 smoke, 40
+  measured, 2 post-fix). The remaining **4** are calls at 17:24:38–17:25:01 UTC
+  carrying 596–732 tokens each, issued after the measurement window closed and
+  **not attributable to any harness run**, because `request_logs` is deferred for
+  this milestone: the counters record that traffic happened, not who asked for
+  it. They are counted in the table above rather than dropped, since dropping
+  them would have manufactured a 46-vs-50 "drift" out of missing bookkeeping.
+
+  **Errors: console 0, router 1, and the gap is definitional, not lost data.**
+  The console's error panel is empty and its success rate is 100%, while the
+  router recorded one `504 provider_timeout`. Both are correct: the router
+  abandoned those calls at its own 5 s deadline, and a client-side abort is not
+  an API error from Google's side — the calls were received, counted, and
+  returned no error status. The practical consequence is worth stating plainly:
+  **the console cannot witness a client-side abort, so it is not an error oracle
+  for this router.** That is precisely the class M2 cares about (an interrupted
+  stream is a client-side abort), which is why the router's own counters, not the
+  console, are the authority for failures.
+
+  **Tokens: totals consistent; the input/output split is not verifiable from the
+  router.** 9,394 provider-reported tokens against a console reading of ≈1K input
+  plus ≈8–9K output agrees at chart resolution. It cannot be checked further
+  because `quota_windows.actual` stores the composed total only —
+  `NormalizedResponse.usage` carries the split per request, but nothing persists
+  it. So a future token audit will have the same limitation; recording it here
+  rather than implying a precision the data does not support.
+
+  **Verdict: no drift on the request dimension (50 of 50), and the two apparent
+  disagreements are explained by definition and by resolution rather than waived.**
+
+- [x] **T064: Confirm the §8.3 deviation stays closed** and remove the M1 entry only
   once Scenarios 1–4 pass against a real restart.
+
+  **Re-confirmed 2026-10-30.** The restart scenarios were re-run after Batches 4
+  and 5 rather than trusted from their 2026-10-19 pass, because both batches
+  changed the request path and a persistence regression would not announce
+  itself:
+
+  ```text
+  uv run pytest tests/test_quota_persistence.py tests/test_app_persistence_wiring.py
+  18 passed
+  ```
+
+  The tests that matter here run **two separate Python processes** through
+  `tests/restart_helper.py`: one writes state and exits, the second constructs
+  fresh objects and restores from the database. A single process clearing its own
+  objects would pass even if the state only ever lived in memory, which is the
+  failure §8.3 exists to prevent. Covered: a cooldown survives, counters survive,
+  an expired cooldown is not resurrected, a corrupt row degrades rather than
+  crashing startup, suspension is written but not restored, the LRU ordinal is
+  seeded above the restored value, and the event loop keeps ticking under
+  concurrent reservation.
+
+  **The M1 entry stays as it is** — closed, with the removal recorded in
+  `specs/002-mvp-openai-proxy/spec.md` § *Recorded Deviations*. T064 asks to
+  confirm the closure holds, not to re-edit it; removing the record of a closed
+  deviation a second time would erase the evidence that it was ever open.
 
 - [ ] **T065: ~~Revisit OpenHands~~ — DEFERRED to M3 (A1).** The OpenHands objective
   is moved to M3, where capability-aware routing and tool support converge. M2

@@ -20,6 +20,24 @@ That is why adapters dispatch with ``stream=True`` and read with ``aread()``
 rather than ``client.post()``, which reads the entire body inside the timeout
 and would turn every real completion into a 504.
 
+**It applies to the streaming call only, and that distinction was learned the
+hard way.** "Headers" means the handshake on ``:streamGenerateContent``, which
+arrives in under a second and is exactly what a short window should retry
+cheaply. On ``:generateContent`` there is no handshake: the provider sends
+nothing until the answer exists, so the "header" phase *is* the generation.
+Applying the same 5 s window there capped unary generation at five seconds --
+measured on 2026-10-30 as one `504 provider_timeout` in twenty requests, where
+two attempts of a few seconds each exhausted a 10 s attempt budget. Earlier
+measurement had recorded generations of 14.7 s to 66.7 s, all of which would
+have failed unary while the identical prompt streamed fine.
+
+So the unary path passes ``header_window=None`` and is bounded by the client's
+read timeout, ``provider_read_timeout_seconds`` (120 s, configurable), which is
+the bound that is documented to span generation. A single window cannot mean
+"handshake" and "whole generation" at once; scoping it is the fix, not raising
+it, because raising it would also make a stalled stream hang for a minute
+instead of retrying after five seconds.
+
 ``ROUTER_ROUTING_OVERHEAD_BUDGET_MS`` is deliberately *not* wired up. The
 routing path is far too fast for a 500 ms assertion to ever fire, and the
 mechanism would be dead code. Reintroduce it when routing logic is real.
@@ -36,7 +54,11 @@ __all__ = [
 ]
 
 DEFAULT_PROVIDER_TIMEOUT_SECONDS = 5.0
-"""Default budget for provider connection and response receipt, in seconds.
+"""Default streaming-handshake budget: connection and response headers.
+
+Applies to ``:streamGenerateContent`` / streaming chat completions only. Unary
+requests do not use it (see the module docstring): their headers are the
+generation, and they are bounded by the configured read timeout instead.
 
 Sized from live measurement, not from the routing-overhead target. Fifteen live
 calls to ``gemini-3.5-flash-lite`` measured p50 743 ms, p90 2332 ms, and

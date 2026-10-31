@@ -28,6 +28,7 @@ from free_router.providers.google.adapter import (
 )
 
 GENERATE_URL = f"{GOOGLE_API_BASE}/v1beta/models/gemini-3.5-flash-lite:generateContent"
+STREAM_URL = f"{GOOGLE_API_BASE}/v1beta/models/gemini-3.5-flash-lite:streamGenerateContent?alt=sse"
 
 SUCCESS_BODY: dict[str, Any] = {
     "candidates": [
@@ -455,27 +456,59 @@ async def test_slow_headers_raise_timeout(
 
 
 @respx.mock
-async def test_asyncio_timeout_is_enforced_on_slow_headers(
+async def test_asyncio_timeout_is_enforced_on_a_streaming_handshake(
     http_client: httpx.AsyncClient,
     key: KeyRef,
 ) -> None:
-    """A connection slower than 0.4s is cut off by asyncio.timeout itself.
+    """A stream whose handshake exceeds the window is cut off by asyncio.timeout.
 
     This asserts the real budget rather than trusting the httpx exception path:
     the route sleeps past PROVIDER_TIMEOUT_SECONDS, so only the strict
     asyncio.timeout can produce the failure.
+
+    It moved from the unary URL to the streaming one when the window was scoped
+    (2026-10-30). On the unary URL there *is* no handshake -- Gemini sends no
+    headers until the answer exists -- so the window was bounding generation,
+    and this test was pinning a defect rather than a policy.
     """
 
     async def _slow_response(_: httpx.Request) -> httpx.Response:
         await asyncio.sleep(PROVIDER_TIMEOUT_SECONDS * 3)
-        return httpx.Response(200, json=SUCCESS_BODY)
+        return httpx.Response(200, text="")
 
-    respx.post(GENERATE_URL).mock(side_effect=_slow_response)
+    respx.post(STREAM_URL).mock(side_effect=_slow_response)
+    adapter = GoogleAdapter(http_client=http_client)
 
     with pytest.raises(ProviderTimeoutError):
-        await GoogleAdapter(http_client=http_client).chat_completion(
-            _request(), "gemini-3.5-flash-lite", key
-        )
+        async for _ in adapter.stream_chat_completion(_request(), "gemini-3.5-flash-lite", key):
+            pass
+
+
+@respx.mock
+async def test_a_unary_generation_slower_than_the_header_window_succeeds(
+    http_client: httpx.AsyncClient,
+    key: KeyRef,
+) -> None:
+    """The window bounds a handshake, and a unary request has none.
+
+    ``generateContent`` sends nothing until the answer has been generated, so
+    applying the 5 s window there made every generation longer than five seconds
+    unservable unary while the same prompt streamed fine. Measured live on
+    2026-10-30: one `504 provider_timeout` in twenty requests, from two
+    consecutive attempts each just over the window.
+    """
+
+    async def _slow_generation(_: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(PROVIDER_TIMEOUT_SECONDS * 2)
+        return httpx.Response(200, json=SUCCESS_BODY)
+
+    respx.post(GENERATE_URL).mock(side_effect=_slow_generation)
+
+    result = await GoogleAdapter(http_client=http_client).chat_completion(
+        _request(), "gemini-3.5-flash-lite", key
+    )
+
+    assert result.content == "hello from gemini"
 
 
 @respx.mock
