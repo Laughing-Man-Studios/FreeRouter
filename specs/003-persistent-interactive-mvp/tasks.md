@@ -951,6 +951,42 @@ remaining work with no issue of its own)
   same date and is recorded under T063 below: requests match exactly (50 of 50),
   errors differ by definition, and the token split is not verifiable.
 
+  **Follow-up 2026-10-31: the streaming handshake window is raised to 10 s, and
+  the attempt budget to 15 s.** Scoping the window to streaming (above) fixed the
+  five-second cap on unary generation but left the streaming handshake at 5 s, a
+  value sized from a p90 of 2332 ms with 2.1x headroom. T062 had already caught
+  one attempt stalling at exactly 5.0 s; the retry recovered it, which is the
+  point -- **the retry is the safety net, so the window cannot be raised alone.**
+
+  That is the trap worth recording. `attempt_budget_seconds` gates only whether a
+  new attempt may *start*, never one in flight. Raise the window to 10 s with the
+  budget left at 10 s and the first attempt consumes the budget, the second never
+  starts, and `max_attempts = 2` silently means 1 -- a stall becomes an immediate
+  failure, which is worse than the long wait it was meant to avoid. Nothing would
+  have failed a test.
+
+  So both moved, and the relationship is now enforced rather than described:
+
+  ```text
+  attempt_budget_seconds >= PROVIDER_TIMEOUT_SECONDS + backoff_seconds
+  15                      >= 10                         + 0.2
+  ```
+
+  A `model_validator` on `DispatchConfig` refuses anything smaller, and
+  `test_a_budget_that_cannot_cover_a_retry_is_refused` pins it at the boundary
+  (exactly the minimum is accepted, one hundredth less is refused). The worst case
+  a client sees is therefore 2 x 10 s + 0.2 s = **20.2 s** before a `504`, still
+  inside a typical 30 s client timeout, with one retry still possible.
+
+  10 s rather than 8 s because the p90 was measured on short prompts: prompt
+  processing happens before a stream produces its first byte, so the tail belongs
+  to cold starts and large prompts, exactly the traffic the p90 does not describe.
+  4.3x the p90 is affordable at this budget; the alternative (8 s / 12 s, 16.2 s
+  worst case) buys four seconds of client patience for 1.6x less tail headroom.
+
+  Unary is untouched by all of this: it has no header window and remains bounded
+  by `provider_read_timeout_seconds` (120 s).
+
 - [x] **T063: Re-run the console cross-check against durable counters** (ADR-0006
   §6), confirming drift has not accumulated.
 

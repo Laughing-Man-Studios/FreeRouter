@@ -292,7 +292,7 @@ class DispatchConfig(BaseModel):
     against a failing provider is precisely that pattern.
     """
 
-    attempt_budget_seconds: float = Field(default=10.0, gt=0)
+    attempt_budget_seconds: float = Field(default=15.0, gt=0)
     """How long the dispatcher keeps *starting* new attempts, in seconds.
 
     A second bound alongside the attempt count, because the two fail differently:
@@ -306,6 +306,14 @@ class DispatchConfig(BaseModel):
     there is time left to try again after it fails. Reading it as a hard ceiling
     on total latency would be wrong, and would reintroduce the cap that was just
     removed.
+
+    Fifteen seconds, not ten, because it has to leave room for a retry **behind
+    the streaming handshake window** (10 s): the budget is checked before an
+    attempt starts, so a budget smaller than the window means the second attempt
+    never begins and ``max_attempts`` silently becomes 1. The relationship is
+    enforced by ``_check_budget_covers_a_retry`` below, which exists because this
+    is exactly the kind of arithmetic that gets retuned in one place and not the
+    other.
     """
 
     backoff_seconds: float = Field(default=0.2, ge=0)
@@ -316,6 +324,39 @@ class DispatchConfig(BaseModel):
     and the cooldown duration governs when capacity returns. The delay here is a
     courtesy to an upstream that may be recovering, not a compliance mechanism.
     """
+
+    @model_validator(mode="after")
+    def _check_budget_covers_a_retry(self) -> DispatchConfig:
+        """Refuse a budget too small to let the second attempt start.
+
+        The dispatcher checks the budget *before* each attempt, so an attempt
+        already running is never truncated. That makes one comparison load
+        bearing: if ``attempt_budget_seconds`` is less than the provider handshake
+        window plus this backoff, the first attempt consumes the budget and the
+        retry the policy promises can never happen. Nothing else in the system
+        would report that -- the request simply fails a little sooner, and
+        ``max_attempts`` quietly means nothing.
+
+        The window is imported inside the method for two reasons: it is resolved
+        from the environment (``ROUTER_PROVIDER_TIMEOUT``) at import time, and
+        reading it here gets the value actually in force rather than a copy bound
+        when this module was first imported. It also keeps ``core`` from taking a
+        module-level dependency on ``providers`` for one number.
+
+        Raises:
+            ValueError: If the budget cannot cover the window plus one backoff.
+        """
+        from free_router.providers.timeout import PROVIDER_TIMEOUT_SECONDS
+
+        minimum = PROVIDER_TIMEOUT_SECONDS + self.backoff_seconds
+        if self.attempt_budget_seconds < minimum:
+            raise ValueError(
+                f"attempt_budget_seconds ({self.attempt_budget_seconds}) must be at "
+                f"least the provider window ({PROVIDER_TIMEOUT_SECONDS}) plus the "
+                f"retry backoff ({self.backoff_seconds}), or the second attempt can "
+                "never start and max_attempts is silently ignored."
+            )
+        return self
 
 
 class Config(BaseSettings):
