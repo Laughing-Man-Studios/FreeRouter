@@ -49,7 +49,9 @@ import httpx
 
 from free_router.core.exceptions import (
     NoAvailableCapacityError,
+    PersistenceUnavailableError,
     ProviderAuthError,
+    ProviderDailyQuotaExhaustedError,
     ProviderRateLimitError,
     ProviderServerError,
     ProviderTimeoutError,
@@ -62,7 +64,8 @@ from free_router.keys.manager import KeyManager
 from free_router.providers.base import build_adapter
 from free_router.quota.breaker import ContextBreaker
 from free_router.quota.cooldown import CooldownManager
-from free_router.quota.tracker import QuotaTracker, estimate_tokens
+from free_router.quota.estimation import estimate_input_tokens
+from free_router.quota.tracker import QuotaTracker
 
 __all__ = ["DispatchOutcome", "Dispatcher"]
 
@@ -85,6 +88,45 @@ class DispatchOutcome:
     attempts: int
     key_aliases: tuple[str, ...]
     failovers: int
+
+
+_DAILY_CAP_HINT_SECONDS = 3_600.0
+"""Shortest provider retry hint treated as evidence of a daily cap.
+
+An hour. Burst windows on these providers are per-second and per-minute, so a
+hint this long is not describing one. Below it the hint says nothing about the
+limit's scope and the router must not guess.
+"""
+
+
+def is_daily_cap(
+    quota: QuotaTracker,
+    provider: str,
+    model_id: str,
+    exc: ProviderRateLimitError,
+) -> bool:
+    """Decide whether a 429 was the day's budget rather than a burst.
+
+    A free function, not a method, because the streaming path must reach the
+    same verdict from the same evidence. Two copies of this rule would drift in
+    the direction that matters least obviously: a burst reported as a daily cap
+    tells a client to give up for the rest of a day it could still use.
+
+    Two pieces of evidence, in order of trust:
+
+    1. The router's own daily request window, when one is configured and
+       exhausted. This is a count the router keeps itself, so it is the
+       strongest claim available.
+    2. The provider's retry hint, when it is at least an hour: nothing but a
+       daily reset waits that long on these providers, and a per-second or
+       per-minute burst window cannot produce it.
+
+    With neither, the answer is "burst", because that is the failure the
+    cooldown already handles.
+    """
+    if quota.daily_requests_exhausted(provider, model_id):
+        return True
+    return exc.retry_after is not None and exc.retry_after >= _DAILY_CAP_HINT_SECONDS
 
 
 class Dispatcher:
@@ -124,6 +166,26 @@ class Dispatcher:
         self._attempt_budget = attempt_budget_seconds
         self._backoff = backoff_seconds
 
+    @property
+    def quota(self) -> QuotaTracker:
+        """The quota tracker. Read-only, for the persistence layer."""
+        return self._quota
+
+    @property
+    def cooldown(self) -> CooldownManager:
+        """The cooldown manager. Read-only, for the persistence layer."""
+        return self._cooldown
+
+    @property
+    def breaker(self) -> ContextBreaker:
+        """The context breaker. Read-only, for the persistence layer."""
+        return self._breaker
+
+    @property
+    def key_manager(self) -> KeyManager:
+        """The credential pool. Read-only, for the persistence layer."""
+        return self._keys
+
     async def dispatch(
         self, request: NormalizedRequest, provider: str, model_id: str
     ) -> DispatchOutcome:
@@ -148,7 +210,10 @@ class Dispatcher:
                 retried.
             RetriesExhaustedError: If attempts were made and all failed.
         """
-        estimated = estimate_tokens(request)
+        # The *input* estimate. The tracker adds the output assumption and
+        # the safety margin; the breaker compares against this figure,
+        # because a context-length refusal is about the prompt.
+        estimated = estimate_input_tokens(request)
         aliases: list[str] = []
         failovers = 0
         last_error: RouterBaseError | None = None
@@ -200,9 +265,20 @@ class Dispatcher:
             except ProviderRateLimitError as exc:
                 # The request was sent, so its quota is spent regardless.
                 await self._quota.reconcile(reservation, None)
-                self._cooldown.enter(
+                await self._cooldown.enter(
                     provider, model_id, provider_hint=exc.retry_after, reason="rate_limited"
                 )
+                # A burst and a daily cap arrive as the same 429 and demand
+                # opposite things from the client: "wait a minute" versus "come
+                # back tomorrow". Reporting both as a rate limit leaves an
+                # operator guessing which.
+                daily = is_daily_cap(self._quota, provider, model_id, exc)
+                if daily:
+                    exc = ProviderDailyQuotaExhaustedError(
+                        f"Model '{model_id}' has exhausted its daily request budget.",
+                        retry_after=exc.retry_after,
+                        provider_code=exc.provider_code,
+                    )
                 last_error = exc
                 logger.info(
                     "provider_rate_limited",
@@ -211,12 +287,13 @@ class Dispatcher:
                         "key_alias": key.alias,
                         "attempt": attempt,
                         "retry_after": exc.retry_after,
+                        "limit_scope": "daily" if daily else "burst",
                     },
                 )
                 # No failover, no retry. The capacity unit is now cooling, and the
                 # next iteration's gate refuses to dispatch. See the module
                 # docstring for why a second key would learn nothing.
-                raise
+                raise exc
 
             except ProviderAuthError as exc:
                 # The credential itself is dead. Suspend it so later requests do
@@ -246,7 +323,7 @@ class Dispatcher:
                     # size rather than rediscovering the limit on every one of
                     # them. Recorded in OUR token estimate, not the provider's
                     # count -- different tokenizers are not comparable.
-                    self._breaker.record_failure(provider, model_id, estimated)
+                    await self._breaker.record_failure(provider, model_id, estimated)
                     logger.info(
                         "model_degraded_for_large_context",
                         extra={
@@ -260,6 +337,22 @@ class Dispatcher:
 
             except (ProviderServerError, ProviderTimeoutError) as exc:
                 await self._quota.reconcile(reservation, None)
+                if not exc.retryable:
+                    # A defect, not overload: the same call will fail the same
+                    # way, and the retry spends quota to learn nothing (A4 item
+                    # 3). The provider's own signal decided this in the adapter;
+                    # the dispatcher only honours it.
+                    logger.info(
+                        "provider_defect",
+                        extra={
+                            "event": "provider_defect",
+                            "key_alias": key.alias,
+                            "attempt": attempt,
+                            "error_category": type(exc).__name__,
+                            "provider_code": exc.provider_code,
+                        },
+                    )
+                    raise
                 last_error = exc
                 failovers += 1
                 logger.info(
@@ -314,6 +407,16 @@ class Dispatcher:
             ProviderRateLimitError: If a rate limit is in force, so the client is
                 told ``429`` rather than a generic ``503``.
         """
+        if self._cooldown.persistence_degraded(provider, model_id):
+            # The router knows a limit on this unit and could not record it, so
+            # it cannot promise to remember it. Dispatching anyway would mean a
+            # restart forgets a limit it was told about -- the overshoot
+            # CONSTITUTION 8.3 exists to prevent.
+            raise PersistenceUnavailableError(
+                f"Model '{model_id}' cannot be served: its rate limit could not be "
+                f"recorded, so the router cannot guarantee to respect it."
+            )
+
         if self._cooldown.is_cooling(provider, model_id):
             remaining = round(self._cooldown.remaining(provider, model_id), 3)
             if remaining > 0:
@@ -335,14 +438,14 @@ class Dispatcher:
 def _usage_from(response: NormalizedResponse) -> int | None:
     """Token usage reported alongside a completion.
 
-    ``NormalizedResponse`` carries no usage field -- M0 does not surface token
-    counts to the client and the spec's OpenAI envelope reports zeros -- so
-    reconciliation receives ``None`` and the reservation's estimate stands.
+    The provider's figure is authoritative when it reports one, and the
+    reservation is settled against it.
 
-    That is the conservative direction: a provider figure is authoritative when
-    present, and assuming the estimate is right when absent costs at most a
-    slightly pessimistic quota count. Adding usage to the normalisation
-    boundary is M2 work, when quota state becomes persistent and the accuracy
-    starts to matter.
+    ``None`` when the provider reported no usage, and that is the conservative
+    direction: the estimate stands rather than capacity being released on the
+    assumption it was unused. Every dispatched attempt consumes quota whether or
+    not it produced output.
     """
-    return None
+    if response.usage is None:
+        return None
+    return response.usage.resolved_total()

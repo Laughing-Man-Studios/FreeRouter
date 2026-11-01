@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -51,12 +52,16 @@ from free_router.core.exceptions import (
 )
 from free_router.core.normalization import (
     FinishReason,
+    NormalizedChunk,
     NormalizedRequest,
     NormalizedResponse,
+    TokenUsage,
 )
 from free_router.keys.manager import KeyRef
+from free_router.providers.sse import SSEDecodeError, iter_sse_data, response_lines
 from free_router.providers.timeout import PROVIDER_TIMEOUT_SECONDS
 from free_router.quota.breaker import is_context_length_error
+from free_router.quota.cooldown import parse_retry_after_seconds
 
 __all__ = [
     "MISTRAL_API_BASE",
@@ -90,8 +95,22 @@ _FINISH_REASON_MAP: dict[str, FinishReason] = {
 }
 
 
+def _timeout_message(header_window: float | None) -> str:
+    """Describe which bound the provider exceeded.
+
+    The unary path has no header window, so naming a fixed number would
+    misattribute a two-minute wait to a setting that was never applied.
+    """
+    if header_window is None:
+        return "The upstream provider did not respond within the configured read timeout."
+    return f"The upstream provider did not respond within {header_window}s."
+
+
 class MistralAdapter:
     """Dispatch chat completions to the Mistral ``/v1/chat/completions`` API."""
+
+    supports_streaming = True
+    """Mistral streams from the same endpoint when the body says ``stream: true``."""
 
     def __init__(self, *, http_client: httpx.AsyncClient) -> None:
         """Store the shared HTTP client.
@@ -140,15 +159,94 @@ class MistralAdapter:
         debug_payload(
             phase="wire_request", provider="mistral", model=provider_model_id, data=payload
         )
-        response = await self._send(url, headers, payload)
+        # No header window: a unary answer's headers arrive with the answer, so
+        # the read timeout is the bound that fits. See ``_send``.
+        response = await self._send(url, headers, payload, header_window=None)
         raw = await self._read_body(response)
         debug_payload(phase="wire_response", provider="mistral", model=provider_model_id, data=raw)
         return from_mistral_response(raw, provider_model_id)
 
+    async def stream_chat_completion(
+        self, request: NormalizedRequest, provider_model_id: str, key: KeyRef
+    ) -> AsyncIterator[NormalizedChunk]:
+        """Stream one completion from Mistral's ``/v1/chat/completions``.
+
+        The streamed and unary calls differ only in the body and how the response
+        is read, so the payload is built by the same translator and then marked
+        as streaming. That keeps the message mapping in one place.
+
+        ``stream_options.include_usage`` is forwarded only when the client asked
+        for it. Mistral reports usage in a stream only on request, unlike Gemini
+        which always does, so forwarding the flag unconditionally would change
+        the provider's payload for a reason the client did not ask for.
+
+        Args:
+            request: The internal normalized request.
+            provider_model_id: The Mistral-side model id.
+            key: The credential to dispatch with.
+
+        Yields:
+            One :class:`NormalizedChunk` per Mistral event carrying text, a finish
+            reason, or usage.
+
+        Raises:
+            ProviderRateLimitError: If Mistral returns 429.
+            ProviderAuthError: If Mistral rejects the API key.
+            ProviderValidationError: If Mistral rejects the payload.
+            ProviderServerError: If Mistral returns 5xx, sends an undecodable
+                event, or the connection fails mid-stream.
+            ProviderTimeoutError: If connection or headers exceed the budget.
+        """
+        url = f"{MISTRAL_API_BASE}{MISTRAL_CHAT_PATH}"
+        headers = {
+            "Authorization": f"Bearer {key.secret.get_secret_value()}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        payload = to_mistral_request(request, provider_model_id)
+        payload["stream"] = True
+        if request.include_usage:
+            payload["stream_options"] = {"include_usage": True}
+
+        # Only the request is logged: a streamed body has no single response to
+        # log, and one line per chunk would be one line per token.
+        debug_payload(
+            phase="wire_request", provider="mistral", model=provider_model_id, data=payload
+        )
+        response = await self._send(url, headers, payload)
+
+        try:
+            async for event in iter_sse_data(response_lines(response)):
+                chunk = _chunk_from_mistral(event)
+                if chunk is not None:
+                    yield chunk
+        except SSEDecodeError as exc:
+            raise ProviderServerError(
+                "The upstream provider returned a stream event that could not be decoded."
+            ) from exc
+        except (httpx.TimeoutException, TimeoutError) as exc:
+            # A mid-stream silence is a timeout, not a server fault: the provider
+            # accepted the request and then stopped sending. Classified
+            # separately so the pre-delivery status is 504 rather than 502.
+            raise ProviderTimeoutError("The upstream provider stream stalled.") from exc
+        except httpx.HTTPError as exc:
+            raise ProviderServerError("The upstream provider stream failed.") from exc
+
     async def _send(
-        self, url: str, headers: dict[str, str], payload: dict[str, Any]
+        self,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, Any],
+        *,
+        header_window: float | None = PROVIDER_TIMEOUT_SECONDS,
     ) -> httpx.Response:
-        """Dispatch under the strict header-receipt timeout.
+        """Dispatch, optionally under the strict header-receipt timeout.
+
+        ``header_window=None`` is used by the unary path: a non-streaming
+        answer's headers arrive with the answer, so bounding them bounds the
+        generation. The read timeout is the bound that fits there. See
+        :mod:`free_router.providers.timeout` and the Google adapter, which
+        carries the fuller explanation of why one number cannot serve both.
 
         Raises:
             ProviderTimeoutError: If connection or headers exceed the budget.
@@ -156,12 +254,14 @@ class MistralAdapter:
         """
         try:
             build = self._http_client.build_request("POST", url, json=payload, headers=headers)
-            async with asyncio.timeout(PROVIDER_TIMEOUT_SECONDS):
-                # stream=True returns once response headers arrive, so the
-                # timeout bounds connection + headers only. The body is read
-                # afterwards, outside this window. See providers.timeout for why
-                # that distinction matters.
+            if header_window is None:
                 response = await self._http_client.send(build, stream=True)
+            else:
+                async with asyncio.timeout(header_window):
+                    # stream=True returns once response headers arrive, so the
+                    # timeout bounds connection + headers only. The body is read
+                    # afterwards, outside this window.
+                    response = await self._http_client.send(build, stream=True)
         except httpx.TimeoutException as exc:
             # Checked before the broader httpx.HTTPError below, since a timeout
             # is a subclass of it and must map to 504, not 502.
@@ -169,9 +269,7 @@ class MistralAdapter:
                 "provider_timeout",
                 extra={"event": "provider_timeout", "error_category": "provider_timeout"},
             )
-            raise ProviderTimeoutError(
-                f"The upstream provider did not respond within {PROVIDER_TIMEOUT_SECONDS}s."
-            ) from exc
+            raise ProviderTimeoutError(_timeout_message(header_window)) from exc
         except httpx.HTTPError as exc:
             # Transport failures (connection refused, DNS, TLS, reset) are
             # raised as exceptions rather than returned as responses, so they
@@ -194,9 +292,7 @@ class MistralAdapter:
                 "provider_timeout",
                 extra={"event": "provider_timeout", "error_category": "provider_timeout"},
             )
-            raise ProviderTimeoutError(
-                f"The upstream provider did not respond within {PROVIDER_TIMEOUT_SECONDS}s."
-            ) from exc
+            raise ProviderTimeoutError(_timeout_message(header_window)) from exc
 
         try:
             return await _raise_for_status(response)
@@ -271,6 +367,83 @@ def to_mistral_request(request: NormalizedRequest, provider_model_id: str) -> di
     return {"model": provider_model_id, "messages": messages, "stream": False}
 
 
+def _chunk_from_mistral(event: dict[str, Any]) -> NormalizedChunk | None:
+    """Translate one Mistral stream event, or drop it if it carries nothing.
+
+    Mistral's chunks are already OpenAI-shaped, so the translation is mostly
+    reading the first choice's ``delta.content``. The role arrives on the first
+    chunk and is deliberately **discarded**: emitting it is the writer's job, so
+    that the role delta appears exactly once regardless of what a provider does.
+
+    A usage-only event has an empty ``choices`` array, which is why the choice
+    handling is guarded rather than indexed.
+
+    Args:
+        event: One decoded ``data:`` payload.
+
+    Returns:
+        The normalized chunk, or ``None`` if the event carries nothing usable.
+    """
+    delta = ""
+    finish_reason: FinishReason | None = None
+
+    choices = event.get("choices") or []
+    if choices and isinstance(choices[0], dict):
+        choice = choices[0]
+        delta_block = choice.get("delta")
+        if isinstance(delta_block, dict):
+            content = delta_block.get("content")
+            if isinstance(content, str):
+                delta = content
+        raw_finish_reason = choice.get("finish_reason")
+        if raw_finish_reason:
+            finish_reason = _FINISH_REASON_MAP.get(str(raw_finish_reason).lower(), "stop")
+
+    usage = _usage_from_mistral(event)
+    if not delta and finish_reason is None and usage is None:
+        return None
+    return NormalizedChunk(delta=delta, finish_reason=finish_reason, usage=usage)
+
+
+def _usage_from_mistral(raw: dict[str, Any]) -> TokenUsage | None:
+    """Translate Mistral's ``usage`` block into token counts.
+
+    Mistral reports the counts as numbers, unlike Gemini's strings.
+
+    Returns ``None`` when the body carries no usage at all, which leaves the
+    reservation's estimate standing rather than releasing capacity that may
+    well have been used.
+    """
+    usage = raw.get("usage")
+    if not isinstance(usage, dict):
+        return None
+
+    def _count(name: str) -> int:
+        value = usage.get(name)
+        if value is None:
+            return 0
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    input_tokens = _count("prompt_tokens")
+    output_tokens = _count("completion_tokens")
+    total = usage.get("total_tokens")
+    try:
+        total_count = None if total is None else max(0, int(total))
+    except (TypeError, ValueError):
+        total_count = None
+
+    if input_tokens == 0 and output_tokens == 0 and total_count is None:
+        return None
+    return TokenUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_count,
+    )
+
+
 def from_mistral_response(raw: dict[str, Any], provider_model_id: str) -> NormalizedResponse:
     """Translate a Mistral response into a :class:`NormalizedResponse`.
 
@@ -313,6 +486,7 @@ def from_mistral_response(raw: dict[str, Any], provider_model_id: str) -> Normal
         content=content,
         model_used=provider_model_id,
         finish_reason=finish_reason,
+        usage=_usage_from_mistral(raw),
     )
 
 
@@ -340,11 +514,11 @@ def body_indicates_context_length_error(raw: bytes) -> bool:
 async def _raise_for_status(response: httpx.Response) -> httpx.Response:
     """Translate a provider status code into the matching router exception.
 
-    The response body is deliberately not read and never echoed into the error
-    message: it can contain a reflected prompt, and this project never logs
-    prompt text. Mistral's envelope does identify auth failures with a
-    ``type`` of ``authentication_error``, but its status codes already
-    distinguish them, so the body is not needed for classification here.
+    The response body is never echoed into the error message: it can contain a
+    reflected prompt, and this project never logs prompt text. It is parsed only
+    for ``provider_code`` -- Mistral's own ``invalid_api_key`` and friends --
+    so a client can tell a credential problem from a payload problem without
+    reading prose (A4 item 1).
 
     The stream is always closed before raising, otherwise the pooled connection
     leaks on every provider error.
@@ -374,17 +548,59 @@ async def _raise_for_status(response: httpx.Response) -> httpx.Response:
     finally:
         await response.aclose()
 
+    provider_code = _mistral_provider_code(raw)
+
     if status == 429:
-        raise ProviderRateLimitError("The upstream provider is rate limiting this key.")
+        # Mistral's hint is a standard ``Retry-After`` header; it does not put a
+        # delay in the body. Used where present, per A4 item 4.
+        raise ProviderRateLimitError(
+            "The upstream provider is rate limiting this key.",
+            retry_after=parse_retry_after_seconds(response.headers),
+            provider_code=provider_code,
+        )
     if status in (401, 403):
-        raise ProviderAuthError("The upstream provider rejected the API credentials.")
+        raise ProviderAuthError(
+            "The upstream provider rejected the API credentials.",
+            provider_code=provider_code,
+        )
     if 400 <= status < 500:
         # 422 is included here: Mistral's OpenAPI spec documents it as a
         # FastAPI-shaped validation error ({detail: [...]}) rather than the
-        # documented {object, message, type, param, code} envelope, so the body
-        # is not parsed for classification.
+        # documented {object, message, type, param, code} envelope, so
+        # ``provider_code`` is simply absent for it.
         raise ProviderValidationError(
             f"The upstream provider rejected the request with status {status}.",
             context_length=body_indicates_context_length_error(raw),
+            provider_code=provider_code,
         )
-    raise ProviderServerError(f"The upstream provider returned status {status}.")
+    # Mistral supplies no in-body retryable signal, so the status is the signal:
+    # 502/503/504 mean "busy", 500 means the service is broken and a retry will
+    # reproduce it (A4 item 3).
+    raise ProviderServerError(
+        f"The upstream provider returned status {status}.",
+        provider_code=provider_code,
+        retryable=status in _RETRYABLE_SERVER_STATUSES,
+    )
+
+
+_RETRYABLE_SERVER_STATUSES = frozenset({502, 503, 504})
+"""HTTP 5xx statuses that mean "busy", not "broken"."""
+
+
+def _mistral_provider_code(raw: bytes) -> str | None:
+    """Read Mistral's error ``code``, e.g. ``invalid_api_key``.
+
+    Falls back to ``type`` because the envelope documents both and older
+    responses populate only the latter. Never returns the ``message``.
+    """
+    try:
+        decoded: Any = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    for key in ("code", "type"):
+        value = decoded.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None

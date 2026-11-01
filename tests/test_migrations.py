@@ -137,16 +137,72 @@ def test_alembic_config_targets_the_requested_database(tmp_path: Path) -> None:
     assert config.get_main_option("sqlalchemy.url") == f"sqlite:///{tmp_path / 'somewhere.db'}"
 
 
-def test_initial_schema_tables_derives_from_the_schema() -> None:
-    """The adoption path's expected set follows the schema, not a literal.
+def test_initial_schema_tables_match_the_initial_revision(tmp_path: Path) -> None:
+    """The adoption path's expected set is the *initial revision's* tables.
 
-    If a table is added to the initial migration, the adoption path must accept
-    it too, or a legitimate pre-Alembic database would stop being adopted.
+    This was previously derived from the current schema, which was correct while
+    there was exactly one revision. Deriving it any longer would be a latent
+    bug: a database from the pre-Alembic era can only ever hold the initial
+    revision's schema, so requiring the later tables would mean such a database
+    was never recognised as adoptable and the upgrade would try to create tables
+    that already existed.
+
+    The set is therefore pinned to the initial revision, and this test checks it
+    against what that revision *actually* creates, so the two cannot drift.
     """
-    from free_router.db.schema import metadata
-    from free_router.migrations import INITIAL_SCHEMA_TABLES
+    from alembic import command
 
-    assert INITIAL_SCHEMA_TABLES == frozenset(t.name for t in metadata.sorted_tables)
+    from free_router.migrations import (
+        INITIAL_REVISION,
+        INITIAL_SCHEMA_TABLES,
+        alembic_config,
+    )
+
+    db_path = tmp_path / "initial.db"
+    command.upgrade(alembic_config(db_path), INITIAL_REVISION)
+
+    engine = create_engine(f"sqlite:///{db_path}", future=True)
+    try:
+        created = {name for name in inspect(engine).get_table_names() if name != "alembic_version"}
+    finally:
+        engine.dispose()
+
+    assert INITIAL_SCHEMA_TABLES == created
+
+
+def test_a_legacy_database_gains_the_tables_added_by_later_revisions(
+    tmp_path: Path,
+) -> None:
+    """A pre-Alembic database is stamped at the initial revision, then upgraded.
+
+    The failure this guards against is subtle and was live until the second
+    revision landed: stamping a legacy database at *head* marks it as already
+    carrying the later tables, and they are then never created. The router would
+    start, find no quota tables, and fail at the first query rather than at
+    startup.
+    """
+
+    legacy = tmp_path / "legacy.db"
+    connection = sqlite3.connect(legacy)
+    try:
+        for statement in LEGACY_SCHEMA:
+            connection.execute(statement)
+        connection.commit()
+    finally:
+        connection.close()
+
+    run_migrations(legacy)
+
+    assert current_revision(legacy) == head_revision()
+
+    engine = create_engine(f"sqlite:///{legacy}", future=True)
+    try:
+        tables = set(inspect(engine).get_table_names())
+    finally:
+        engine.dispose()
+
+    assert {"models", "request_logs"} <= tables
+    assert {"quota_windows", "cooldowns", "model_status", "key_state"} <= tables
 
 
 LEGACY_SCHEMA = (

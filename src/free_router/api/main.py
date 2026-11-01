@@ -26,20 +26,24 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from free_router.api.health import health_router
+from free_router.api.models_route import router as models_router
 from free_router.api.routes import router
 from free_router.core.config import Config, ConfigError, load_config
 from free_router.core.debug_logging import configure_debug_payload_logging
 from free_router.core.dispatch import Dispatcher
 from free_router.core.exceptions import (
     NoAvailableCapacityError,
+    PersistenceUnavailableError,
     ProviderAuthError,
     ProviderBaseError,
+    ProviderDailyQuotaExhaustedError,
     ProviderRateLimitError,
     ProviderServerError,
     ProviderTimeoutError,
     ProviderValidationError,
     RetriesExhaustedError,
     RouterBaseError,
+    StreamingUnsupportedError,
     UnsupportedModelError,
     ValidationError,
 )
@@ -49,14 +53,58 @@ from free_router.keys.manager import KeyManager
 from free_router.quota.breaker import ContextBreaker
 from free_router.quota.cooldown import CooldownManager
 from free_router.quota.dimensions import QuotaDimension
+from free_router.quota.persistence import (
+    PersistenceCoordinator,
+    QuotaStateStore,
+    RestoreReport,
+)
 from free_router.quota.tracker import QuotaTracker
 
 logger = logging.getLogger(__name__)
 
 REQUEST_ID_HEADER = "X-Request-ID"
 
-HTTP_CLIENT_TIMEOUT = httpx.Timeout(connect=0.25, pool=0.05, write=1.0, read=10.0)
-"""Aggressive client timeouts so a hung provider cannot stall the event loop."""
+CONNECT_TIMEOUT_SECONDS = 0.25
+"""How long a TCP+TLS connection to a provider may take.
+
+A constant, not configuration: it describes the router's own local connection
+behaviour, which does not vary by orders of magnitude between deployments.
+"""
+
+POOL_TIMEOUT_SECONDS = 0.05
+"""How long to wait for a free connection from the pool."""
+
+WRITE_TIMEOUT_SECONDS = 1.0
+"""How long sending the request body may take.
+
+The bodies here are small -- a chat completion request, not an upload -- so this
+is generous by an order of magnitude.
+"""
+
+
+def http_client_timeout(config: Config) -> httpx.Timeout:
+    """Build the provider client's timeout.
+
+    **Only ``read`` is configuration.** ``connect``, ``pool`` and ``write``
+    describe the router's own connection behaviour and are stable constants.
+    ``read`` spans the provider's *generation*, which is unbounded in principle
+    and is the only phase that varies by orders of magnitude -- a value baked
+    into the source meant a slow provider produced a 504 on every request with
+    no way to adjust it short of a rebuild.
+
+    Args:
+        config: The validated configuration.
+
+    Returns:
+        The timeout applied to the shared provider client.
+    """
+    return httpx.Timeout(
+        connect=CONNECT_TIMEOUT_SECONDS,
+        pool=POOL_TIMEOUT_SECONDS,
+        write=WRITE_TIMEOUT_SECONDS,
+        read=config.provider_read_timeout_seconds,
+    )
+
 
 PROVIDER_ERROR_STATUS_MAP: dict[type[RouterBaseError], int] = {
     # Order is significant: _status_for returns the first isinstance match, so
@@ -64,12 +112,15 @@ PROVIDER_ERROR_STATUS_MAP: dict[type[RouterBaseError], int] = {
     # by. ProviderValidationError must precede ProviderBaseError's 502 fallback,
     # and ProviderAuthError must precede ProviderValidationError's 400.
     ProviderTimeoutError: 504,
+    ProviderDailyQuotaExhaustedError: 429,
     ProviderRateLimitError: 429,
     NoAvailableCapacityError: 503,
+    PersistenceUnavailableError: 503,
     RetriesExhaustedError: 503,
     ProviderAuthError: 401,
     ProviderValidationError: 400,
     ProviderServerError: 502,
+    StreamingUnsupportedError: 400,
     ValidationError: 400,
     UnsupportedModelError: 400,
 }
@@ -97,18 +148,56 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.config = await _startup_step("config_invalid", _load_config)
     app.state.db_engine = await _startup_step("database_init_failed", _init_database)
 
+    # The store is built over the lifespan-owned engine, so every component that
+    # writes through to durable state shares one connection pool and one file.
+    quota_store = QuotaStateStore(app.state.db_engine)
+
     # Built after the HTTP client so the dispatcher can hold it, and after config
     # so a missing credential has already aborted startup. Every collaborator is
     # constructed once and shared: each holds in-memory state that a per-request
     # construction would silently discard, which would defeat the quota
     # reservation cycle entirely.
-    app.state.http_client = httpx.AsyncClient(timeout=HTTP_CLIENT_TIMEOUT)
-    app.state.dispatcher = _build_dispatcher(app.state.config, app.state.http_client)
+    app.state.http_client = httpx.AsyncClient(timeout=http_client_timeout(app.state.config))
+    app.state.dispatcher = _build_dispatcher(app.state.config, app.state.http_client, quota_store)
+
+    # Restored **before** the listener accepts anything. A request dispatched
+    # against an unrestored counter would spend capacity the router believes it
+    # has, which is the overshoot CONSTITUTION 8.3 exists to prevent. Nothing
+    # below this line can run in parallel with a served request, because the
+    # listener does not start until the lifespan yields.
+    restore_report = await _restore_quota_state(quota_store, app.state.dispatcher)
+    # The counts go in the message rather than in ``extra``: CONSTITUTION 9.1's
+    # operational allowlist is closed and deliberately so, and a restore summary
+    # is a startup line rather than request telemetry. Degradation is the part
+    # that needs to be machine-readable, and it is logged below with
+    # ``error_category``, which the allowlist does carry.
+    logger.info(
+        "quota_state_restored %s",
+        restore_report.describe(),
+        extra={"event": "quota_state_restored"},
+    )
+
+    # Counters and LRU ordinals batch behind the flush interval (B2). Cooldowns
+    # and status transitions do not: they write through the moment they are set,
+    # because a forgotten cooldown makes the router contact a provider that has
+    # just refused it.
+    app.state.persistence = PersistenceCoordinator(
+        quota_store,
+        snapshot=lambda: _quota_snapshot(app.state.dispatcher),
+        flush_interval=app.state.config.quota_flush_interval_seconds,
+    )
+    app.state.persistence.start()
+
     logger.info("startup_completed", extra={"event": "startup_completed"})
 
     try:
         yield
     finally:
+        # The final flush happens here: a clean shutdown should not be able to
+        # lose the last interval of counters.
+        coordinator: PersistenceCoordinator | None = getattr(app.state, "persistence", None)
+        if coordinator is not None:
+            await coordinator.stop()
         client: httpx.AsyncClient | None = getattr(app.state, "http_client", None)
         if client is not None:
             await client.aclose()
@@ -124,12 +213,21 @@ async def _load_config() -> Config:
     return load_config()
 
 
-def _build_dispatcher(config: Config, http_client: httpx.AsyncClient) -> Dispatcher:
+def _build_dispatcher(
+    config: Config, http_client: httpx.AsyncClient, store: QuotaStateStore
+) -> Dispatcher:
     """Construct the dispatcher's whole object graph from configuration.
 
     Runs after configuration so a declared alias with no credential has already
     failed startup: an unusable key is discovered before the process serves
     traffic, not as a 401 on the first request.
+
+    Args:
+        config: The validated configuration.
+        http_client: The lifespan-owned client shared by every adapter.
+        store: The durable store. Cooldowns and status transitions write through
+            it the moment they are set, so a restart cannot resurrect a provider
+            the router had already learned to avoid.
     """
     dimensions: Mapping[tuple[str, str], tuple[QuotaDimension, ...]] = {
         (entry.provider, entry.provider_id): tuple(entry.quota) for entry in config.models
@@ -139,14 +237,91 @@ def _build_dispatcher(config: Config, http_client: httpx.AsyncClient) -> Dispatc
     }
     return Dispatcher(
         key_manager=KeyManager(config.resolve_key_material()),
-        quota=QuotaTracker(dimensions, safety_margin=config.quota.estimation_safety_margin),
-        cooldown=CooldownManager(durations=durations),
-        breaker=ContextBreaker(),
+        quota=QuotaTracker(
+            dimensions,
+            safety_margin=config.quota.estimation_safety_margin,
+            output_token_assumption=config.quota.output_token_assumption,
+        ),
+        cooldown=CooldownManager(
+            durations=durations,
+            store=store,
+            max_cooldown_seconds=config.max_cooldown_seconds,
+        ),
+        breaker=ContextBreaker(store=store),
         http_client=http_client,
         max_attempts=config.dispatch.max_attempts,
         attempt_budget_seconds=config.dispatch.attempt_budget_seconds,
         backoff_seconds=config.dispatch.backoff_seconds,
     )
+
+
+async def _restore_quota_state(store: QuotaStateStore, dispatcher: Dispatcher) -> RestoreReport:
+    """Restore every component's durable state before the listener serves.
+
+    Each table is loaded and handed to the component that owns it; the store
+    never interprets a field. A failure to load one table degrades that unit to
+    in-memory accounting and is recorded, rather than failing startup -- an
+    unreadable row must not make the router unavailable.
+
+    Args:
+        store: The durable store.
+        dispatcher: The object graph whose components own the restored state.
+
+    Returns:
+        What was actually recovered, so startup can report it rather than
+        assume it.
+    """
+    report = RestoreReport()
+
+    try:
+        rows = await store.load_windows()
+        dispatcher.quota.import_windows(rows)
+        report.windows = len(rows)
+        report.window_entries = sum(
+            len(row.get("entries", ())) for row in rows if isinstance(row, dict)
+        )
+    except Exception as exc:
+        report.degraded.append(f"windows:{type(exc).__name__}")
+
+    try:
+        report.cooldowns = dispatcher.cooldown.import_cooldowns(await store.load_cooldowns())
+    except Exception as exc:
+        report.degraded.append(f"cooldowns:{type(exc).__name__}")
+
+    try:
+        report.model_status = dispatcher.breaker.import_status(await store.load_model_status())
+    except Exception as exc:
+        report.degraded.append(f"model_status:{type(exc).__name__}")
+
+    try:
+        report.key_state = await dispatcher.key_manager.import_key_state(
+            await store.load_key_state()
+        )
+    except Exception as exc:
+        report.degraded.append(f"key_state:{type(exc).__name__}")
+
+    for unit in report.degraded:
+        logger.warning(
+            "quota_state_degraded",
+            extra={
+                "event": "quota_state_degraded",
+                "error_category": "persistence_degraded",
+                "error": unit,
+            },
+        )
+
+    return report
+
+
+def _quota_snapshot(
+    dispatcher: Dispatcher,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """The batched state written on each flush: counters and LRU ordinals.
+
+    Read at flush time rather than captured when the loop started, so the write
+    reflects the state as it is now.
+    """
+    return dispatcher.quota.export_windows(), dispatcher.key_manager.export_key_state()
 
 
 async def _init_database() -> AsyncEngine:
@@ -289,6 +464,7 @@ def create_app() -> FastAPI:
     app.middleware("http")(request_context_middleware)
     register_exception_handlers(app)
     app.include_router(health_router)
+    app.include_router(models_router)
     app.include_router(router)
     return app
 
@@ -296,11 +472,11 @@ def create_app() -> FastAPI:
 app = create_app()
 
 __all__ = [
-    "HTTP_CLIENT_TIMEOUT",
     "PROVIDER_ERROR_STATUS_MAP",
     "REQUEST_ID_HEADER",
     "app",
     "create_app",
+    "http_client_timeout",
     "lifespan",
     "register_exception_handlers",
     "request_context_middleware",

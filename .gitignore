@@ -24,3 +24,9 @@ router-scratch.db*
 
 # Docker build output (the Dockerfile itself is tracked)
 .docker/
+
+# Screenshots dropped into the working tree (macOS names them
+# "Screenshot 2026-10-30 at 4.15.52 PM.png"). Evidence belongs in a spec or a
+# task entry as text, not as a binary in the repository root.
+Screenshot*.png
+Screen Shot*.png

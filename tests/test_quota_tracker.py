@@ -20,7 +20,8 @@ from free_router.quota.dimensions import (
     QuotaDimension,
     WindowReset,
 )
-from free_router.quota.tracker import QuotaTracker, Reservation, estimate_tokens
+from free_router.quota.estimation import estimate_input_tokens
+from free_router.quota.tracker import QuotaTracker, Reservation
 
 PROVIDER = "mistral"
 MODEL = "ministral-14b-2512"
@@ -57,10 +58,24 @@ def _tpm(limit: float, provenance: Provenance = Provenance.MEASURED) -> QuotaDim
     )
 
 
-def _tracker(clock: FakeClock, *dimensions: QuotaDimension, margin: float = 1.1) -> QuotaTracker:
+def _tracker(
+    clock: FakeClock,
+    *dimensions: QuotaDimension,
+    margin: float = 1.1,
+    output_assumption: int = 0,
+) -> QuotaTracker:
+    """A tracker over the given dimensions.
+
+    **The output assumption is zero here by default**, so these tests exercise
+    the window mechanics in isolation. The tracker adds the assumption to every
+    reservation, and a default of 1025 would swamp a 100-token budget and make
+    the assertions about window behaviour unreadable. The composition itself is
+    covered by its own tests, in ``test_quota_estimation.py``.
+    """
     return QuotaTracker(
         {(PROVIDER, MODEL): dimensions},
         safety_margin=margin,
+        output_token_assumption=output_assumption,
         clock=clock,
     )
 
@@ -72,14 +87,14 @@ def test_estimate_scales_with_content() -> None:
     short = NormalizedRequest(model="m", messages=[{"role": "user", "content": "hi"}])
     long = NormalizedRequest(model="m", messages=[{"role": "user", "content": "hi" * 1000}])
 
-    assert estimate_tokens(long) > estimate_tokens(short)
+    assert estimate_input_tokens(long) > estimate_input_tokens(short)
 
 
 def test_estimate_is_never_zero() -> None:
     """A zero estimate would reserve nothing and overshoot on the first request."""
     empty = NormalizedRequest(model="m", messages=[{"role": "user", "content": ""}])
 
-    assert estimate_tokens(empty) >= 1
+    assert estimate_input_tokens(empty) >= 1
 
 
 def test_estimate_sums_every_message() -> None:
@@ -92,7 +107,7 @@ def test_estimate_sums_every_message() -> None:
         ],
     )
 
-    assert estimate_tokens(two) == estimate_tokens(one) * 2
+    assert estimate_input_tokens(two) == estimate_input_tokens(one) * 2
 
 
 # --- Step 2: reserve, and the safety margin ---
@@ -326,6 +341,7 @@ async def test_reconcile_of_an_unknown_reservation_is_ignored() -> None:
         identifier=999,
         provider=PROVIDER,
         model_id=MODEL,
+        estimated_input_tokens=10,
         estimated_tokens=10,
         reserved_tokens=11,
         window_start=clock.now,

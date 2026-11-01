@@ -196,8 +196,12 @@ async def test_a_sustained_5xx_surfaces_as_502_not_503(http_client: httpx.AsyncC
     `retries_exhausted` (503) is reserved for never having dispatched at all.
     Reporting an upstream fault as a capacity problem would send an operator
     looking at quota instead of at the provider.
+
+    ``503`` rather than ``500`` since T060: a 503 is overload and is retried,
+    which is what "survived its retries" means. A 500 is a defect and raises on
+    the first attempt, which is covered in ``test_error_classification``.
     """
-    respx.post(GENERATE_URL).mock(return_value=httpx.Response(500, json={}))
+    respx.post(GENERATE_URL).mock(return_value=httpx.Response(503, json={}))
 
     with pytest.raises(ProviderServerError):
         await _dispatcher(http_client).dispatch(_request(), PROVIDER, MODEL)
@@ -424,7 +428,7 @@ async def test_a_degraded_model_refuses_large_requests_without_dispatching(
     route = respx.post(GENERATE_URL).mock(return_value=httpx.Response(200, json=SUCCESS_BODY))
     dispatcher = _dispatcher(http_client)
 
-    dispatcher._breaker.record_failure(PROVIDER, MODEL, 1000)
+    await dispatcher._breaker.record_failure(PROVIDER, MODEL, 1000)
     route.reset()
 
     with pytest.raises(NoAvailableCapacityError):
@@ -438,7 +442,7 @@ async def test_a_degraded_model_still_serves_small_requests(http_client: httpx.A
     """Degradation is size-conditional; blocking small requests would cost quota."""
     route = respx.post(GENERATE_URL).mock(return_value=httpx.Response(200, json=SUCCESS_BODY))
     dispatcher = _dispatcher(http_client)
-    dispatcher._breaker.record_failure(PROVIDER, MODEL, 1000)
+    await dispatcher._breaker.record_failure(PROVIDER, MODEL, 1000)
 
     outcome = await dispatcher.dispatch(_request("hi"), PROVIDER, MODEL)
 
@@ -492,7 +496,7 @@ def test_retry_defaults_are_conservative() -> None:
 
 
 @pytest.mark.parametrize("attempts", [0, -1, 11])
-def test_invalid_attempt_counts_are_refused(attempts: int) -> None:
+async def test_invalid_attempt_counts_are_refused(attempts: int) -> None:
     from pydantic import ValidationError
 
     with pytest.raises(ValidationError):
@@ -504,3 +508,44 @@ def test_a_zero_budget_is_refused() -> None:
 
     with pytest.raises(ValidationError):
         DispatchConfig(attempt_budget_seconds=0)
+
+
+def test_a_budget_that_cannot_cover_a_retry_is_refused() -> None:
+    """The budget gates *starting* an attempt, so it must clear the window.
+
+    A budget at or below the provider handshake window is spent by the first
+    attempt, which makes the second attempt unreachable and ``max_attempts=2``
+    meaningless. Before 2026-10-31 that relationship was documented in prose and
+    held by hand; raising the window from 5 s to 10 s without moving the budget
+    would have disabled retries while every test still passed.
+    """
+    from pydantic import ValidationError
+
+    from free_router.providers.timeout import PROVIDER_TIMEOUT_SECONDS
+
+    minimum = PROVIDER_TIMEOUT_SECONDS + DispatchConfig().backoff_seconds
+
+    assert DispatchConfig(attempt_budget_seconds=minimum).attempt_budget_seconds == minimum
+
+    with pytest.raises(ValidationError, match="second attempt can never start"):
+        DispatchConfig(attempt_budget_seconds=minimum - 0.01)
+
+
+def test_an_override_that_outgrows_the_budget_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deployment override must not disable retries silently either.
+
+    ``ROUTER_PROVIDER_TIMEOUT`` can raise the window past the default budget. The
+    validator reads the value in force at call time rather than a copy bound at
+    import, so the operator gets a startup error naming the conflict instead of a
+    router that quietly never retries.
+    """
+    from pydantic import ValidationError
+
+    import free_router.providers.timeout as timeout_module
+
+    monkeypatch.setattr(timeout_module, "PROVIDER_TIMEOUT_SECONDS", 20.0)
+
+    with pytest.raises(ValidationError, match="second attempt can never start"):
+        DispatchConfig()

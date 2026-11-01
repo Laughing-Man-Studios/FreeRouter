@@ -55,6 +55,7 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.ruff.lint.per-file-ignores]
 # FastAPI's Depends() is declared in argument defaults by design.
 "src/free_router/api/routes.py" = ["B008"]
+"src/free_router/api/models_route.py" = ["B008"]
 
 [tool.mypy]
 python_version = "3.13"

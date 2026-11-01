@@ -44,11 +44,14 @@ model — an intermittent backend limit must not cost permanent availability.
 
 from __future__ import annotations
 
+import logging
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
+
+from free_router.core.timestamps import to_iso
 
 __all__ = [
     "DEFAULT_BREAKER_SECONDS",
@@ -66,6 +69,9 @@ context refusals have been observed clearing on their own within seconds. A long
 breaker would turn a transient backend limit into a sustained outage; a short one
 costs at most a few rejected large requests while it is actually still failing.
 """
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +131,8 @@ class ContextBreaker:
         durations: dict[tuple[str, str], float] | None = None,
         default_duration: float = DEFAULT_BREAKER_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
+        store: Any = None,
     ) -> None:
         """Build a breaker.
 
@@ -136,13 +144,15 @@ class ContextBreaker:
         self._durations = dict(durations or {})
         self._default_duration = default_duration
         self._clock = clock
+        self._wall_clock = wall_clock
+        self._store = store
         self._records: dict[tuple[str, str], ContextBreakerRecord] = {}
 
     def configured_duration(self, provider: str, model_id: str) -> float:
         """The configured degraded duration for a model, or the default."""
         return self._durations.get((provider, model_id), self._default_duration)
 
-    def record_failure(
+    async def record_failure(
         self,
         provider: str,
         model_id: str,
@@ -189,6 +199,7 @@ class ContextBreaker:
             provider_reported_max=reported,
         )
         self._records[key] = record
+        await self._persist(provider, model_id, record)
         return record
 
     def blocks(self, provider: str, model_id: str, estimated_tokens: int) -> bool:
@@ -238,17 +249,102 @@ class ContextBreaker:
             return None
         return record
 
+    # Observed Google messages. Matched as whole phrases rather than loose keywords,
+    # so a prompt that happens to contain "token" cannot degrade a model.
+    #
+    #   "The input token count (5911388) exceeds the maximum number of tokens
+    #    allowed (1048576)."
+    #   "Unable to submit request because the input token count is 40000 but model
+    #    only supports up to 32768"
+    #
+    # Mistral's wording has not been observed and is deliberately NOT guessed. An
+    # unrecognised body leaves the breaker closed, which is M0's existing behaviour.
 
-# Observed Google messages. Matched as whole phrases rather than loose keywords,
-# so a prompt that happens to contain "token" cannot degrade a model.
-#
-#   "The input token count (5911388) exceeds the maximum number of tokens
-#    allowed (1048576)."
-#   "Unable to submit request because the input token count is 40000 but model
-#    only supports up to 32768"
-#
-# Mistral's wording has not been observed and is deliberately NOT guessed. An
-# unrecognised body leaves the breaker closed, which is M0's existing behaviour.
+    def export_status(self) -> list[dict[str, Any]]:
+        """Serialise the breaker's state for persistence.
+
+        Only a *degraded* model is written: the absence of a row means healthy,
+        which is the common case and does not deserve a row per model.
+        """
+        rows: list[dict[str, Any]] = []
+        for (provider, model_id), record in self._records.items():
+            rows.append(
+                {
+                    "provider": provider,
+                    "model_id": model_id,
+                    "status": "degraded",
+                    "detail": record.provider_reported_max is not None
+                    and f"provider_max={record.provider_reported_max}"
+                    or None,
+                    "threshold_tokens": record.threshold_tokens,
+                    "updated_at": to_iso(self._wall_clock()),
+                }
+            )
+        return rows
+
+    def import_status(self, rows: Sequence[Mapping[str, Any]]) -> int:
+        """Restore degraded models from persisted rows.
+
+        A row that is not degraded carries no threshold and so nothing to
+        restore; an unhealthy row is recorded for inspection but does not block
+        requests, because the breaker blocks by *size* and a model with no
+        threshold is not degraded for any size.
+        """
+        now = self._clock()
+        restored = 0
+        for row in rows:
+            provider = row.get("provider")
+            model_id = row.get("model_id")
+            threshold = row.get("threshold_tokens")
+            if not provider or not model_id or threshold is None:
+                continue
+            record = ContextBreakerRecord(
+                provider=str(provider),
+                model_id=str(model_id),
+                threshold_tokens=int(threshold),
+                until=now + self.configured_duration(str(provider), str(model_id)),
+                provider_reported_max=None,
+            )
+            self._records[(provider, model_id)] = record
+            restored += 1
+        return restored
+
+    async def _persist(self, provider: str, model_id: str, record: ContextBreakerRecord) -> None:
+        """Write the degraded status through.
+
+        A degraded model that is forgotten on restart would keep serving
+        requests it has already been shown to fail, which spends quota to
+        rediscover a limit the router already knows.
+        """
+        if self._store is None:
+            return
+        try:
+            await self._store.save_model_status(
+                {
+                    "provider": provider,
+                    "model_id": model_id,
+                    "status": "degraded",
+                    "detail": (
+                        f"provider_max={record.provider_reported_max}"
+                        if record.provider_reported_max is not None
+                        else None
+                    ),
+                    "threshold_tokens": record.threshold_tokens,
+                    "updated_at": to_iso(self._wall_clock()),
+                }
+            )
+        except Exception as exc:
+            logger.warning(
+                "model_status_persist_failed",
+                extra={
+                    "event": "model_status_persist_failed",
+                    "provider": provider,
+                    "model_id": model_id,
+                    "error_category": type(exc).__name__,
+                },
+            )
+
+
 _CONTEXT_LENGTH_PHRASES = (
     "exceeds the maximum number of tokens allowed",
     "model only supports up to",

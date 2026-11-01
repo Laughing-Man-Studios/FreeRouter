@@ -38,19 +38,21 @@ briefly exceed a limit it had already reached. Persistence is M2, and lands
 from __future__ import annotations
 
 import asyncio
-import math
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import ROUND_CEILING, Decimal
 from typing import Any
 
+from free_router.core.timestamps import from_iso, to_iso
 from free_router.quota.dimensions import DimensionResource, QuotaDimension, WindowReset
+from free_router.quota.estimation import (
+    DEFAULT_OUTPUT_TOKEN_ASSUMPTION,
+)
 
 __all__ = [
     "QuotaTracker",
     "Reservation",
-    "estimate_tokens",
 ]
 
 # Rough characters-per-token for English text. Deliberately a constant rather
@@ -60,26 +62,26 @@ __all__ = [
 # with a buffer, not an exact count.
 _CHARS_PER_TOKEN = 4
 
+_IMPLAUSIBLE_ACTUAL_FACTOR = 10
+"""How far above a reservation a reported figure may be before it is doubted.
+
+A per-request count cannot plausibly exceed the reservation by an order of
+magnitude. The threshold is deliberately generous: a legitimate long
+completion must not be mistaken for a cumulative counter, and the cost of
+believing a bad figure is unbounded while the cost of doubting a good one is
+one pessimistic count.
+"""
+
 _PRUNE_THRESHOLD = 256
 """Entry count above which a window is scanned for expired entries."""
 
+_MINIMUM_DAILY_WINDOW_SECONDS = 86_400.0
+"""Shortest window that counts as "daily" when classifying a 429.
 
-def estimate_tokens(request: Any) -> int:
-    """Estimate the prompt tokens a request will consume.
-
-    Args:
-        request: A :class:`~free_router.core.normalization.NormalizedRequest`, or
-            any object exposing a ``messages`` list of ``{role, content}`` dicts.
-
-    Returns:
-        A token estimate. Never zero for a request with any content.
-    """
-    characters = 0
-    for message in getattr(request, "messages", []) or []:
-        content = message.get("content", "") if isinstance(message, dict) else ""
-        if isinstance(content, str):
-            characters += len(content)
-    return max(1, math.ceil(characters / _CHARS_PER_TOKEN))
+A day, by definition. Stated as a threshold rather than imported from the
+dimension module so a provider that declares a slightly shorter day -- a 23-hour
+budget, say -- is still treated as daily, while an hourly window is not.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,8 +100,12 @@ class Reservation:
     identifier: int
     provider: str
     model_id: str
+    estimated_input_tokens: int
+    """The caller's estimate of the request's own tokens."""
     estimated_tokens: int
+    """The total estimate -- input plus the assumed output -- before the margin."""
     reserved_tokens: int
+    """What was actually reserved, after the safety margin."""
     window_start: float
 
     def describe(self) -> str:
@@ -215,6 +221,25 @@ class _Window:
     def _bucket(self, at: float) -> int:
         return int(at // self.dimension.window_seconds)
 
+    def bucket_of(self, at: float) -> int:
+        """The bucket an instant falls in, for a fixed window.
+
+        Public because persistence needs to reason about which bucket a
+        restored reservation belongs to, and reimplementing the arithmetic
+        outside this class is how the two would drift apart.
+        """
+        return self._bucket(at)
+
+    def bucket_end(self, now: float) -> float:
+        """The instant the bucket containing ``now`` ends, for a fixed window.
+
+        This is the boundary the window *actually* honours. It is not a
+        documented boundary it does not: Google's daily allowance resets at
+        midnight Pacific, but nothing here knows about Pacific, so the honest
+        thing to persist is the boundary the code uses.
+        """
+        return (self._bucket(now) + 1) * self.dimension.window_seconds
+
 
 class QuotaTracker:
     """In-memory Level 1 quota accounting.
@@ -231,7 +256,9 @@ class QuotaTracker:
         dimensions_by_model: Mapping[tuple[str, str], Sequence[QuotaDimension]],
         *,
         safety_margin: float = 1.1,
+        output_token_assumption: int = DEFAULT_OUTPUT_TOKEN_ASSUMPTION,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
     ) -> None:
         """Build a tracker over the configured dimensions.
 
@@ -244,6 +271,15 @@ class QuotaTracker:
                 ``estimated_tokens * 1.1`` as its example.
             clock: Monotonic time source, injected so tests do not sleep and so
                 a future implementation is not tied to wall time.
+            wall_clock: Wall-clock source, used only to translate instants to
+                and from the durable form. Durations are always measured on the
+                monotonic clock; the wall clock exists because a monotonic
+                value is only meaningful against the current boot, so a
+                persisted one would restore nonsense after a reboot.
+            output_token_assumption: Tokens assumed for a response that has not
+                been generated yet. The tracker adds it to the caller's *input*
+                estimate, so the caller supplies the part it can see and the
+                tracker owns the part that is policy.
 
         Raises:
             ValueError: If ``safety_margin`` is not greater than 1.0.
@@ -264,7 +300,9 @@ class QuotaTracker:
         # over-reservation, reproducible but for the wrong reason. Decimal keeps
         # the arithmetic exact so the configured margin is the applied margin.
         self._safety_margin = Decimal(str(safety_margin))
+        self._output_token_assumption = max(0, output_token_assumption)
         self._clock = clock
+        self._wall_clock = wall_clock
         self._lock = asyncio.Lock()
         self._next_identifier = 0
         self._pending: dict[int, list[tuple[_Window, _Entry]]] = {}
@@ -293,16 +331,47 @@ class QuotaTracker:
         now = self._clock()
         return all(window.has_room(now, 1.0) for window in self._windows_for(provider, model_id))
 
+    def daily_requests_exhausted(self, provider: str, model_id: str) -> bool:
+        """True when the per-day request budget for a model has no room left.
+
+        This is the only evidence the router owns for separating a daily-cap
+        ``429`` from a burst ``429`` (A4 item 2). The two are identical on the
+        wire, and neither provider publishes a signal that distinguishes them,
+        so the router asks the question it can actually answer: has the window
+        that resets once a day run out?
+
+        A model with no daily request dimension configured answers ``False``.
+        An unverified limit stays unenforced rather than being guessed at, and
+        the caller falls back to the provider's own retry hint.
+
+        Advisory like :meth:`available`: a read without the lock, used to
+        *classify* a refusal the provider has already issued, never to admit or
+        refuse one.
+        """
+        now = self._clock()
+        return any(
+            window.dimension.resource is DimensionResource.REQUESTS
+            and window.dimension.window_seconds >= _MINIMUM_DAILY_WINDOW_SECONDS
+            and not window.has_room(now, 1.0)
+            for window in self._windows_for(provider, model_id)
+        )
+
     async def reserve(
-        self, provider: str, model_id: str, estimated_tokens: int
+        self, provider: str, model_id: str, estimated_input_tokens: int
     ) -> Reservation | None:
         """Reserve capacity for one request, or return ``None`` if none is free.
+
+        The caller supplies the **input** estimate, because that is the part it
+        can see. The tracker adds the output assumption it holds, because that
+        is the part that is policy, and applies the safety margin. Composing it
+        here rather than in the caller means a caller cannot forget the output
+        half the way it could forget the margin.
 
         Args:
             provider: The provider owning the capacity.
             model_id: The provider-native model id.
-            estimated_tokens: Raw token estimate; the safety margin is applied
-                here so a caller cannot forget to.
+            estimated_input_tokens: The caller's estimate of the *request's* own
+                tokens. The output assumption is added on top of it.
 
         Returns:
             The :class:`Reservation`, or ``None`` when a dimension is exhausted.
@@ -310,6 +379,7 @@ class QuotaTracker:
             (``NoAvailableCapacityError``) belongs to Batch 5, which attaches
             cooldown and failover semantics to it.
         """
+        estimated_tokens = estimated_input_tokens + self._output_token_assumption
         reserved_tokens = max(
             1,
             int(
@@ -344,6 +414,7 @@ class QuotaTracker:
             identifier=identifier,
             provider=provider,
             model_id=model_id,
+            estimated_input_tokens=estimated_input_tokens,
             estimated_tokens=estimated_tokens,
             reserved_tokens=reserved_tokens,
             window_start=now,
@@ -364,10 +435,34 @@ class QuotaTracker:
                 # Already reconciled, or never reserved. Idempotent by design so
                 # a retry of the reconcile step cannot double-count.
                 return
-            if actual_tokens is not None:
-                for _window, entry in entries:
-                    entry.actual = float(actual_tokens)
+            if actual_tokens is not None and self._is_plausible(reservation, actual_tokens):
+                for window, entry in entries:
+                    # Only the *token* dimension is corrected. A provider's
+                    # token count says nothing about how many requests were
+                    # made, and the request dimension is exact -- one dispatched
+                    # attempt is one request, whatever the response contained.
+                    # Overwriting it would turn one request into seven.
+                    if not window.dimension.is_requests:
+                        entry.actual = float(actual_tokens)
             del self._pending[reservation.identifier]
+
+    def _is_plausible(self, reservation: Reservation, actual_tokens: int) -> bool:
+        """True when a provider-reported figure looks like a per-request count.
+
+        A cumulative counter reported as if it were per-request would inflate
+        reconciliation without bound -- every request would add the running
+        total to the window. A figure more than an order of magnitude above the
+        reservation is not a per-request count, so the estimate stands.
+
+        **This is a heuristic, and it is recorded as one.** The authoritative
+        check on estimator drift is the console cross-check, which compares
+        accumulated persisted counts against what the provider actually bills.
+        This guard exists to stop one obviously-wrong figure from doing damage
+        before that check runs, not to replace it.
+        """
+        if actual_tokens <= 0:
+            return False
+        return actual_tokens <= reservation.reserved_tokens * _IMPLAUSIBLE_ACTUAL_FACTOR
 
     def used(self, provider: str, model_id: str, resource: DimensionResource) -> float:
         """Current usage for one resource, for logging and diagnostics.
@@ -390,3 +485,144 @@ class QuotaTracker:
         unlimited.
         """
         return self._dimensions.setdefault((provider, model_id), [])
+
+    def export_windows(self) -> list[dict[str, Any]]:
+        """Serialise the window state for persistence.
+
+        The durable form is a list of one row per configured dimension, each
+        carrying the reservations that window has recorded. A reservation keeps
+        its *reserved* amount and its *reported* amount side by side, because
+        collapsing them into one effective figure would make estimator drift
+        unmeasurable after a restart -- and the console cross-check is the only
+        independent check available.
+
+        Timestamps are **wall-clock**, not the monotonic instants the window
+        holds. A monotonic value is only meaningful against the current boot, so
+        persisting one and restoring it after a reboot would restore nonsense.
+        The conversion happens here, at the boundary, rather than leaking into
+        the window logic.
+
+        Returns:
+            One row per dimension that has recorded usage. A window with no
+            entries is skipped: it carries no information, and writing it would
+            put a row in the table for every configured dimension on every
+            shutdown, whether or not the router had served a request.
+        """
+        now = self._clock()
+        offset = self._wall_clock() - now
+        rows: list[dict[str, Any]] = []
+
+        for (provider, model_id), windows in self._dimensions.items():
+            for window in windows:
+                if not window.entries:
+                    continue
+                dimension = window.dimension
+                reset_at: str | None = None
+                if dimension.reset is WindowReset.FIXED:
+                    # The instant the *current* bucket ends, in wall-clock
+                    # terms. This is the boundary the window actually uses, not
+                    # a documented one it does not: the honest thing to persist
+                    # is the boundary the code honours.
+                    # Monotonic to wall-clock is an *addition*: the offset is
+                    # wall_now - mono_now, so mono + offset is the wall
+                    # instant. Subtracting it produced a boundary far in the
+                    # past, which made every fixed window look already-reset
+                    # and silently discarded its restored usage.
+                    boundary = window.bucket_end(now) + offset
+                    reset_at = to_iso(boundary)
+                rows.append(
+                    {
+                        "provider": provider,
+                        "model_id": model_id,
+                        "resource": dimension.resource.value,
+                        "window_seconds": dimension.window_seconds,
+                        "reset_kind": dimension.reset.value,
+                        "reset_at": reset_at,
+                        "entries": [
+                            {
+                                "at": round(entry.at + offset, 6),
+                                "reserved": entry.reserved,
+                                "actual": entry.actual,
+                            }
+                            for entry in window.entries
+                        ],
+                        "flushed_at": to_iso(self._wall_clock()),
+                    }
+                )
+        return rows
+
+    def import_windows(self, rows: Sequence[Mapping[str, Any]]) -> int:
+        """Restore window state from persisted rows.
+
+        The *dimension* is taken from configuration, never from the row: the
+        database records usage, not policy, and a limit that has changed must
+        take effect. A row whose dimension is no longer configured is ignored,
+        which is what ``spec.md`` requires -- state for a dimension that is
+        gone is discarded, not applied to one that remains.
+
+        Entries that fall outside the window they belong to are dropped rather
+        than restored, because they cannot affect any future decision.
+
+        Args:
+            rows: Rows as produced by :meth:`export_windows`.
+
+        Returns:
+            The number of reservations restored.
+        """
+        now = self._clock()
+        offset = self._wall_clock() - now
+        by_key = {
+            (
+                row.get("provider"),
+                row.get("model_id"),
+                row.get("resource"),
+                float(row.get("window_seconds", 0.0)),
+            ): row
+            for row in rows
+        }
+
+        restored = 0
+        for (provider, model_id), windows in self._dimensions.items():
+            for window in windows:
+                dimension = window.dimension
+                row = by_key.get(
+                    (provider, model_id, dimension.resource.value, dimension.window_seconds)
+                )
+                if row is None:
+                    continue
+
+                if dimension.reset is WindowReset.FIXED:
+                    reset_at = row.get("reset_at")
+                    if not reset_at:
+                        # No boundary recorded, so the current bucket's usage
+                        # cannot be identified. Starting from zero is the safe
+                        # direction: it may admit a request the limit has
+                        # already refused, but it never refuses one it should
+                        # admit.
+                        continue
+                    if self._wall_clock() >= from_iso(str(reset_at)):
+                        # The bucket has rolled since the flush. The old usage
+                        # belongs to a window that has reset.
+                        continue
+
+                for entry in row.get("entries") or []:
+                    try:
+                        wall_at = float(entry["at"])
+                        reserved = float(entry["reserved"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    actual = entry.get("actual")
+                    actual_value = None if actual is None else float(actual)
+                    mono_at = wall_at - offset
+
+                    if dimension.reset is WindowReset.FIXED:
+                        if window.bucket_of(mono_at) != window.bucket_of(now):
+                            continue
+                    elif now - mono_at >= dimension.window_seconds:
+                        continue
+
+                    window.entries.append(
+                        _Entry(at=mono_at, reserved=reserved, actual=actual_value)
+                    )
+                    restored += 1
+        return restored

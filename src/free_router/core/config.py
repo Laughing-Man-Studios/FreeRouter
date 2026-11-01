@@ -28,6 +28,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     SecretStr,
     ValidationError,
     field_validator,
@@ -250,6 +251,26 @@ class QuotaConfig(BaseModel):
     reservation cycle exists to prevent.
     """
 
+    output_token_assumption: int = Field(default=1025, ge=0)
+    """Tokens assumed for a response that has not been generated yet (B1).
+
+    The reservation must cover the response as well as the request, because
+    under-reserving output is what breaches a token-per-minute ceiling. The
+    output size is unknowable before dispatch, so it is an **assumption** -- and
+    an assumption hidden inside a constant is a policy nobody can see or change.
+
+    **Global rather than per-model.** It is a policy number, not a measured one;
+    the measured part, the input estimate, is already per-model in effect
+    because it is computed from the request. A per-model value would invite the
+    belief that it is calibrated, and a value that is not calibrated is worse
+    than one that obviously is not.
+
+    1025 is about 6x the measured output of a short-paragraph response -- 146
+    tokens on Gemini, 178 on Mistral -- and roughly 8% of Gemini's 250K TPM
+    ceiling at the 15 RPM burst limit. It is refunded on reconciliation, so
+    over-reserving costs a transient reservation rather than capacity.
+    """
+
 
 class DispatchConfig(BaseModel):
     """Retry budget and failure policy for the dispatch loop.
@@ -271,12 +292,28 @@ class DispatchConfig(BaseModel):
     against a failing provider is precisely that pattern.
     """
 
-    attempt_budget_seconds: float = Field(default=10.0, gt=0)
-    """Wall-clock ceiling for all attempts of one request.
+    attempt_budget_seconds: float = Field(default=15.0, gt=0)
+    """How long the dispatcher keeps *starting* new attempts, in seconds.
 
-    A second bound alongside the attempt count, because the two fail differently.
-    An attempt budget alone lets a few very slow attempts run long past any
-    sensible client timeout.
+    A second bound alongside the attempt count, because the two fail differently:
+    an attempt count alone lets a few very slow attempts run long past any
+    sensible client deadline.
+
+    It gates **starting** an attempt, not an attempt already in flight. That
+    distinction became load-bearing on 2026-10-30, when the unary path stopped
+    being capped by the 5 s streaming window: a unary generation may now run for
+    as long as the read timeout allows, and this budget decides only whether
+    there is time left to try again after it fails. Reading it as a hard ceiling
+    on total latency would be wrong, and would reintroduce the cap that was just
+    removed.
+
+    Fifteen seconds, not ten, because it has to leave room for a retry **behind
+    the streaming handshake window** (10 s): the budget is checked before an
+    attempt starts, so a budget smaller than the window means the second attempt
+    never begins and ``max_attempts`` silently becomes 1. The relationship is
+    enforced by ``_check_budget_covers_a_retry`` below, which exists because this
+    is exactly the kind of arithmetic that gets retuned in one place and not the
+    other.
     """
 
     backoff_seconds: float = Field(default=0.2, ge=0)
@@ -287,6 +324,39 @@ class DispatchConfig(BaseModel):
     and the cooldown duration governs when capacity returns. The delay here is a
     courtesy to an upstream that may be recovering, not a compliance mechanism.
     """
+
+    @model_validator(mode="after")
+    def _check_budget_covers_a_retry(self) -> DispatchConfig:
+        """Refuse a budget too small to let the second attempt start.
+
+        The dispatcher checks the budget *before* each attempt, so an attempt
+        already running is never truncated. That makes one comparison load
+        bearing: if ``attempt_budget_seconds`` is less than the provider handshake
+        window plus this backoff, the first attempt consumes the budget and the
+        retry the policy promises can never happen. Nothing else in the system
+        would report that -- the request simply fails a little sooner, and
+        ``max_attempts`` quietly means nothing.
+
+        The window is imported inside the method for two reasons: it is resolved
+        from the environment (``ROUTER_PROVIDER_TIMEOUT``) at import time, and
+        reading it here gets the value actually in force rather than a copy bound
+        when this module was first imported. It also keeps ``core`` from taking a
+        module-level dependency on ``providers`` for one number.
+
+        Raises:
+            ValueError: If the budget cannot cover the window plus one backoff.
+        """
+        from free_router.providers.timeout import PROVIDER_TIMEOUT_SECONDS
+
+        minimum = PROVIDER_TIMEOUT_SECONDS + self.backoff_seconds
+        if self.attempt_budget_seconds < minimum:
+            raise ValueError(
+                f"attempt_budget_seconds ({self.attempt_budget_seconds}) must be at "
+                f"least the provider window ({PROVIDER_TIMEOUT_SECONDS}) plus the "
+                f"retry backoff ({self.backoff_seconds}), or the second attempt can "
+                "never start and max_attempts is silently ignored."
+            )
+        return self
 
 
 class Config(BaseSettings):
@@ -305,6 +375,58 @@ class Config(BaseSettings):
     models: list[ModelConfig] = Field(min_length=1)
     quota: QuotaConfig = Field(default_factory=QuotaConfig)
     dispatch: DispatchConfig = Field(default_factory=DispatchConfig)
+    max_cooldown_seconds: float = Field(default=86_400.0, gt=0)
+    """Upper bound on a single cooldown, in seconds (clarification B4).
+
+    Twenty-four hours accommodates the longest *legitimate* provider hint -- a
+    daily cap resetting at midnight -- while still bounding a lockout caused by
+    a clock that jumped backwards. A backwards jump is better detected than
+    patched: a restored cooldown is compared against the system clock, and this
+    is the backstop for the case that check cannot cover.
+    """
+    quota_flush_interval_seconds: float = Field(default=20.0, gt=0)
+    """Seconds between counter flushes (clarification B2).
+
+    A crash loses up to one interval of counters. Cooldowns are unaffected --
+    they are written through the moment they are set.
+    """
+    provider_read_timeout_seconds: float = Field(default=120.0, gt=0)
+    """How long one provider's response **body** may take to arrive, in seconds.
+
+    This is a different phase from the provider window. That window
+    (``ROUTER_PROVIDER_TIMEOUT``, 5 s) bounds connection and response headers,
+    which were measured at p50 743 ms and p90 2332 ms. This bound spans
+    *generation*, which is unbounded in principle, and the two must not be
+    conflated.
+
+    120 s is derived from the workload rather than picked for comfort. The router
+    reserves against an output assumption of 1025 tokens (B1); at the throughput
+    a loaded free tier actually delivers -- roughly 15-30 tokens/second -- a full
+    response takes 34-68 s. A bound below that refuses work the provider was
+    willing to do. Measured against ``gemini-3.5-flash-lite`` on 2026-10-26,
+    generation took 14.7 s, 26.1 s, 49.7 s and 66.7 s; the 66.7 s case was a
+    success once the bound allowed it.
+
+    The previous value was 10 s, inherited as an httpx client default and never
+    measured for this phase, and it failed **every** request once the provider
+    was slow -- with no way to adjust it short of editing the source. It is
+    configuration because the right value is a property of the workload and the
+    upstream, not of the router.
+
+    Streaming (Batch 5) supersedes this: an incremental read needs a per-chunk
+    bound, not a per-response one.
+    """
+    owned_by: str = "free-router"
+    """The deployment owner reported by ``GET /v1/models`` (clarification B5).
+
+    The identity the router is operating as, not the provider. The provider is
+    already carried by the model id (``google/...``, ``mistral/...``), so
+    repeating it there would add no information.
+
+    No routing decision depends on it, so it is policy rather than a gate -- but
+    it is the *operator's* identity rather than the code's, which is why it is
+    configuration.
+    """
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
     def key_slots(self) -> dict[tuple[str, str], list[str]]:
@@ -361,6 +483,24 @@ class Config(BaseSettings):
                 slots[alias] = SecretStr(material)
             resolved[(entry.provider, entry.provider_id)] = slots
         return resolved
+
+    _config_mtime: int = PrivateAttr(default=0)
+
+    @property
+    def config_mtime(self) -> int:
+        """When the configuration file behind this instance was last modified.
+
+        Captured once by :func:`load_config` rather than computed per request.
+        ``GET /v1/models`` reports it as every model's ``created`` (B5), and the
+        value has to describe the configuration the router actually loaded: a
+        per-request ``stat()`` would drift from a model list that was frozen at
+        startup, so the listing would claim to have changed when nothing the
+        router serves had.
+
+        ``0`` means "not loaded from a file" -- an instance constructed directly,
+        or a file that vanished between being read and being stat-ed.
+        """
+        return self._config_mtime
 
     @classmethod
     def settings_customise_sources(
@@ -513,9 +653,24 @@ def load_config(path: str | Path | None = None, *, resolve_keys: bool = True) ->
     finally:
         _config_path_override.reset(token)
 
+    config._config_mtime = _modified_at(resolved)
+
     if resolve_keys:
         config.resolve_key_material()
     return config
+
+
+def _modified_at(path: Path) -> int:
+    """The file's modification time in whole seconds, or ``0`` if unreadable.
+
+    Captured here rather than in the route because the model list is frozen at
+    load: reporting a later mtime would claim the listing had changed when the
+    served configuration had not.
+    """
+    try:
+        return int(path.stat().st_mtime)
+    except OSError:
+        return 0
 
 
 def _format_validation_error(exc: ValidationError) -> str:

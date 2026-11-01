@@ -70,7 +70,7 @@ M1 makes the router survive that. It adds a key pool, quota awareness with coold
 - Token estimation must include a configurable safety margin so provider-side context rejections are avoided.
 - On a hard provider rejection indicating context-length overflow, the router must mark that model as degraded for large-context requests (CONSTITUTION §8.2 circuit breaker).
 - A `429` must place the affected key into cooldown. Cooldown duration must be configurable per provider/model rather than globally hard-coded.
-- **Quota and cooldown state is in-memory for M1.** This is a recorded deviation from CONSTITUTION §8.3 — see *Recorded Deviations*.
+- **Quota and cooldown state was in-memory for M1.** That was a recorded deviation from CONSTITUTION §8.3, **closed in M2** — see *Recorded Deviations*.
 
 > **Finding (Issue #51): provider free-tier limits are not published.**
 >
@@ -363,13 +363,26 @@ All failures continue to return the OpenAI-compatible error envelope established
 
 ## Recorded Deviations
 
-### CONSTITUTION §8.3 — quota state persistence
+### CONSTITUTION §8.3 — quota state persistence — **CLOSED IN M2**
 
 CONSTITUTION §8.3 requires that quota counts, cooldown timestamps, and provider availability state be persisted to SQLite and survive restarts.
 
-**M1 keeps them in memory.** ROADMAP places persistence in M2. The consequence is real and must not be understated: after a restart, the router forgets daily request counts and cooldown state, so it can briefly exceed a limit it had already reached, and a key that was cooling may be retried immediately.
+**M1 kept them in memory.** ROADMAP places persistence in M2. The consequence was real and must not be understated: after a restart, the router forgot daily request counts and cooldown state, so it could briefly exceed a limit it had already reached, and a key that was cooling could be retried immediately.
 
-This deviation is accepted deliberately, with the Constitution treated as the definition of done: it is recorded here and tracked as M2 work rather than being discovered later as unexplained behaviour.
+This deviation was accepted deliberately, with the Constitution treated as the definition of done: it was recorded here and tracked as M2 work rather than being discovered later as unexplained behaviour.
+
+**M2 closed it on 2026-10-19**, with the removal recorded here rather than made silently. ADR-0004 §6 listed four obligations:
+
+| Obligation | How it was met |
+| :--- | :--- |
+| Tables for quota counters, cooldown state and provider availability | `quota_windows`, `cooldowns`, `model_status`, `key_state` (revision `0002_quota_state`, plus `0003_model_status_threshold`) |
+| A durable tracker satisfying the same interface, non-blocking | One implementation with a persistence layer attached (ADR-0005, decision A3) — async `aiosqlite` throughout, with a test asserting the event loop stays responsive under concurrent reservation |
+| Persisted cooldowns read at startup, so a restart does not retry a cooling key | Restored in the lifespan, before the listener accepts anything; an expired cooldown is not restored |
+| Remove the recorded deviation | This entry |
+
+**One deviation from ADR-0004's own wording, recorded rather than absorbed.** ADR-0004 §6 asked for "a SQLite-backed `QuotaTracker` satisfying the same interface", which reads as a *second* implementation alongside the in-memory one. What was built is **one** implementation with a persistence layer attached, and that is a deliberate refinement: if counters batch behind a flush interval, the state they batch must be hot in memory, and a tracker reading and writing SQLite per reservation would put a database round-trip on the dispatch path — the exact cost the asymmetry principle exists to avoid. The interface is unchanged either way, which is what ADR-0004 identified as the durable part of the decision.
+
+**The restoration is verified against a real restart** — two separate processes, one writing the state and exiting and the second restoring from the database. A single process clearing its own objects would pass even if the state only ever lived in memory.
 
 ### ADR-001 §2.4 — stale timeout value
 
