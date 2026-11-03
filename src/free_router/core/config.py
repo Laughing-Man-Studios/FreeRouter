@@ -143,6 +143,72 @@ class ConfigError(RuntimeError):
     """A condition that must prevent the process from starting."""
 
 
+CapabilityProvenance = Literal["published", "measured", "assumed"]
+
+
+class CapabilityValue[T](BaseModel):
+    """A capability declaration with auditable provenance (ADR-0008).
+
+    T is generic (int, bool) so that capability types remain strict under
+    ``mypy --strict`` without unions or casts.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    value: T
+    provenance: CapabilityProvenance
+    source: str | None = None
+
+    @property
+    def is_usable(self) -> bool:
+        """Whether this capability is verified and eligible to satisfy requirements.
+
+        Assumed capabilities are recorded for documentation only and treated as
+        unknown by requirement filters (spec §1, ADR-0008).
+        """
+        return self.provenance in ("published", "measured")
+
+    @model_validator(mode="after")
+    def _validate_source(self) -> CapabilityValue[T]:
+        if self.provenance in ("published", "measured"):
+            if not self.source or not self.source.strip():
+                raise ValueError(
+                    f"source is required when provenance is '{self.provenance}'. "
+                    "Name the document and date, or the measurement (spec Requirement 1, ADR-0008)."
+                )
+        elif self.provenance == "assumed":
+            if self.source is not None:
+                raise ValueError(
+                    "source must not be provided when provenance is 'assumed'. "
+                    "Assumed capabilities are unverified; recording a source would claim "
+                    "verification that does not exist (spec Requirement 1, ADR-0008)."
+                )
+        return self
+
+
+class Capabilities(BaseModel):
+    """The capability set declared by a model (spec §1, ROADMAP §3.7)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    context_window: CapabilityValue[int]
+    supports_streaming: CapabilityValue[bool]
+    supports_tools: CapabilityValue[bool]
+    supports_vision: CapabilityValue[bool]
+    supports_json_schema: CapabilityValue[bool]
+
+    @field_validator("context_window")
+    @classmethod
+    def _validate_context_window(cls, value: CapabilityValue[int]) -> CapabilityValue[int]:
+        if value.value <= 0:
+            raise ValueError(
+                f"context_window must be a positive integer, found {value.value}. "
+                "Zero or negative is not a small context window, it is a missing "
+                "one wearing a number."
+            )
+        return value
+
+
 class ModelConfig(BaseModel):
     """A single externally-addressable model and its provider mapping."""
 
@@ -151,6 +217,8 @@ class ModelConfig(BaseModel):
     id: str
     provider: str
     provider_id: str
+    capabilities: Capabilities
+    fallback_models: list[str] = Field(default_factory=list)
     cooldown_seconds: float = Field(default=60.0, gt=0)
     """How long to wait after a rate limit before this model may be dispatched again.
 
@@ -234,6 +302,27 @@ class ModelConfig(BaseModel):
                 f"model '{self.id}' declares {len(self.key_aliases)} key aliases but "
                 f"provider '{self.provider}' permits at most {cap}. Pooling is capped "
                 "under CONSTITUTION 6.1 Conservative Compliance Mode; see ADR-0003."
+            )
+        return self
+
+    @field_validator("fallback_models")
+    @classmethod
+    def _validate_fallback_duplicates(cls, value: list[str]) -> list[str]:
+        seen: set[str] = set()
+        for item in value:
+            if item in seen:
+                raise ValueError(
+                    f"duplicate fallback_models entry '{item}'. Fallbacks must be unique."
+                )
+            seen.add(item)
+        return value
+
+    @model_validator(mode="after")
+    def _validate_fallback_self_reference(self) -> ModelConfig:
+        if self.id in self.fallback_models:
+            raise ValueError(
+                f"model '{self.id}' declares self-referential fallback_models entry "
+                f"'{self.id}'. A model cannot fall back to itself (spec §7)."
             )
         return self
 
@@ -428,6 +517,38 @@ class Config(BaseSettings):
     configuration.
     """
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+
+    def model_by_id(self, model_id: str) -> ModelConfig | None:
+        """Look up a model configuration by its external identifier.
+
+        Decision C3: lookups are provided directly on Config rather than introducing
+        a separate ModelRegistry wrapper class (CONSTITUTION §2.3).
+        """
+        for model in self.models:
+            if model.id == model_id:
+                return model
+        return None
+
+    @model_validator(mode="after")
+    def _validate_fallback_relationships(self) -> Config:
+        models_by_id = {model.id: model for model in self.models}
+        for model in self.models:
+            for fallback_id in model.fallback_models:
+                if fallback_id not in models_by_id:
+                    raise ValueError(
+                        f"model '{model.id}' declares unknown fallback_models entry "
+                        f"'{fallback_id}'. All fallback models must be declared in "
+                        "configuration (spec §7)."
+                    )
+                fallback = models_by_id[fallback_id]
+                if fallback.fallback_models:
+                    raise ValueError(
+                        f"model '{model.id}' declares fallback '{fallback_id}' which itself "
+                        f"declares fallback_models ({fallback.fallback_models}). Fallback "
+                        "chains are refused: substitution is strictly single-hop "
+                        "(spec §5 rule 4, §7, ADR-0009)."
+                    )
+        return self
 
     def key_slots(self) -> dict[tuple[str, str], list[str]]:
         """Declared aliases for every model, keyed by ``(provider, provider_id)``.

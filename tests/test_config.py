@@ -348,7 +348,13 @@ def test_explicit_path_overrides_env_var(
     write_config()
     elsewhere = tmp_path / "other.yaml"
     elsewhere.write_text(
-        'models:\n  - id: "google/other"\n    provider: "google"\n    provider_id: "other"\n',
+        'models:\n  - id: "google/other"\n    provider: "google"\n    provider_id: "other"\n'
+        "    capabilities:\n"
+        '      context_window: {value: 131072, provenance: published, source: "docs"}\n'
+        '      supports_streaming: {value: true, provenance: measured, source: "test"}\n'
+        '      supports_tools: {value: false, provenance: published, source: "docs"}\n'
+        '      supports_vision: {value: false, provenance: published, source: "docs"}\n'
+        '      supports_json_schema: {value: false, provenance: published, source: "docs"}\n',
         encoding="utf-8",
     )
     set_api_key()

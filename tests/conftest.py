@@ -38,6 +38,28 @@ models:
   - id: "google/gemini-3.5-flash-lite"
     provider: "google"
     provider_id: "gemini-3.5-flash-lite"
+    capabilities:
+      context_window:
+        value: 131072
+        provenance: published
+        source: "provider model documentation, retrieved 2026-11-03"
+      supports_streaming:
+        value: true
+        provenance: measured
+        source: "M2 measurement, 20/20 streamed, 2026-10-30"
+      supports_tools:
+        value: false
+        provenance: published
+        source: "provider model documentation, retrieved 2026-11-03"
+      supports_vision:
+        value: false
+        provenance: published
+        source: "provider model documentation, retrieved 2026-11-03"
+      supports_json_schema:
+        value: false
+        provenance: published
+        source: "provider model documentation, retrieved 2026-11-03"
+    fallback_models: []
 """
 """The shipped M0 configuration."""
 

@@ -19,7 +19,7 @@ from email.utils import format_datetime
 
 import pytest
 
-from free_router.core.config import ModelConfig
+from free_router.core.config import Capabilities, CapabilityValue, ModelConfig
 from free_router.quota.cooldown import (
     DEFAULT_COOLDOWN_SECONDS,
     CooldownManager,
@@ -276,12 +276,25 @@ async def test_record_never_carries_provider_text() -> None:
     assert MODEL in described
 
 
+def _sample_capabilities() -> Capabilities:
+    return Capabilities(
+        context_window=CapabilityValue[int](value=131072, provenance="published", source="docs"),
+        supports_streaming=CapabilityValue[bool](value=True, provenance="measured", source="test"),
+        supports_tools=CapabilityValue[bool](value=False, provenance="published", source="docs"),
+        supports_vision=CapabilityValue[bool](value=False, provenance="published", source="docs"),
+        supports_json_schema=CapabilityValue[bool](
+            value=False, provenance="published", source="docs"
+        ),
+    )
+
+
 def test_config_cooldown_default_is_configurable_per_model() -> None:
     model = ModelConfig(
         id="mistral/m",
         provider="mistral",
         provider_id="m",
         cooldown_seconds=300.0,
+        capabilities=_sample_capabilities(),
     )
 
     assert model.cooldown_seconds == 300.0
@@ -290,14 +303,25 @@ def test_config_cooldown_default_is_configurable_per_model() -> None:
 async def test_config_rejects_a_non_positive_cooldown() -> None:
     """A zero cooldown would mean 'do not wait', which is the prohibited retry."""
     with pytest.raises(ValueError):
-        ModelConfig(id="m/m", provider="m", provider_id="m", cooldown_seconds=0.0)
+        ModelConfig(
+            id="m/m",
+            provider="m",
+            provider_id="m",
+            cooldown_seconds=0.0,
+            capabilities=_sample_capabilities(),
+        )
 
 
 def test_config_default_covers_a_rolling_window() -> None:
     """The default must span the shortest documented window, not be arbitrary."""
     assert DEFAULT_COOLDOWN_SECONDS >= 60.0
     assert (
-        ModelConfig(id="g/m", provider="google", provider_id="m").cooldown_seconds
+        ModelConfig(
+            id="g/m",
+            provider="google",
+            provider_id="m",
+            capabilities=_sample_capabilities(),
+        ).cooldown_seconds
         == DEFAULT_COOLDOWN_SECONDS
     )
 

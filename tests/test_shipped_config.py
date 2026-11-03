@@ -31,7 +31,15 @@ from free_router.core.config import ConfigError, key_env_var, load_config
 SHIPPED_CONFIG = Path(__file__).resolve().parent.parent / "config.yaml"
 """The repository's default configuration, as baked into the image by the Dockerfile."""
 
-_MODEL_KEYS = {"id", "provider", "provider_id", "key_aliases", "quota"}
+_MODEL_KEYS = {
+    "id",
+    "provider",
+    "provider_id",
+    "key_aliases",
+    "quota",
+    "capabilities",
+    "fallback_models",
+}
 """Fields a model entry may declare. Anything else is a mistake or a pasted secret."""
 
 
@@ -151,3 +159,33 @@ def test_missing_shipped_config_reports_the_path() -> None:
     """An absent config is a clear error naming the file looked for."""
     with pytest.raises(ConfigError, match="definitely-not-here.yaml"):
         load_config(SHIPPED_CONFIG.parent / "definitely-not-here.yaml", resolve_keys=False)
+
+
+def test_shipped_config_models_declare_complete_capabilities() -> None:
+    """Every model in the shipped config carries all required capabilities with provenance.
+
+    The reference configuration must not be the one place the rules are unmet
+    (spec §1, §7, tasks.md T067).
+    """
+    config = _shipped()
+    for model in config.models:
+        caps = model.capabilities
+        assert caps.context_window.value > 0
+        assert caps.context_window.provenance in ("published", "measured", "assumed")
+        assert caps.context_window.source is not None
+
+        for name in (
+            "supports_streaming",
+            "supports_tools",
+            "supports_vision",
+            "supports_json_schema",
+        ):
+            field = getattr(caps, name)
+            assert isinstance(field.value, bool)
+            assert field.provenance in ("published", "measured", "assumed")
+            if field.provenance in ("published", "measured"):
+                assert field.source is not None and field.source.strip()
+            else:
+                assert field.source is None
+
+        assert isinstance(model.fallback_models, list)
