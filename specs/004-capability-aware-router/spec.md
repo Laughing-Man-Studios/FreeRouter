@@ -629,6 +629,13 @@ OpenHands objective **is not**. Fixing that needs adapter-level pass-through
 the `tool_calls` finish reason), which is a milestone-sized piece of work and is
 carried into M4.
 
+The ROADMAP carries the same amendment as of 2026-11-03: its Milestone 2 objective
+records that the convergence did not happen, Milestone 3 records that selection is
+opt-in and that declared capabilities must be servable, and Milestone 4 gains the
+pass-through deliverables and the OpenHands objective. `specs/003` § A1 and
+ADR-0007 § 7 point forward to this section, so a reader arriving from the M2 record
+is not left with the old promise.
+
 ### C6 — `streaming_unsupported` stays its own code
 
 Streaming is a capability like any other, and the filter could report it as
