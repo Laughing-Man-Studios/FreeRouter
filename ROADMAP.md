@@ -731,6 +731,22 @@ Tool calling remains outside the MVP boundary but should be the next compatibili
 > recorded in `specs/003-persistent-interactive-mvp/spec.md` § *Clarifications
 > Recorded* (A1).
 
+**Amended 2026-11-03: the convergence assumed above did not happen, so the
+objective moves again, to Milestone 4.** M3's planning scoped capability
+*awareness* — the schema, local requirement detection and hard-requirement
+filtering — and found that the four M3 issues contain no adapter work. Neither
+adapter forwards `tools`; the ingress boundary discards the field before
+dispatch. A capability filter that declared tool support without that
+pass-through would pass a tools request to an adapter that strips it, which is
+the silent degradation CONSTITUTION §7.1 names first.
+
+M3 therefore **refuses** tool, vision and structured-output requests rather than
+serving them, and declares no model able to serve them. OpenHands stays
+unreachable, and the objective is carried to Milestone 4 alongside the
+pass-through work it actually needs. The reasoning is recorded in
+`specs/004-capability-aware-router/spec.md` § *Clarifications Recorded* (C5) and
+ADR-0009.
+
 ### Milestone 2: Exit criteria
 
 The router survives a restart without immediately losing its quota state and can serve interactive OpenHands workloads with streaming where supported.
@@ -739,6 +755,10 @@ The router survives a restart without immediately losing its quota state and can
 > **deferred to Milestone 3** and is not met or claimed by M2. M2's exit criteria
 > are: the router survives a restart without immediately losing its quota state,
 > and it supports streaming and model discovery where the provider supports them.
+
+**Amended 2026-11-03:** the deferred clause is now carried by **Milestone 4**, for
+the reasons given under the OpenHands objective above. It is not met or claimed by
+M3 either.
 
 ---
 
@@ -760,6 +780,23 @@ Move from “send this exact model a request” toward “select from models tha
 - No LLM-based request classifier.
 - No automatic paid routing.
 
+> **Amended 2026-11-03: "large-context candidate selection" is opt-in, and
+> capability metadata is awareness, not capability.** Two clarifications were
+> needed before implementation, both recorded in
+> `specs/004-capability-aware-router/spec.md`:
+>
+> - **Selection is opt-in per model** (C1). CONSTITUTION §7.2 prohibits
+>   cross-model fallback for an explicitly requested model, so substitution
+>   happens only where a model declares `fallback_models`, and never on a rate
+>   limit. Absent that declaration the router refuses the request. The
+>   deliverable is therefore *configurable* large-context selection, not
+>   automatic selection.
+> - **Declared capabilities must be servable** (C5). M3 filters on tools, vision
+>   and structured output, but no adapter forwards them, so no model is declared
+>   able to serve them and those requests are refused. The deliverables above
+>   describe the metadata and the filter; they do not promise adapter
+>   pass-through, which is Milestone 4's work.
+
 ### Example selection flow
 
 ```text
@@ -778,6 +815,14 @@ Rank remaining candidates
 
 A request is never deliberately sent to a model that the local registry already knows cannot satisfy its hard requirements.
 
+> **Amended 2026-11-03: this criterion is met by M3; the OpenHands objective is
+> not.** The two are separate claims and the milestone report keeps them
+> separate. A request needing tools, vision or schema-constrained output is
+> refused locally with a `400` naming the requirement, so nothing is dispatched
+> to a model known incapable — that is this criterion. Serving such a request
+> requires adapter pass-through, which M3 does not build and Milestone 4
+> carries.
+
 ---
 
 ## Milestone 4: Quality-First Free Router
@@ -794,11 +839,35 @@ Introduce the first true `model = free` style routing behavior.
 - Quota availability as a hard constraint.
 - Reliability/health as a scoring dimension or eligibility filter.
 - Tool support as a strongly weighted requirement.
+- **Tool, vision and structured-output pass-through in both adapters**, including
+  streaming `tool_calls` deltas and the `tool_calls` finish reason.
+- **Capability-declared serving**: a model may declare `supports_tools`,
+  `supports_vision` and `supports_json_schema` as `true` only once its adapter
+  forwards them, so the M3 filter admits the request instead of refusing it.
 - Context fit as a hard constraint.
 - Latency as a deliberately low-weight factor.
 - Stable selection of the current best model while its free capacity remains available.
 - Fall to the next-best model when the preferred model becomes unavailable.
 - Explainable routing decisions in logs.
+
+> **Amended 2026-11-03: the pass-through items above arrive from Milestone 3, and
+> with them the OpenHands objective carried since Milestone 2.** M3 detects tool,
+> vision and structured-output requirements and refuses them because no adapter
+> forwards those fields; making them servable is adapter work, not routing work,
+> and it belongs with the milestone that has the reason to do it. Once forwarding
+> exists, the M3 capability schema admits these requests without a schema change —
+> the metadata, the filter and the refusal contract are already built. See
+> `specs/004-capability-aware-router/spec.md` § *Clarifications Recorded* (C5) and
+> `tasks.md` § *Carried Into M4*.
+
+### OpenHands objective (carried from Milestone 2)
+
+Begin using the router with the local OpenHands instance as an actual workload.
+
+This objective was set in Milestone 2 and deferred twice — from M2 to M3 by the
+amendment there, and from M3 to M4 here. It is satisfied when an agentic OpenHands
+run completes through the router: tool calls forwarded, `tool_calls` results
+returned, a multi-turn loop that terminates on its own terms.
 
 ### Illustrative routing sequence
 
