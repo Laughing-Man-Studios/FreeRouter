@@ -170,8 +170,10 @@ and §5 rule 5 of the spec makes it the contract rather than a side effect.
 ```python
 # core/capabilities.py
 
+
 class RequestRequirements(BaseModel):
     """What a request needs, derived locally from its payload. No I/O."""
+
     requires_tools: bool
     requires_vision: bool
     requires_json_schema: bool
@@ -179,26 +181,32 @@ class RequestRequirements(BaseModel):
     input_tokens: int
     reserved_output: int
 
+
 def detect_requirements(payload: dict[str, Any], assumed_output: int) -> RequestRequirements: ...
+
 
 class Mismatch(BaseModel):
     """Why a model cannot serve a request. Maps 1:1 to an error in spec §6."""
+
     code: Literal["capability_unsatisfiable", "context_window_exceeded", "streaming_unsupported"]
     param: str
     detail: str
 
+
 def mismatch(model: ModelConfig, requirements: RequestRequirements) -> Mismatch | None: ...
+
 
 def eligible_models(
     config: Config,
     requirements: RequestRequirements,
-) -> list[ModelConfig]: ...   # every model whose mismatch() is None, in config order
+) -> list[ModelConfig]: ...  # every model whose mismatch() is None, in config order
+
 
 def resolve_target(
     config: Config,
     requirements: RequestRequirements,
     requested_model: str,
-) -> Target: ...        # raises UnsupportedModelError / CapabilityUnsatisfiable* / ContextWindowExceeded
+) -> Target: ...  # raises UnsupportedModelError / CapabilityUnsatisfiable* / ContextWindowExceeded
 ```
 
 `mismatch` is the single place the capability rules live: provenance handling,
