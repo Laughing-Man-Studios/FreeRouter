@@ -42,9 +42,53 @@ models:
   - id: "google/{GOOGLE_MODEL}"
     provider: "google"
     provider_id: "{GOOGLE_MODEL}"
+    capabilities:
+      context_window:
+        value: 131072
+        provenance: published
+        source: "docs"
+      supports_streaming:
+        value: true
+        provenance: measured
+        source: "test"
+      supports_tools:
+        value: false
+        provenance: published
+        source: "docs"
+      supports_vision:
+        value: false
+        provenance: published
+        source: "docs"
+      supports_json_schema:
+        value: false
+        provenance: published
+        source: "docs"
+    fallback_models: []
   - id: "mistral/{MISTRAL_MODEL}"
     provider: "mistral"
     provider_id: "{MISTRAL_MODEL}"
+    capabilities:
+      context_window:
+        value: 131072
+        provenance: published
+        source: "docs"
+      supports_streaming:
+        value: true
+        provenance: measured
+        source: "test"
+      supports_tools:
+        value: false
+        provenance: published
+        source: "docs"
+      supports_vision:
+        value: false
+        provenance: published
+        source: "docs"
+      supports_json_schema:
+        value: false
+        provenance: published
+        source: "docs"
+    fallback_models: []
 """
 
 GOOGLE_STREAM_BODY = "\n\n".join(

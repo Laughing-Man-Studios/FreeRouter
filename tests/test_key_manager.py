@@ -17,6 +17,7 @@ The properties that matter are narrow and specific:
 import asyncio
 
 import pytest
+from conftest import capabilities_yaml
 from pydantic import SecretStr
 
 from free_router.core.config import (
@@ -326,10 +327,13 @@ def test_the_env_var_name_is_derived_not_configurable() -> None:
 # --- T023: configuration schema ---
 
 
+_CAPS_SNIPPET = capabilities_yaml()
+
+
 def _yaml(provider: str = "google", provider_id: str = MODEL, extra: str = "") -> str:
     return (
         f'models:\n  - id: "{provider}/{provider_id}"\n    provider: "{provider}"\n'
-        f'    provider_id: "{provider_id}"\n{extra}'
+        f'    provider_id: "{provider_id}"\n{_CAPS_SNIPPET}{extra}'
     )
 
 
@@ -455,10 +459,7 @@ def test_secret_named_yaml_fields_remain_refused(write_config, field: str) -> No
 def test_key_material_is_resolved_per_model(write_config, monkeypatch) -> None:
     monkeypatch.setenv("GOOGLE_KEY_PRIMARY", "google-secret")
     monkeypatch.setenv("MISTRAL_KEY_PRIMARY", "mistral-secret")
-    write_config(
-        _yaml() + '  - id: "mistral/ministral-3b-2512"\n    provider: "mistral"\n'
-        '    provider_id: "ministral-3b-2512"\n'
-    )
+    write_config(_yaml() + _yaml("mistral", "ministral-3b-2512").removeprefix("models:\n"))
 
     resolved = load_config().resolve_key_material()
 
@@ -472,10 +473,7 @@ def test_a_mistral_only_deployment_starts_without_a_google_key(write_config, mon
     """Deferred from #7: provider credentials are per model, not a required global field."""
     monkeypatch.delenv("GOOGLE_KEY_PRIMARY", raising=False)
     monkeypatch.setenv("MISTRAL_KEY_PRIMARY", "mistral-secret")
-    write_config(
-        'models:\n  - id: "mistral/ministral-3b-2512"\n    provider: "mistral"\n'
-        '    provider_id: "ministral-3b-2512"\n'
-    )
+    write_config(_yaml("mistral", "ministral-3b-2512"))
 
     config = load_config()
 

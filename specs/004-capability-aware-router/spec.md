@@ -76,13 +76,13 @@ Each capability is an object rather than a bare value:
 ```yaml
 capabilities:
   context_window:
-    value: 1000000
+    value: 1048576
     provenance: published
-    source: "provider model documentation, retrieved <date>"
+    source: "https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash-lite, input token limit, retrieved 2026-11-04"
   supports_streaming:
     value: true
     provenance: measured
-    source: "M2 streaming measurement, 20/20 requests streamed"
+    source: "T062 measurement, Google, 20/20 requests streamed, 2026-10-30"
 ```
 
 **Provenance is one of `published`, `measured`, `assumed`, and the distinction is
@@ -100,6 +100,15 @@ The third case is the one that makes "verified" checkable. Without it, a guessed
 value and a checked value are indistinguishable in config, and the milestone's
 claim — *the router never sends a request to a model it knows cannot serve it* —
 would rest on guesses.
+
+**A capability the model has but the router cannot use is `assumed`, not
+`published: false`.** `supports_tools`, `supports_vision` and
+`supports_json_schema` are capabilities the upstream models do have; the limit is
+in this router, whose adapters forward none of them (decision C5). Recording them
+as `published: false` would claim the provider documents the feature as
+unsupported, which is false. Recording them as `assumed` makes them unusable
+while keeping the reason truthful. A `published` or `measured` value must carry a
+`source`; an `assumed` value must not, because there is nothing to cite.
 
 **The capability schema is closed, and unknown keys are refused.** Extensibility
 means adding a field to the schema and a rule to the filter, not accepting
@@ -259,9 +268,9 @@ The error message names the numbers and the models considered, so a failure is
 actionable without reading the router's source:
 
 ```text
-No configured model can accept this request: it requires about 132,400 input
+No configured model can accept this request: it requires about 1,150,000 input
 tokens plus 1,025 reserved output tokens, and the largest eligible context
-window is 131,072. Considered: google/gemini-3.5-flash-lite.
+window is 1,048,576. Considered: google/gemini-3.5-flash-lite.
 ```
 
 **What must never happen instead:** truncating the messages, dropping the tools,
@@ -316,8 +325,8 @@ Validation must refuse:
 ### Scenario 1: An oversized request is refused locally
 
 ```text
-Given google/gemini-3.5-flash-lite declares context_window 131072
-And a request's estimated input is 140,000 tokens
+Given google/gemini-3.5-flash-lite declares context_window 1048576
+And a request's estimated input is 1,100,000 tokens
 When the client posts to /v1/chat/completions for that model
 Then the response is 400 with code context_window_exceeded
 And the error names the estimate and the window
@@ -327,8 +336,8 @@ And no outbound request is made
 ### Scenario 2: A request that just fits is dispatched
 
 ```text
-Given a model declaring context_window 131072
-And a request whose input estimate plus reserved output is 130,000 tokens
+Given a model declaring context_window 1048576
+And a request whose input estimate plus reserved output is 1,040,000 tokens
 When the client posts to /v1/chat/completions
 Then the request is dispatched normally
 ```
@@ -448,8 +457,13 @@ Then M2's streaming behaviour is unchanged, including fail-fast after the first
   regardless (C5).
 - **A fallback that is itself the requested model.** Refused at startup as
   self-referential.
-- **Two models declaring each other as fallbacks.** Each is a one-hop edge, which
-  is legal; single-hop evaluation means the cycle can never be traversed.
+- **Two models declaring each other as fallbacks.** Refused at startup. §5 rule 4
+  says a fallback must not itself declare fallbacks, and a mutual pair is two
+  such declarations: following the edge once lands on a model that declares one
+  more. Earlier drafts called the cycle legal because each edge is individually
+  one hop; that contradicted §5 and left the runtime to decide whether to stop at
+  the first hop or at the model it landed on. Corrected 2026-11-04 (decision C1,
+  Batch 1).
 - **An unconfigured capability block added by a future schema version.** Refused as
   an unknown key rather than ignored.
 

@@ -16,6 +16,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from free_router.core.config import Capabilities, CapabilityValue
 from free_router.core.logging import NORMALISED_LOGGERS, JsonFormatter
 
 MANAGED_ENV_VARS = (
@@ -33,12 +34,76 @@ Covers every ``<PROVIDER>_KEY_<ALIAS>`` slot the shipped configuration can name,
 so a developer shell with real credentials cannot influence a result."""
 """Environment variables that must not leak into a test."""
 
-MINIMAL_CONFIG = """\
-models:
-  - id: "google/gemini-3.5-flash-lite"
-    provider: "google"
-    provider_id: "gemini-3.5-flash-lite"
-"""
+
+def capabilities_yaml(
+    *,
+    context_window: int = 1_048_576,
+    streaming: bool = True,
+    fallback_models: tuple[str, ...] = (),
+    indent: str = "    ",
+) -> str:
+    """A complete capability block, for tests that build their own config.
+
+    One definition rather than a copy in every fixture: the block is required on
+    every model, so a schema change would otherwise touch a dozen files. The
+    values here are synthetic test data; the shipped file's values are asserted
+    separately in ``test_shipped_config.py``.
+    """
+    fallback = (
+        "[]" if not fallback_models else "[" + ", ".join(f'"{m}"' for m in fallback_models) + "]"
+    )
+    return (
+        f"{indent}capabilities:\n"
+        f"{indent}  context_window:\n"
+        f"{indent}    value: {context_window}\n"
+        f"{indent}    provenance: published\n"
+        f'{indent}    source: "https://example.test/model-docs, retrieved 2026-11-04"\n'
+        f"{indent}  supports_streaming:\n"
+        f"{indent}    value: {str(streaming).lower()}\n"
+        f"{indent}    provenance: measured\n"
+        f'{indent}    source: "test measurement, 1/1 streamed, 2026-11-04"\n'
+        f"{indent}  supports_tools:\n"
+        f"{indent}    value: false\n"
+        f"{indent}    provenance: assumed\n"
+        f"{indent}  supports_vision:\n"
+        f"{indent}    value: false\n"
+        f"{indent}    provenance: assumed\n"
+        f"{indent}  supports_json_schema:\n"
+        f"{indent}    value: false\n"
+        f"{indent}    provenance: assumed\n"
+        f"{indent}fallback_models: {fallback}\n"
+    )
+
+
+def sample_capabilities(
+    *,
+    context_window: int = 1_048_576,
+    streaming: bool = True,
+) -> Capabilities:
+    """The typed equivalent of :func:`capabilities_yaml`, for direct model construction."""
+    return Capabilities(
+        context_window=CapabilityValue[int](
+            value=context_window,
+            provenance="published",
+            source="https://example.test/model-docs, retrieved 2026-11-04",
+        ),
+        supports_streaming=CapabilityValue[bool](
+            value=streaming,
+            provenance="measured",
+            source="test measurement, 1/1 streamed, 2026-11-04",
+        ),
+        supports_tools=CapabilityValue[bool](value=False, provenance="assumed"),
+        supports_vision=CapabilityValue[bool](value=False, provenance="assumed"),
+        supports_json_schema=CapabilityValue[bool](value=False, provenance="assumed"),
+    )
+
+
+MINIMAL_CONFIG = (
+    "models:\n"
+    '  - id: "google/gemini-3.5-flash-lite"\n'
+    '    provider: "google"\n'
+    '    provider_id: "gemini-3.5-flash-lite"\n' + capabilities_yaml()
+)
 """The shipped M0 configuration."""
 
 
