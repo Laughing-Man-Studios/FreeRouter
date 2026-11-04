@@ -153,7 +153,12 @@ class CapabilityValue[T](BaseModel):
     ``mypy --strict`` without unions or casts.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", strict=True)
+    """Strict on purpose: ``value: true`` must not become a 1-token context
+    window, and ``value: "yes"`` must not become a verified capability. The
+    schema is closed, so a value of the wrong YAML type is a configuration
+    error rather than something to coerce.
+    """
 
     value: T
     provenance: CapabilityProvenance
@@ -530,6 +535,26 @@ class Config(BaseSettings):
         return None
 
     @model_validator(mode="after")
+    def _validate_unique_model_ids(self) -> Config:
+        """Refuse duplicate external ids.
+
+        Ids became load-bearing in M3: ``model_by_id`` and fallback resolution both
+        look a model up by id. Two models sharing an id would make the two lookups
+        pick different entries (``model_by_id`` returns the first, a dict
+        comprehension keeps the last), so the same question would have two answers.
+        """
+        seen: set[str] = set()
+        for model in self.models:
+            if model.id in seen:
+                raise ValueError(
+                    f"duplicate model id '{model.id}'. Model ids are the routing key "
+                    "for explicit requests and fallbacks, so they must be unique "
+                    "(spec §5, §7)."
+                )
+            seen.add(model.id)
+        return self
+
+    @model_validator(mode="after")
     def _validate_fallback_relationships(self) -> Config:
         models_by_id = {model.id: model for model in self.models}
         for model in self.models:
@@ -770,7 +795,7 @@ def load_config(path: str | Path | None = None, *, resolve_keys: bool = True) ->
     try:
         config = Config()
     except ValidationError as exc:
-        raise ConfigError(_format_validation_error(exc)) from exc
+        raise ConfigError(_format_validation_error(exc, _model_ids_by_index(resolved))) from exc
     finally:
         _config_path_override.reset(token)
 
@@ -794,16 +819,58 @@ def _modified_at(path: Path) -> int:
         return 0
 
 
-def _format_validation_error(exc: ValidationError) -> str:
+def _model_ids_by_index(path: Path) -> dict[int, str]:
+    """Map a ``models.<index>`` path component to the model's declared id.
+
+    Pydantic reports a location such as ``models.0.capabilities``. An operator's
+    configuration has model ids, not positions, and the id is the only part of
+    that path they can search for. The document is read again here, but only on
+    the error path, so a successful load is unchanged.
+
+    Any failure is swallowed: a diagnostic must never mask the validation error
+    it exists to explain.
+    """
+    try:
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return {}
+    if not isinstance(document, dict):
+        return {}
+    entries = document.get("models")
+    if not isinstance(entries, list):
+        return {}
+
+    ids: dict[int, str] = {}
+    for index, entry in enumerate(entries):
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str):
+            ids[index] = entry["id"]
+    return ids
+
+
+def _format_validation_error(
+    exc: ValidationError, model_ids: Mapping[int, str] | None = None
+) -> str:
     """Render a validation failure for a human operator.
 
     Only the location and the message are reported. Pydantic's ``input`` value
     is deliberately omitted so that a malformed secret can never be echoed into
     logs or a crash message.
+
+    A location under a model is rewritten from the list index to the model id,
+    because "models.0.capabilities" does not tell an operator which model to fix.
     """
     problems = []
     for error in exc.errors():
-        location = ".".join(str(part) for part in error["loc"]) or "<root>"
+        parts: list[object] = list(error["loc"])
+        if (
+            len(parts) >= 2
+            and parts[0] == "models"
+            and isinstance(parts[1], int)
+            and model_ids is not None
+            and parts[1] in model_ids
+        ):
+            parts = [f"models[{model_ids[parts[1]]}]", *parts[2:]]
+        location = ".".join(str(part) for part in parts) or "<root>"
         problems.append(f"  - {location}: {error['msg']}")
     detail = "\n".join(problems)
     return f"Invalid router configuration:\n{detail}"

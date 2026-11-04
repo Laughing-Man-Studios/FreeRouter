@@ -21,12 +21,13 @@ from typing import Any
 import httpx
 import pytest
 import respx
+from conftest import capabilities_yaml, sample_capabilities
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from free_router.api.main import http_client_timeout
-from free_router.core.config import Capabilities, CapabilityValue, Config, ModelConfig
+from free_router.core.config import Config, ModelConfig
 from free_router.providers.google.adapter import GOOGLE_API_BASE
 
 MODEL = "google/gemini-3.5-flash-lite"
@@ -34,46 +35,12 @@ PROVIDER_MODEL_ID = "gemini-3.5-flash-lite"
 GENERATE_URL = f"{GOOGLE_API_BASE}/v1beta/models/{PROVIDER_MODEL_ID}:generateContent"
 
 
-def _sample_capabilities() -> Capabilities:
-    return Capabilities(
-        context_window=CapabilityValue[int](value=131072, provenance="published", source="docs"),
-        supports_streaming=CapabilityValue[bool](value=True, provenance="measured", source="test"),
-        supports_tools=CapabilityValue[bool](value=False, provenance="published", source="docs"),
-        supports_vision=CapabilityValue[bool](value=False, provenance="published", source="docs"),
-        supports_json_schema=CapabilityValue[bool](
-            value=False, provenance="published", source="docs"
-        ),
-    )
-
-
-BASE_CONFIG = """\
-models:
-  - id: "google/gemini-3.5-flash-lite"
-    provider: "google"
-    provider_id: "gemini-3.5-flash-lite"
-    capabilities:
-      context_window:
-        value: 131072
-        provenance: published
-        source: "docs"
-      supports_streaming:
-        value: true
-        provenance: measured
-        source: "test"
-      supports_tools:
-        value: false
-        provenance: published
-        source: "docs"
-      supports_vision:
-        value: false
-        provenance: published
-        source: "docs"
-      supports_json_schema:
-        value: false
-        provenance: published
-        source: "docs"
-    fallback_models: []
-"""
+BASE_CONFIG = (
+    "models:\n"
+    '  - id: "google/gemini-3.5-flash-lite"\n'
+    '    provider: "google"\n'
+    '    provider_id: "gemini-3.5-flash-lite"\n' + capabilities_yaml()
+)
 
 
 def body() -> dict[str, Any]:
@@ -97,7 +64,7 @@ def minimal_config(**overrides: Any) -> Config:
                 id=MODEL,
                 provider="google",
                 provider_id=PROVIDER_MODEL_ID,
-                capabilities=_sample_capabilities(),
+                capabilities=sample_capabilities(),
             )
         ],
         **overrides,

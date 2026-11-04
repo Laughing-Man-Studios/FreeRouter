@@ -84,7 +84,7 @@ verification states the consequence rather than pretending the gap closed.
 
 **Maps to GitHub Issue:** `#17 Model Capability Metadata Schema & Registry Expansion`
 
-- [ ] **T066: Define the capability schema.**
+- [x] **T066: Define the capability schema.**
 
   `CapabilityValue[T]` (`value`, `provenance`, `source`) and `Capabilities`
   (`context_window`, `supports_streaming`, `supports_tools`, `supports_vision`,
@@ -107,7 +107,7 @@ verification states the consequence rather than pretending the gap closed.
   Without it, an operator's belief and a verified fact are indistinguishable in
   config, and the milestone's central claim rests on beliefs.
 
-- [ ] **T067: Populate `config.yaml` with verified capability metadata.**
+- [x] **T067: Populate `config.yaml` with verified capability metadata.**
 
   Every declared model gains a full capability block. Each `published` value names
   its source and the date it was read; `measured` values name the measurement.
@@ -119,7 +119,7 @@ verification states the consequence rather than pretending the gap closed.
   The commented block carries capability values so enabling Mistral remains a
   copy-paste rather than a research task.
 
-- [ ] **T068: Capability and fallback queries on the configuration objects.**
+- [x] **T068: Capability and fallback queries on the configuration objects.**
 
   `Config.model_by_id(model_id) -> ModelConfig | None`, and cross-model validation
   for `fallback_models`: unknown ids, self-reference, duplicates, and a fallback
@@ -144,6 +144,14 @@ verification states the consequence rather than pretending the gap closed.
    capabilities — the shipped file must not be the one place the rule is unmet.
 4. `pytest tests/test_config.py tests/test_capabilities_schema.py`
 5. **STOP**, review, then update #17.
+
+**Batch 1 verification gate (2026-11-04).** All four checks pass under `make check`
+(ruff, format, mypy strict, pytest, markdownlint), with no provider credential set.
+Beyond the original stop conditions, the review added: duplicate `model.id` is
+refused (the id is the routing key, so two lookups must not disagree), capability
+values are strict (a boolean cannot become a token count), error locations name the
+model id rather than its list index, the shipped numbers are pinned to their
+sources, and the commented Mistral entry is loaded by a test so it cannot rot.
 
 ---
 

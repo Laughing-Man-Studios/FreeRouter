@@ -14,6 +14,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from conftest import capabilities_yaml
 
 from free_router.core.config import (
     Capabilities,
@@ -24,30 +25,7 @@ from free_router.core.config import (
 
 pytestmark = pytest.mark.usefixtures("workdir")
 
-_VALID_CAPABILITIES_YAML = """\
-    capabilities:
-      context_window:
-        value: 131072
-        provenance: published
-        source: "provider model documentation, retrieved 2026-11-03"
-      supports_streaming:
-        value: true
-        provenance: measured
-        source: "M2 measurement, 20/20 streamed, 2026-10-30"
-      supports_tools:
-        value: false
-        provenance: published
-        source: "provider model documentation, retrieved 2026-11-03"
-      supports_vision:
-        value: false
-        provenance: published
-        source: "provider model documentation, retrieved 2026-11-03"
-      supports_json_schema:
-        value: false
-        provenance: published
-        source: "provider model documentation, retrieved 2026-11-03"
-    fallback_models: []
-"""
+_VALID_CAPABILITIES_YAML = capabilities_yaml()
 
 
 def _model_yaml(
@@ -84,10 +62,10 @@ def test_capabilities_round_trip_with_types_intact(
 
     assert isinstance(model.capabilities, Capabilities)
     cw: int = model.capabilities.context_window.value
-    assert cw == 131072
+    assert cw == 1_048_576
     assert model.capabilities.context_window.provenance == "published"
     assert model.capabilities.context_window.source == (
-        "provider model documentation, retrieved 2026-11-03"
+        "https://example.test/model-docs, retrieved 2026-11-04"
     )
     assert model.capabilities.context_window.is_usable is True
 
@@ -97,6 +75,8 @@ def test_capabilities_round_trip_with_types_intact(
     assert model.capabilities.supports_streaming.is_usable is True
 
     assert model.capabilities.supports_tools.value is False
+    assert model.capabilities.supports_tools.provenance == "assumed"
+    assert model.capabilities.supports_tools.is_usable is False
     assert model.capabilities.supports_vision.value is False
     assert model.capabilities.supports_json_schema.value is False
     assert model.fallback_models == []
@@ -175,7 +155,7 @@ def test_invalid_provenance_rejected(
         load_config(resolve_keys=False)
 
     message = str(excinfo.value)
-    assert "models.0.capabilities.context_window.provenance" in message
+    assert "models[google/gemini-3.5-flash-lite].capabilities.context_window.provenance" in message
 
 
 # --- 3. Startup validation fails fast (fail-closed, C2) ---
@@ -195,7 +175,7 @@ def test_missing_capabilities_block_fails_startup(
         load_config(resolve_keys=False)
 
     message = str(excinfo.value)
-    assert "models.0.capabilities" in message
+    assert "models[google/gemini-3.5-flash-lite].capabilities" in message
     assert "Field required" in message
 
 
@@ -233,7 +213,7 @@ def test_published_without_source_fails_startup(
         load_config(resolve_keys=False)
 
     message = str(excinfo.value)
-    assert "models.0.capabilities.context_window" in message
+    assert "models[google/gemini-3.5-flash-lite].capabilities.context_window" in message
     assert "source is required" in message
 
 
@@ -273,7 +253,7 @@ def test_non_positive_context_window_fails_startup(
             load_config(resolve_keys=False)
 
         message = str(excinfo.value)
-        assert "models.0.capabilities.context_window" in message
+        assert "models[google/gemini-3.5-flash-lite].capabilities.context_window" in message
         assert "context_window must be a positive integer" in message
 
 
@@ -316,6 +296,7 @@ def test_unknown_capability_key_fails_startup(
         load_config(resolve_keys=False)
 
     message = str(excinfo.value)
+    assert "google/gemini-3.5-flash-lite" in message
     assert "supports_audio" in message
 
 
@@ -436,6 +417,134 @@ def test_valid_single_hop_fallback_succeeds(
     config = load_config(resolve_keys=False)
     assert config.models[0].fallback_models == ["google/model-b"]
     assert config.models[1].fallback_models == []
+
+
+def test_mutual_fallbacks_refused(
+    write_config: Callable[..., Path],
+) -> None:
+    """Two models naming each other are a two-hop chain, not two legal edges.
+
+    Spec §7 refuses a fallback that itself declares fallbacks. The Edge Cases
+    section previously called a cycle legal; that contradicted §5 rule 4 and was
+    corrected on 2026-11-04.
+    """
+    model_a = (
+        'models:\n  - id: "google/model-a"\n    provider: "google"\n    provider_id: "a"\n'
+        + _VALID_CAPABILITIES_YAML.replace(
+            "fallback_models: []", 'fallback_models: ["google/model-b"]'
+        )
+    )
+    model_b = (
+        '  - id: "google/model-b"\n    provider: "google"\n    provider_id: "b"\n'
+        + _VALID_CAPABILITIES_YAML.replace(
+            "fallback_models: []", 'fallback_models: ["google/model-a"]'
+        )
+    )
+    write_config(model_a + model_b)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(resolve_keys=False)
+
+    message = str(excinfo.value)
+    assert "declares fallback" in message
+    assert "Fallback chains are refused" in message
+
+
+def test_fallback_models_default_to_empty(
+    write_config: Callable[..., Path],
+) -> None:
+    """An omitted fallback_models means no substitution, never a permissive default."""
+    body = capabilities_yaml().replace("    fallback_models: []\n", "")
+    write_config(_model_yaml(capabilities_body=body))
+
+    config = load_config(resolve_keys=False)
+    assert config.models[0].fallback_models == []
+
+
+def test_duplicate_model_ids_refused(
+    write_config: Callable[..., Path],
+) -> None:
+    """Duplicate external ids are refused: both id lookups must agree."""
+    yaml_content = _model_yaml(model_id="google/dup") + (
+        '  - id: "google/dup"\n    provider: "google"\n    provider_id: "other"\n'
+        + _VALID_CAPABILITIES_YAML
+    )
+    write_config(yaml_content)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(resolve_keys=False)
+
+    assert "duplicate model id 'google/dup'" in str(excinfo.value)
+
+
+# --- 4b. Strict value types (no silent coercion) ---
+
+
+def test_capability_values_do_not_coerce_types() -> None:
+    """A boolean is not a token count and a string is not a boolean."""
+    with pytest.raises(ValueError):
+        CapabilityValue[int](value=True, provenance="published", source="docs")
+
+    with pytest.raises(ValueError):
+        CapabilityValue[int](value="1048576", provenance="published", source="docs")
+
+    with pytest.raises(ValueError):
+        CapabilityValue[bool](value="yes", provenance="published", source="docs")
+
+    with pytest.raises(ValueError):
+        CapabilityValue[bool](value=1, provenance="measured", source="test")
+
+
+def test_boolean_context_window_refused_at_startup(
+    write_config: Callable[..., Path],
+) -> None:
+    """``value: true`` must not become a one-token context window."""
+    body = capabilities_yaml().replace("        value: 1048576\n", "        value: true\n")
+    write_config(_model_yaml(capabilities_body=body))
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(resolve_keys=False)
+
+    message = str(excinfo.value)
+    assert "google/gemini-3.5-flash-lite" in message
+    assert "context_window" in message
+
+
+def test_unknown_key_inside_capability_value_refused(
+    write_config: Callable[..., Path],
+) -> None:
+    """A typo inside a capability object is refused, not ignored."""
+    body = capabilities_yaml().replace(
+        '        source: "https://example.test/model-docs, retrieved 2026-11-04"\n',
+        '        source: "https://example.test/model-docs, retrieved 2026-11-04"\n'
+        "        units: tokens\n",
+        1,
+    )
+    write_config(_model_yaml(capabilities_body=body))
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(resolve_keys=False)
+
+    message = str(excinfo.value)
+    assert "google/gemini-3.5-flash-lite" in message
+    assert "units" in message
+
+
+def test_missing_single_capability_names_model_and_field(
+    write_config: Callable[..., Path],
+) -> None:
+    """Omitting one capability names the model and the missing field."""
+    body = capabilities_yaml().replace(
+        "      supports_vision:\n        value: false\n        provenance: assumed\n", ""
+    )
+    write_config(_model_yaml(capabilities_body=body))
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(resolve_keys=False)
+
+    message = str(excinfo.value)
+    assert "google/gemini-3.5-flash-lite" in message
+    assert "supports_vision" in message
 
 
 # --- 5. Lookups and no ModelRegistry class (Clarification C3) ---

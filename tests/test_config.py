@@ -198,7 +198,7 @@ def test_invalid_schema_fails_fast(
     with pytest.raises(ConfigError) as excinfo:
         load_config()
 
-    assert "models.0.provider_id" in str(excinfo.value)
+    assert "models[google/gemini-3.5-flash-lite].provider_id" in str(excinfo.value)
 
 
 def test_invalid_schema_wrong_type_fails_fast(

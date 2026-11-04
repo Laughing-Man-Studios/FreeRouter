@@ -39,25 +39,24 @@ models:
     provider_id: "gemini-3.5-flash-lite"
     capabilities:
       context_window:
-        value: 131072
+        value: 1048576
         provenance: published
-        source: "provider model documentation, retrieved 2026-11-03"
+        source: "https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash-lite, input token limit, retrieved 2026-11-04"
       supports_streaming:
         value: true
         provenance: measured
-        source: "M2 measurement, 20/20 streamed, 2026-10-30"
+        source: "T062 measurement, Google, 20/20 streamed, 2026-10-30"
+      # The model has these; the router does not forward them, so they are
+      # `assumed` -- recorded and unusable (spec §1, decision C5).
       supports_tools:
         value: false
-        provenance: published
-        source: "provider model documentation, retrieved 2026-11-03"
+        provenance: assumed
       supports_vision:
         value: false
-        provenance: published
-        source: "provider model documentation, retrieved 2026-11-03"
+        provenance: assumed
       supports_json_schema:
         value: false
-        provenance: published
-        source: "provider model documentation, retrieved 2026-11-03"
+        provenance: assumed
     fallback_models: []          # absent or empty = never substitute
 ```
 

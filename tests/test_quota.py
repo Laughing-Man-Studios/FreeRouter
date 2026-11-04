@@ -7,11 +7,10 @@ wrong thing.
 """
 
 import pytest
+from conftest import capabilities_yaml, sample_capabilities
 from pydantic import ValidationError
 
 from free_router.core.config import (
-    Capabilities,
-    CapabilityValue,
     ConfigError,
     ModelConfig,
     load_config,
@@ -23,43 +22,6 @@ from free_router.quota.dimensions import (
     QuotaDimension,
     WindowReset,
 )
-
-_CAPABILITIES_YAML = """\
-    capabilities:
-      context_window:
-        value: 131072
-        provenance: published
-        source: "docs"
-      supports_streaming:
-        value: true
-        provenance: measured
-        source: "test"
-      supports_tools:
-        value: false
-        provenance: published
-        source: "docs"
-      supports_vision:
-        value: false
-        provenance: published
-        source: "docs"
-      supports_json_schema:
-        value: false
-        provenance: published
-        source: "docs"
-    fallback_models: []
-"""
-
-
-def _sample_capabilities() -> Capabilities:
-    return Capabilities(
-        context_window=CapabilityValue[int](value=131072, provenance="published", source="docs"),
-        supports_streaming=CapabilityValue[bool](value=True, provenance="measured", source="test"),
-        supports_tools=CapabilityValue[bool](value=False, provenance="published", source="docs"),
-        supports_vision=CapabilityValue[bool](value=False, provenance="published", source="docs"),
-        supports_json_schema=CapabilityValue[bool](
-            value=False, provenance="published", source="docs"
-        ),
-    )
 
 
 def _dimension(**overrides: object) -> QuotaDimension:
@@ -193,7 +155,7 @@ models:
   - id: "mistral/ministral-3b-2512"
     provider: "mistral"
     provider_id: "ministral-3b-2512"
-{_CAPABILITIES_YAML}    quota:
+{capabilities_yaml()}    quota:
       - resource: "requests"
         limit: 15
         window_seconds: 1
@@ -226,7 +188,7 @@ def test_model_with_no_quota_block_has_no_dimensions() -> None:
         id="google/gemini-3.5-flash-lite",
         provider="google",
         provider_id="gemini",
-        capabilities=_sample_capabilities(),
+        capabilities=sample_capabilities(),
     )
 
     assert model.quota == []
@@ -245,7 +207,7 @@ models:
   - id: "mistral/m"
     provider: "mistral"
     provider_id: "m"
-{_CAPABILITIES_YAML}    quota:
+{capabilities_yaml()}    quota:
       - resource: "requests"
         limit: 15
         window_seconds: 60
@@ -273,7 +235,7 @@ models:
   - id: "mistral/ministral-14b-2512"
     provider: "mistral"
     provider_id: "ministral-14b-2512"
-{_CAPABILITIES_YAML}    quota:
+{capabilities_yaml()}    quota:
       - resource: "requests"
         limit: 0.5
         window_seconds: 1
@@ -297,7 +259,7 @@ models:
   - id: "mistral/m"
     provider: "mistral"
     provider_id: "m"
-{_CAPABILITIES_YAML}    quota:
+{capabilities_yaml()}    quota:
       - resource: "furlongs"
         limit: 15
         window_seconds: 60
@@ -317,7 +279,7 @@ models:
   - id: "mistral/m"
     provider: "mistral"
     provider_id: "m"
-{_CAPABILITIES_YAML}    quota:
+{capabilities_yaml()}    quota:
       - resource: "requests"
         limit: 0
         window_seconds: 60
@@ -343,7 +305,7 @@ models:
   - id: "google/gemini-3.5-flash-lite"
     provider: "google"
     provider_id: "gemini-3.5-flash-lite"
-{_CAPABILITIES_YAML}quota:
+{capabilities_yaml()}quota:
   estimation_safety_margin: 1.0
 """
     )
@@ -358,6 +320,6 @@ def test_estimation_safety_margin_defaults_to_the_constitutional_example() -> No
         id="g/m",
         provider="google",
         provider_id="gemini",
-        capabilities=_sample_capabilities(),
+        capabilities=sample_capabilities(),
     )
     assert model.quota == []

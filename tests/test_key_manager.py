@@ -17,6 +17,7 @@ The properties that matter are narrow and specific:
 import asyncio
 
 import pytest
+from conftest import capabilities_yaml
 from pydantic import SecretStr
 
 from free_router.core.config import (
@@ -326,29 +327,7 @@ def test_the_env_var_name_is_derived_not_configurable() -> None:
 # --- T023: configuration schema ---
 
 
-_CAPS_SNIPPET = """\
-    capabilities:
-      context_window:
-        value: 131072
-        provenance: published
-        source: "docs"
-      supports_streaming:
-        value: true
-        provenance: measured
-        source: "measurement"
-      supports_tools:
-        value: false
-        provenance: published
-        source: "docs"
-      supports_vision:
-        value: false
-        provenance: published
-        source: "docs"
-      supports_json_schema:
-        value: false
-        provenance: published
-        source: "docs"
-"""
+_CAPS_SNIPPET = capabilities_yaml()
 
 
 def _yaml(provider: str = "google", provider_id: str = MODEL, extra: str = "") -> str:
