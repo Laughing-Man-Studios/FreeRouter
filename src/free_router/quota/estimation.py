@@ -57,14 +57,18 @@ def estimate_input_tokens(request: Any) -> int:
     """Estimate the *input* tokens a request will consume.
 
     Args:
-        request: A :class:`~free_router.core.normalization.NormalizedRequest`, or
-            any object exposing a ``messages`` list of ``{role, content}`` dicts.
+        request: A :class:`~free_router.core.normalization.NormalizedRequest`, a
+            decoded request mapping containing ``messages``, or any object
+            exposing a ``messages`` list of ``{role, content}`` dicts.
 
     Returns:
         A token estimate. Never zero for a request with any content.
     """
     characters = 0
-    for message in getattr(request, "messages", []) or []:
+    raw_messages = (
+        request.get("messages") if isinstance(request, dict) else getattr(request, "messages", None)
+    )
+    for message in raw_messages or []:
         content = message.get("content", "") if isinstance(message, dict) else ""
         if isinstance(content, str):
             characters += len(content)
