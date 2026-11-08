@@ -160,7 +160,7 @@ and §5 rule 5 of the spec makes it the contract rather than a side effect.
 | `api/models_route.py` | Unchanged in behaviour; capability block is not exposed in the OpenAI shape (see *Risks*) |
 | `core/dispatch.py` | **Unchanged** |
 | providers | **Unchanged** |
-| quota | **Unchanged** |
+| quota | `quota/estimation.py`: `estimate_input_tokens` also accepts a decoded request mapping, not only an object with `.messages`; backwards compatible, no behaviour change for existing callers |
 | `config.yaml` | Capability blocks for the declared model; the commented Mistral entry gains one too |
 | database / migrations | **None** |
 
@@ -288,6 +288,7 @@ wrong in a way that reads as correct:
 | `response_format: {"type": "json_object"}` | `requires_json_schema=True` |
 | `max_tokens: 4096` | `reserved_output=4096`, not the global assumption |
 | `max_completion_tokens` present | same |
+| `max_tokens` / `max_completion_tokens` is a string, bool, zero or negative | falls back to `output_token_assumption`; only positive integers are reservations |
 | neither | `reserved_output = output_token_assumption` |
 
 Detection is tested against the payload **after** the route's JSON decode and

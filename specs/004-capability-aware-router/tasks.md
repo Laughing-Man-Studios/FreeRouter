@@ -159,7 +159,7 @@ sources, and the commented Mistral entry is loaded by a test so it cannot rot.
 
 **Maps to GitHub Issue:** `#18 Incoming Request Capability & Context Size Parser`
 
-- [ ] **T069: Detect hard requirements from the payload.**
+- [x] **T069: Detect hard requirements from the payload.**
 
   `core/capabilities.py`: `RequestRequirements`, `detect_requirements(payload,
   assumed_output)`.
@@ -182,7 +182,7 @@ sources, and the commented Mistral entry is loaded by a test so it cannot rot.
     matters is that the client asked for tools to be forwarded, and M3 forwards
     none.
 
-- [ ] **T070: Size the request against the window.**
+- [x] **T070: Size the request against the window.**
 
   `input_tokens` from `quota.estimation.estimate_input_tokens` — the same estimator
   the reservation cycle uses — plus `reserved_output` from the client's `max_tokens`
@@ -201,8 +201,18 @@ sources, and the commented Mistral entry is loaded by a test so it cannot rot.
 2. The table in `plan.md` § *Detection* is a parametrised test, not prose.
 3. A payload carrying `tools` is detected **and** still normalizes to a request
    with no tools, proving detection precedes the strip.
-4. `pytest tests/test_capabilities_detection.py tests/test_estimation.py`
+4. `pytest tests/test_capabilities_detection.py tests/test_quota_estimation.py`
 5. **STOP**, review, then update #18.
+
+**Batch 2 verification gate (2026-11-08).** All checks pass under `make check`
+(ruff, format, mypy strict, pytest, markdownlint) and `make test-hermetic`, with
+no provider credential set. 669 passed, up from 629. Pure deterministic detector
+implemented in `core/capabilities.py`, verified with table-driven tests in
+`tests/test_capabilities_detection.py`, and ordering relative to normalization asserted.
+Review hardening: `tool_choice: "auto"`/`"none"` and non-function dicts are not
+requirements; malformed, boolean, zero or negative token limits fall back to
+`assumed_output`; and `assumed_output` is required so the configured quota policy
+cannot be bypassed.
 
 ---
 
