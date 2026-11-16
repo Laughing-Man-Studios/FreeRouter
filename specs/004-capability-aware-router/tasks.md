@@ -295,7 +295,7 @@ cannot be bypassed.
 
 ## Batch 4: Exit-Criteria Verification & Milestone Report
 
-- [ ] **T074: Prove the exit criterion, and report the gap.**
+- [x] **T074: Prove the exit criterion, and report the gap.**
 
   Verify against a running router, not only in tests:
 
@@ -315,14 +315,51 @@ cannot be bypassed.
   **not** — tool calling is detected and refused, not served. Reporting the first
   as if it implied the second is the failure mode this milestone is most exposed to.
 
+  **Run 2026-11-15 21:52–21:58 local (2026-11-16 02:52–02:58 UTC).** The router
+  ran under uvicorn on `127.0.0.1:8113` with the shipped `config.yaml` and a fresh
+  database, and on `127.0.0.1:8114` with a verification-only config for the fallback
+  row. Credentials were the live Google key from the environment, after confirming
+  `gemini-3.5-flash-lite` and `gemini-3.5-flash` in the provider's model list.
+
+  | Row | Condition | Observed | Verdict |
+  | :--- | :--- | :--- | :--- |
+  | In-context dispatch | live, shipped config, short prompt | `200` in 0.72 s, content `ok`; exactly one `provider_dispatched` | pass |
+  | Oversized | live, 4,840,000-char prompt (~1,210,000 estimated tokens) | `400 context_window_exceeded`, `param: "messages"`, 16.7 ms; `provider_dispatched` count unchanged | pass, observed locally |
+  | Tools | live, non-empty `tools` | `400 capability_unsatisfiable`, `param: "tools"`, 1.7 ms; no dispatch | pass, observed locally |
+  | Structured output | live, `response_format` | `400 capability_unsatisfiable`, `param: "response_format"`, 1.7 ms; no dispatch | pass, observed locally |
+  | Fallback substitution | synthetic window (below), live dispatch | `200` in 4.0 s; response `model` `google/gemini-3.5-flash`; INFO `model_substituted ... due to context_window_exceeded`; one dispatch to flash | pass, injected condition |
+  | Cooling with fallbacks | injected at the httpx transport (`respx`) | `test_scenario_8_cooldown_does_not_trigger_substitution` and `test_cooldown_fallback_skipped_for_next_eligible`: no substitution on a requested-model `429`; a cooling fallback is skipped for the next eligible entry | pass, injected |
+  | Startup validation | local config load, same step the lifespan calls | missing provenance → `models[verify/bad-model].capabilities.supports_vision.provenance: Field required`; unknown key → `...supports_audio: Extra inputs are not permitted` | pass, observed locally |
+
+  **The provider console was not accessed from this environment**, so rows 2 and 3
+  are recorded as observed *locally*: the 400s arrived in 1–17 ms and the
+  `provider_dispatched` count did not move, which is the router's own record that
+  nothing left the process. The console remains the operator's corroboration.
+
+  **The fallback row's condition is synthetic and named as such.** Every shipped
+  model declares `fallback_models: []`, and both real 3.5 models state a 1,048,576
+  window, so triggering substitution against shipped values would need a
+  ~1.1M-token live prompt. A temporary config instead declared a 100-token
+  `context_window` on `verify/source` and a real `google/gemini-3.5-flash` fallback.
+  Only the size threshold is synthetic; the filter, selection, dispatch and response
+  paths are the production ones. The cooling row is injected for the same reason
+  M2's T061 injected `5xx` and timeout: a live `429` cannot be produced on demand,
+  and the adapters use module-level base URLs.
+
 **Verification & Stop:**
 
-1. `make check` green; suite passes with no provider credential set.
-2. Each numbered item above recorded with its observed output, and with whether it
-   was **observed** or **injected** — the distinction M2's T061 matrix established
-   and which must not be quietly dropped.
-3. `spec.md` § *Explicit Non-Goals* reviewed against what was built.
-4. **STOP**, review, then the milestone integration PR.
+1. `make check` green (705 passed; ruff, format, `mypy --strict`, markdownlint);
+   `make test-hermetic` green with provider credentials unset (705 passed).
+2. Every numbered item above is recorded with its observed output and labelled
+   **observed** or **injected**, per T061's distinction.
+3. `spec.md` § *Explicit Non-Goals* reviewed against what was built: no discrepancy.
+   Tools, vision and structured output are refused, not forwarded; no classifier,
+   paid routing, ranking, truncation, discovered metadata, multi-hop fallback or
+   `model = "free"` path exists.
+4. **STOP** for review, then the milestone integration PR.
+
+**Status:** verified 2026-11-15. The M3 exit criterion is met; the OpenHands
+objective remains unmet and is carried to M4, as stated below.
 
 ---
 
@@ -330,6 +367,9 @@ cannot be bypassed.
 
 ROADMAP Milestone 3: *"A request is never deliberately sent to a model that the
 local registry already knows cannot satisfy its hard requirements."*
+
+Verified end-to-end by T074 on 2026-11-15; the matrix and its observed/injected
+labels are recorded above.
 
 | Criterion | Status after M3 |
 | :--- | :--- |
