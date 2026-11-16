@@ -218,9 +218,9 @@ cannot be bypassed.
 
 ## Batch 3: Hard-Requirement Filtering, Substitution & Wiring
 
-**Maps to GitHub Issue:** `#19 Hard Requirements Filtering Pipeline`
+**Maps to GitHub Issue:** `#19 Hard-Requirement Filtering, Opt-in Substitution & Route Wiring`
 
-- [ ] **T071: The eligibility predicate.**
+- [x] **T071: The eligibility predicate.**
 
   `mismatch(model, requirements) -> Mismatch | None` — the single place the rules
   live: provenance handling (`assumed` ≡ unknown), capability flags, and
@@ -232,12 +232,20 @@ cannot be bypassed.
 
   Code selection: `streaming_unsupported` when streaming is the unsatisfied
   requirement (C6), `context_window_exceeded` for size, `capability_unsatisfiable`
-  otherwise.
+  otherwise. An unusable (`assumed`) context window is *unknown*, not too small, so
+  it reports `capability_unsatisfiable` with `param: "messages"`; claiming the
+  request is oversized would be a statement the router cannot support.
 
-- [ ] **T072: `resolve_target` — substitution, and the rules that stop it.**
+- [x] **T072: `resolve_target` — substitution, and the rules that stop it.**
 
   Step 3 of the §7.1 pipeline: honour the requested model, else walk
   `fallback_models` in declared order and take the first eligible one. Single hop.
+
+  Step 2 applies to every fallback candidate, not only to the model finally
+  dispatched: a fallback that is cooling, breaker-degraded or out of quota is
+  skipped for the next eligible entry. If capable fallbacks existed but none was
+  dispatchable, the first capacity error is raised, keeping the M2 `429`/`503`
+  outcome rather than converting it into a misleading `400`.
 
   **Substitution is triggered by capability or context mismatch only.** A rate
   limit or cooldown on the requested model keeps its existing outcome and never
@@ -248,7 +256,7 @@ cannot be bypassed.
   M3 does not rank fallbacks. Step 4 is M4, and "first eligible" is a declared
   order rather than a score.
 
-- [ ] **T073: Wire both routes, and report the model that served the request.**
+- [x] **T073: Wire both routes, and report the model that served the request.**
 
   `api/routes.py` (unary) and the streaming path both call
   `resolve_target`; the effective model id flows into `to_openai_completion` and
@@ -279,6 +287,9 @@ cannot be bypassed.
 5. `pytest tests/test_capabilities_filter.py tests/test_routes.py
    tests/test_streaming.py`
 6. **STOP**, review, then update #19.
+
+**Status:** implemented on `M3-Batch3-Capability-Filtering`. `make check` and
+`make test-hermetic` are green (705 tests), with no provider credential set.
 
 ---
 

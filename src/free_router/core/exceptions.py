@@ -26,6 +26,8 @@ __all__ = [
     "StreamingUnsupportedError",
     "UnsupportedModelError",
     "ValidationError",
+    "CapabilityUnsatisfiableError",
+    "ContextWindowExceededError",
 ]
 
 
@@ -108,6 +110,19 @@ class ValidationError(RouterBaseError):
 
     error_type = "invalid_request_error"
     code = "invalid_request"
+
+
+class CapabilityUnsatisfiableError(ValidationError):
+    """A required capability cannot be satisfied by any eligible model."""
+
+    code = "capability_unsatisfiable"
+
+
+class ContextWindowExceededError(ValidationError):
+    """The estimated request tokens plus reserved output exceed every eligible context window."""
+
+    code = "context_window_exceeded"
+    param = "messages"
 
 
 class UnsupportedModelError(ValidationError):
