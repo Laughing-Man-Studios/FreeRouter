@@ -108,14 +108,16 @@ The unary route and the streaming route are separate functions and M2 already
 duplicated capacity gating between them, with a parity test to stop the copies
 drifting. M3 does not add a second duplication:
 
-`resolve_target(config, requirements, requested_model)` is called by both routes and
-returns either a target or a mismatch. It performs steps 1–3 of the pipeline:
+`resolve_target(config, requirements, requested_model, *, capacity_probe=None)` is
+called by both routes and returns either a target or a mismatch. It performs steps
+1–3 of the pipeline:
 
 ```python
 @dataclass(frozen=True)
 class Target:
     model: ModelConfig
     substituted_from: str | None       # None when the request was honoured exactly
+    forcing_requirement: str | None    # the mismatch code that triggered substitution
 
 def resolve_target(...) -> Target: ...
 ```
@@ -123,6 +125,14 @@ def resolve_target(...) -> Target: ...
 Eligibility for the requested model, eligibility for each fallback, the
 capability-only trigger rule, and the single-hop limit all live inside that one
 function, so the streaming path cannot implement a slightly different policy.
+
+The optional `capacity_probe` supplies step 2 for fallback candidates only: a
+capability-eligible fallback that is cooling, breaker-degraded or out of quota is
+skipped in favour of the next declared entry. The probe is the dispatcher's own
+capacity gate, so the rules are not copied. If capable fallbacks existed but none
+was dispatchable, the first capacity error is raised, preserving the M2 `429`/`503`
+outcome. The requested model is never probed: a capacity failure on it keeps its
+M2 outcome and must not trigger substitution.
 
 ### Substitution without touching the dispatcher
 
@@ -201,10 +211,16 @@ def eligible_models(
 ) -> list[ModelConfig]: ...  # every model whose mismatch() is None, in config order
 
 
+CapacityProbe = Callable[[ModelConfig, int], RouterBaseError | None]
+# None when dispatchable; otherwise the error the dispatcher's gate would raise.
+
+
 def resolve_target(
     config: Config,
     requirements: RequestRequirements,
     requested_model: str,
+    *,
+    capacity_probe: CapacityProbe | None = None,
 ) -> Target: ...  # raises UnsupportedModelError / CapabilityUnsatisfiable* / ContextWindowExceeded
 ```
 

@@ -19,10 +19,11 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 
 from free_router.api import stream_dispatch
-from free_router.core.config import Config
+from free_router.core.capabilities import CapacityProbe, detect_requirements, resolve_target
+from free_router.core.config import Config, ModelConfig
 from free_router.core.debug_logging import debug_payload
 from free_router.core.dispatch import Dispatcher
-from free_router.core.exceptions import UnsupportedModelError, ValidationError
+from free_router.core.exceptions import RouterBaseError, UnsupportedModelError, ValidationError
 from free_router.core.logging import log_context
 from free_router.core.normalization import (
     NormalizedRequest,
@@ -88,6 +89,30 @@ def resolve_model(config: Config, model: str) -> tuple[str, str]:
     )
 
 
+def _capacity_probe(dispatcher: Dispatcher) -> CapacityProbe:
+    """Adapt the dispatcher's capacity gate into a fallback-selection probe.
+
+    Substitution must respect the same quota, cooldown and breaker rules as
+    dispatch (spec §4 step 2). Reusing ``Dispatcher._check_capacity`` keeps one
+    implementation of those rules: a fallback that would be refused at dispatch
+    is skipped during selection instead, and the error it would have raised is
+    preserved for the case where no fallback is available.
+
+    The requested model is deliberately not probed here; the dispatcher still
+    gates it exactly as in M2, so a rate limit on it keeps its existing outcome.
+    """
+
+    def probe(model: ModelConfig, estimated_tokens: int) -> RouterBaseError | None:
+        try:
+            # One capacity gate, not two: the dispatcher's rules are the only ones.
+            dispatcher._check_capacity(model.provider, model.provider_id, estimated_tokens)
+        except RouterBaseError as exc:
+            return exc
+        return None
+
+    return probe
+
+
 @router.post("/chat/completions", response_model=None)
 async def chat_completions(
     request: Request,
@@ -119,32 +144,53 @@ async def chat_completions(
         RetriesExhaustedError: If attempts were made and all of them failed.
     """
     payload: Any = await _read_json_object(request)
+    requirements = detect_requirements(payload, assumed_output=config.quota.output_token_assumption)
     normalized = normalize_chat_completion_request(payload)
 
-    # Model validation happens here, inside the route handler, so no dispatch
-    # can occur for a model the router does not serve (spec Behavioral Rules).
-    provider, provider_id = resolve_model(config, normalized.model)
+    target = resolve_target(
+        config,
+        requirements,
+        normalized.model,
+        capacity_probe=_capacity_probe(dispatcher),
+    )
+    if target.substituted_from is not None:
+        logger.info(
+            "model_substituted: requested '%s', substituted '%s' due to %s",
+            target.substituted_from,
+            target.model.id,
+            target.forcing_requirement,
+            extra={
+                "event": "model_substituted",
+                "routing_decision": "substituted",
+            },
+        )
+        effective_request = normalized.model_copy(update={"model": target.model.id})
+    else:
+        effective_request = normalized
+
+    provider = target.model.provider
+    provider_id = target.model.provider_id
 
     # Published on request.state so the logging middleware can attribute the
     # request_completed record. The middleware binds its context around
     # call_next and logs after the route returns, so a log_context made inside
     # the handler is already unwound by then and would not reach that record.
-    request.state.model = normalized.model
+    request.state.model = target.model.id
     request.state.provider = provider
 
     debug_payload(
         phase="inbound",
         provider=provider,
-        model=normalized.model,
-        data={"client_request": payload, "normalized": normalized.model_dump()},
+        model=target.model.id,
+        data={"client_request": payload, "normalized": effective_request.model_dump()},
     )
 
-    if normalized.stream:
+    if effective_request.stream:
         return await _stream_response(
             request=request,
             config=config,
             dispatcher=dispatcher,
-            normalized=normalized,
+            normalized=effective_request,
             provider=provider,
             provider_id=provider_id,
         )
@@ -155,8 +201,8 @@ async def chat_completions(
     # `model` alongside `provider`. The dispatcher knows only the provider-native
     # id, and CONSTITUTION 9.1 lists both as expected operational metadata.
     started = time.perf_counter()
-    with log_context(model=normalized.model, provider=provider):
-        outcome = await dispatcher.dispatch(normalized, provider, provider_id)
+    with log_context(model=target.model.id, provider=provider):
+        outcome = await dispatcher.dispatch(effective_request, provider, provider_id)
         logger.info(
             "dispatch_completed",
             extra={
@@ -170,14 +216,14 @@ async def chat_completions(
     response = outcome.response
     completion = to_openai_completion(
         response,
-        request_model=normalized.model,
-        response_id=f"chatcmpl-{_completion_id(normalized, response, provider_id)}",
+        request_model=target.model.id,
+        response_id=f"chatcmpl-{_completion_id(effective_request, response, provider_id)}",
         created=int(datetime.now(tz=UTC).timestamp()),
     )
     debug_payload(
         phase="client_response",
         provider=provider,
-        model=normalized.model,
+        model=target.model.id,
         data=completion,
     )
     return completion
