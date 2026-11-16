@@ -39,6 +39,28 @@ models:
   - id: "google/gemini-3.5-flash-lite"
     provider: "google"
     provider_id: "gemini-3.5-flash-lite"
+    capabilities:
+      context_window:
+        value: 131072
+        provenance: published
+        source: "docs"
+      supports_streaming:
+        value: true
+        provenance: measured
+        source: "test"
+      supports_tools:
+        value: false
+        provenance: published
+        source: "docs"
+      supports_vision:
+        value: false
+        provenance: published
+        source: "docs"
+      supports_json_schema:
+        value: false
+        provenance: published
+        source: "docs"
+    fallback_models: []
     quota:
       - resource: "requests"
         limit: 15

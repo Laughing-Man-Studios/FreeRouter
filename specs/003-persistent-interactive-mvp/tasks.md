@@ -1089,6 +1089,14 @@ remaining work with no issue of its own)
   restart with cooldown and counter state intact (Batches 1–2), and streaming plus
   model discovery serving an interactive client (Batches 4–5).
 
+  **Amended 2026-11-03: the work is not in M3 either, and now sits in M4.** T065's
+  "deferred to M3" was a promise M3 could not keep: its four issues scope capability
+  awareness, not adapter pass-through, and neither adapter forwards `tools`. M3
+  refuses tool requests rather than serving them, so the objective moves to M4 with
+  the pass-through work. See `specs/004-capability-aware-router/spec.md` §
+  *Clarifications Recorded* (C5) and this file's § *Carried Into M3, Not Deferred By
+  Choice* below.
+
 ### T060 verification gate (2026-10-29)
 
 1. **The provider's own code is a second field, not a replacement.**
@@ -1171,6 +1179,11 @@ The clause was unreachable in M2 regardless of effort: "interactive OpenHands
 workloads" implies agentic use, which requires tool calling — explicitly outside
 this milestone's boundary.
 
+**Amended 2026-11-03: the second clause is now carried by M4, not M3.** M3 scopes
+capability awareness and does not forward tool calls, so it cannot serve an agentic
+client either. The deferral target is corrected here and in the ROADMAP; M2's own
+record is unchanged.
+
 What M2 demonstrates:
 
 | Criterion | Batch |
@@ -1186,8 +1199,8 @@ What M2 demonstrates:
 
 | Item | Source | Note |
 | :--- | :--- | :--- |
-| **OpenHands as a real workload** | A1 | **Deferred to M3 by decision.** Tool calling converges with capability-aware routing there. |
-| Tool calling | #36 non-goal | Next compatibility feature after streaming. OpenHands agentic use depends on it. |
+| **OpenHands as a real workload** | A1 | **Originally deferred to M3 by decision, then to M4 on 2026-11-03.** M3 delivers capability-aware routing but not tool support, and OpenHands needs both. See `specs/004` § C5. |
+| Tool calling | #36 non-goal | Next compatibility feature after streaming. OpenHands agentic use depends on it. **Still unimplemented after M3** — M3 detects and refuses it; M4 forwards it. |
 | Capability-aware routing | M3 | — |
 | Cross-file deployment contract enforcement | M1 Batch 6 | `config.yaml` ↔ `docker-compose.yml` ↔ `ci.yml` is checked only by the CI smoke test. Warnings, not enforcement. |
 | Mistral RPD measurement | ADR-0006 §7 | Persistent counters make this answerable empirically for the first time. |

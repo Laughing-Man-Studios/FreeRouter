@@ -7,9 +7,14 @@ wrong thing.
 """
 
 import pytest
+from conftest import capabilities_yaml, sample_capabilities
 from pydantic import ValidationError
 
-from free_router.core.config import ConfigError, ModelConfig, load_config
+from free_router.core.config import (
+    ConfigError,
+    ModelConfig,
+    load_config,
+)
 from free_router.quota.dimensions import (
     SECONDS_PER_DAY,
     DimensionResource,
@@ -145,12 +150,12 @@ def test_dimensions_load_from_config(workdir, write_config, set_api_key) -> None
     """The representation must be reachable from config.yaml, not just the API."""
     set_api_key()
     write_config(
-        """\
+        f"""\
 models:
   - id: "mistral/ministral-3b-2512"
     provider: "mistral"
     provider_id: "ministral-3b-2512"
-    quota:
+{capabilities_yaml()}    quota:
       - resource: "requests"
         limit: 15
         window_seconds: 1
@@ -179,7 +184,12 @@ def test_model_with_no_quota_block_has_no_dimensions() -> None:
 
     This is how an unverified limit is represented, so it must not be an error.
     """
-    model = ModelConfig(id="google/gemini-3.5-flash-lite", provider="google", provider_id="gemini")
+    model = ModelConfig(
+        id="google/gemini-3.5-flash-lite",
+        provider="google",
+        provider_id="gemini",
+        capabilities=sample_capabilities(),
+    )
 
     assert model.quota == []
 
@@ -192,12 +202,12 @@ def test_unknown_quota_field_is_rejected(workdir, write_config, set_api_key) -> 
     """
     set_api_key()
     write_config(
-        """\
+        f"""\
 models:
   - id: "mistral/m"
     provider: "mistral"
     provider_id: "m"
-    quota:
+{capabilities_yaml()}    quota:
       - resource: "requests"
         limit: 15
         window_seconds: 60
@@ -220,12 +230,12 @@ def test_fractional_limits_load_from_config(workdir, write_config, set_api_key) 
     """
     set_api_key()
     write_config(
-        """\
+        f"""\
 models:
   - id: "mistral/ministral-14b-2512"
     provider: "mistral"
     provider_id: "ministral-14b-2512"
-    quota:
+{capabilities_yaml()}    quota:
       - resource: "requests"
         limit: 0.5
         window_seconds: 1
@@ -244,12 +254,12 @@ models:
 def test_unknown_resource_is_rejected_at_startup(workdir, write_config, set_api_key) -> None:
     set_api_key()
     write_config(
-        """\
+        f"""\
 models:
   - id: "mistral/m"
     provider: "mistral"
     provider_id: "m"
-    quota:
+{capabilities_yaml()}    quota:
       - resource: "furlongs"
         limit: 15
         window_seconds: 60
@@ -264,12 +274,12 @@ models:
 def test_zero_limit_is_rejected_at_startup(workdir, write_config, set_api_key) -> None:
     set_api_key()
     write_config(
-        """\
+        f"""\
 models:
   - id: "mistral/m"
     provider: "mistral"
     provider_id: "m"
-    quota:
+{capabilities_yaml()}    quota:
       - resource: "requests"
         limit: 0
         window_seconds: 60
@@ -290,12 +300,12 @@ def test_estimation_safety_margin_must_exceed_one(workdir, write_config, set_api
     """
     set_api_key()
     write_config(
-        """\
+        f"""\
 models:
   - id: "google/gemini-3.5-flash-lite"
     provider: "google"
     provider_id: "gemini-3.5-flash-lite"
-quota:
+{capabilities_yaml()}quota:
   estimation_safety_margin: 1.0
 """
     )
@@ -306,5 +316,10 @@ quota:
 
 def test_estimation_safety_margin_defaults_to_the_constitutional_example() -> None:
     """CONSTITUTION §8.2 gives ``estimated_tokens * 1.1`` as its example."""
-    model = ModelConfig(id="g/m", provider="google", provider_id="gemini")
+    model = ModelConfig(
+        id="g/m",
+        provider="google",
+        provider_id="gemini",
+        capabilities=sample_capabilities(),
+    )
     assert model.quota == []

@@ -21,6 +21,7 @@ from typing import Any
 import httpx
 import pytest
 import respx
+from conftest import capabilities_yaml, sample_capabilities
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
@@ -33,12 +34,13 @@ MODEL = "google/gemini-3.5-flash-lite"
 PROVIDER_MODEL_ID = "gemini-3.5-flash-lite"
 GENERATE_URL = f"{GOOGLE_API_BASE}/v1beta/models/{PROVIDER_MODEL_ID}:generateContent"
 
-BASE_CONFIG = """\
-models:
-  - id: "google/gemini-3.5-flash-lite"
-    provider: "google"
-    provider_id: "gemini-3.5-flash-lite"
-"""
+
+BASE_CONFIG = (
+    "models:\n"
+    '  - id: "google/gemini-3.5-flash-lite"\n'
+    '    provider: "google"\n'
+    '    provider_id: "gemini-3.5-flash-lite"\n' + capabilities_yaml()
+)
 
 
 def body() -> dict[str, Any]:
@@ -57,7 +59,14 @@ def body() -> dict[str, Any]:
 def minimal_config(**overrides: Any) -> Config:
     """A config with one model, plus any override under test."""
     return Config(
-        models=[ModelConfig(id=MODEL, provider="google", provider_id=PROVIDER_MODEL_ID)],
+        models=[
+            ModelConfig(
+                id=MODEL,
+                provider="google",
+                provider_id=PROVIDER_MODEL_ID,
+                capabilities=sample_capabilities(),
+            )
+        ],
         **overrides,
     )
 

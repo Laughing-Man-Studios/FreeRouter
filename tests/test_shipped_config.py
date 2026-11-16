@@ -19,6 +19,7 @@ actual image with the actual environment. The warnings in `config.yaml` and
 `ci.yml` say so where the next person will actually be editing.
 """
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -26,12 +27,23 @@ import pytest
 import yaml
 from conftest import MANAGED_ENV_VARS
 
-from free_router.core.config import ConfigError, key_env_var, load_config
+from free_router.core.config import Capabilities, ConfigError, key_env_var, load_config
+
+_CITATION_DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+"""Every provenance source ends with the date it was retrieved or measured."""
 
 SHIPPED_CONFIG = Path(__file__).resolve().parent.parent / "config.yaml"
 """The repository's default configuration, as baked into the image by the Dockerfile."""
 
-_MODEL_KEYS = {"id", "provider", "provider_id", "key_aliases", "quota"}
+_MODEL_KEYS = {
+    "id",
+    "provider",
+    "provider_id",
+    "key_aliases",
+    "quota",
+    "capabilities",
+    "fallback_models",
+}
 """Fields a model entry may declare. Anything else is a mistake or a pasted secret."""
 
 
@@ -151,3 +163,112 @@ def test_missing_shipped_config_reports_the_path() -> None:
     """An absent config is a clear error naming the file looked for."""
     with pytest.raises(ConfigError, match="definitely-not-here.yaml"):
         load_config(SHIPPED_CONFIG.parent / "definitely-not-here.yaml", resolve_keys=False)
+
+
+def test_shipped_config_models_declare_complete_capabilities() -> None:
+    """Every model in the shipped config carries all required capabilities with provenance.
+
+    The reference configuration must not be the one place the rules are unmet
+    (spec §1, §7, tasks.md T067).
+    """
+    for model in _shipped().models:
+        _assert_complete_capabilities(model)
+
+
+def test_shipped_config_declares_the_verified_google_limits() -> None:
+    """The shipped numbers are the ones the provider documents, not placeholders.
+
+    A context window that is too small refuses legal requests; one that is too
+    large sends requests the provider rejects. Both are silent in a fake config,
+    so the shipped value is pinned here to its source.
+    """
+    google = _shipped().models[0]
+
+    assert google.capabilities.context_window.value == 1_048_576
+    assert google.capabilities.supports_streaming.value is True
+    assert google.capabilities.supports_streaming.provenance == "measured"
+    assert google.fallback_models == []
+
+
+def test_commented_mistral_entry_is_a_valid_model_config(tmp_path: Path) -> None:
+    """The commented Mistral example loads when uncommented.
+
+    A commented block is documentation that is never parsed, so it rots
+    silently: a field renamed in the schema leaves a copy-paste trap behind.
+    Uncommenting it here is exactly what an operator would do.
+    """
+    path = tmp_path / "config.yaml"
+    path.write_text("models:\n" + _commented_mistral_entry(), encoding="utf-8")
+
+    config = load_config(path, resolve_keys=False)
+
+    assert [model.id for model in config.models] == ["mistral/ministral-3b-2512"]
+    model = config.models[0]
+    assert model.capabilities.context_window.value == 262_144
+    assert model.provider == "mistral"
+    _assert_complete_capabilities(model)
+
+
+def _assert_complete_capabilities(model: Any) -> None:
+    """One model's capability block is complete, cited and typed.
+
+    Every field named by :class:`Capabilities` is checked, so adding a
+    capability to the schema without shipping a value fails here rather than at
+    a user's startup.
+    """
+    caps = model.capabilities
+    for name in Capabilities.model_fields:
+        field = getattr(caps, name)
+        assert field.provenance in ("published", "measured", "assumed"), (
+            f"{model.id}.{name} has unknown provenance {field.provenance!r}"
+        )
+        if field.provenance == "assumed":
+            assert field.source is None, (
+                f"{model.id}.{name} is assumed, so it must not claim a source"
+            )
+            continue
+        assert field.source is not None and field.source.strip(), (
+            f"{model.id}.{name} is {field.provenance} but has no source"
+        )
+        assert _CITATION_DATE.search(field.source), (
+            f"{model.id}.{name} source {field.source!r} carries no retrieval date, "
+            "so it cannot be checked for staleness"
+        )
+        if field.provenance == "published":
+            assert field.source.startswith("http"), (
+                f"{model.id}.{name} is published but its source is not a provider URL"
+            )
+
+    assert isinstance(caps.context_window.value, int)
+    assert caps.context_window.value > 0
+    for name in (
+        "supports_streaming",
+        "supports_tools",
+        "supports_vision",
+        "supports_json_schema",
+    ):
+        assert isinstance(getattr(caps, name).value, bool)
+    assert isinstance(model.fallback_models, list)
+
+
+def _commented_mistral_entry() -> str:
+    """The commented model entry in the shipped file, with its ``#`` prefix removed."""
+    lines = SHIPPED_CONFIG.read_text(encoding="utf-8").splitlines()
+    start = next(
+        index
+        for index, line in enumerate(lines)
+        if line.strip() == '#   - id: "mistral/ministral-3b-2512"'
+    )
+
+    entry: list[str] = []
+    for line in lines[start:]:
+        if not line.startswith("#"):
+            break
+        content = line[1:]
+        if content.startswith(" "):
+            content = content[1:]
+        # An unindented line is prose (the WARNING that follows), not the entry.
+        if content and not content.startswith(" "):
+            break
+        entry.append(content)
+    return "\n".join(entry) + "\n"

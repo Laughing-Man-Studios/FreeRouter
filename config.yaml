@@ -2,6 +2,35 @@ models:
   - id: "google/gemini-3.5-flash-lite"
     provider: "google"
     provider_id: "gemini-3.5-flash-lite"
+    capabilities:
+      context_window:
+        value: 1048576
+        provenance: published
+        # The input token limit. The provider states it separately from the
+        # 65,536 output limit; the fit test adds reserved output to this figure,
+        # so the input limit is the conservative reading (spec §2).
+        source: "https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash-lite, input token limit, retrieved 2026-11-04"
+      supports_streaming:
+        value: true
+        provenance: measured
+        source: "T062 measurement, Google, 20/20 streamed, 2026-10-30"
+      # The model supports function calling, image input and structured output;
+      # this router does not. Neither adapter forwards tools, vision or
+      # response_format, so these are recorded as `assumed` -- treated as unknown
+      # and never usable -- rather than `published: false`, which would claim the
+      # provider documents the feature as unsupported. Declaring `true` would
+      # pass the filter and then silently degrade at the ingress boundary
+      # (decision C5, CONSTITUTION §7.1).
+      supports_tools:
+        value: false
+        provenance: assumed
+      supports_vision:
+        value: false
+        provenance: assumed
+      supports_json_schema:
+        value: false
+        provenance: assumed
+    fallback_models: []
 
 # The Mistral adapter ships in M1 (Issue #7) and is selectable purely through
 # configuration -- `core/config.py` and `api/routes.py` were deliberately left
@@ -18,6 +47,27 @@ models:
 #   - id: "mistral/ministral-3b-2512"
 #     provider: "mistral"
 #     provider_id: "ministral-3b-2512"
+#     capabilities:
+#       context_window:
+#         value: 262144
+#         provenance: published
+#         source: "https://docs.mistral.ai/models/ministral-3-3b-25-12, retrieved 2026-11-04"
+#       supports_streaming:
+#         value: true
+#         provenance: measured
+#         source: "T061 manual matrix, Mistral, 1 streamed request, 12 chunks, 2026-10-30"
+#       # The model supports function calling, image input and structured output;
+#       # this router does not, for the reasons given in the Google block above.
+#       supports_tools:
+#         value: false
+#         provenance: assumed
+#       supports_vision:
+#         value: false
+#         provenance: assumed
+#       supports_json_schema:
+#         value: false
+#         provenance: assumed
+#     fallback_models: []
 #     # Measured free-tier limits (Issue #7, workspace console):
 #     #   12.50 requests/second, 1,300,000 tokens/minute.
 #     # Recorded as measured rather than published -- neither provider documents

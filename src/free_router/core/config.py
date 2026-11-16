@@ -143,6 +143,77 @@ class ConfigError(RuntimeError):
     """A condition that must prevent the process from starting."""
 
 
+CapabilityProvenance = Literal["published", "measured", "assumed"]
+
+
+class CapabilityValue[T](BaseModel):
+    """A capability declaration with auditable provenance (ADR-0008).
+
+    T is generic (int, bool) so that capability types remain strict under
+    ``mypy --strict`` without unions or casts.
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    """Strict on purpose: ``value: true`` must not become a 1-token context
+    window, and ``value: "yes"`` must not become a verified capability. The
+    schema is closed, so a value of the wrong YAML type is a configuration
+    error rather than something to coerce.
+    """
+
+    value: T
+    provenance: CapabilityProvenance
+    source: str | None = None
+
+    @property
+    def is_usable(self) -> bool:
+        """Whether this capability is verified and eligible to satisfy requirements.
+
+        Assumed capabilities are recorded for documentation only and treated as
+        unknown by requirement filters (spec §1, ADR-0008).
+        """
+        return self.provenance in ("published", "measured")
+
+    @model_validator(mode="after")
+    def _validate_source(self) -> CapabilityValue[T]:
+        if self.provenance in ("published", "measured"):
+            if not self.source or not self.source.strip():
+                raise ValueError(
+                    f"source is required when provenance is '{self.provenance}'. "
+                    "Name the document and date, or the measurement (spec Requirement 1, ADR-0008)."
+                )
+        elif self.provenance == "assumed":
+            if self.source is not None:
+                raise ValueError(
+                    "source must not be provided when provenance is 'assumed'. "
+                    "Assumed capabilities are unverified; recording a source would claim "
+                    "verification that does not exist (spec Requirement 1, ADR-0008)."
+                )
+        return self
+
+
+class Capabilities(BaseModel):
+    """The capability set declared by a model (spec §1, ROADMAP §3.7)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    context_window: CapabilityValue[int]
+    supports_streaming: CapabilityValue[bool]
+    supports_tools: CapabilityValue[bool]
+    supports_vision: CapabilityValue[bool]
+    supports_json_schema: CapabilityValue[bool]
+
+    @field_validator("context_window")
+    @classmethod
+    def _validate_context_window(cls, value: CapabilityValue[int]) -> CapabilityValue[int]:
+        if value.value <= 0:
+            raise ValueError(
+                f"context_window must be a positive integer, found {value.value}. "
+                "Zero or negative is not a small context window, it is a missing "
+                "one wearing a number."
+            )
+        return value
+
+
 class ModelConfig(BaseModel):
     """A single externally-addressable model and its provider mapping."""
 
@@ -151,6 +222,8 @@ class ModelConfig(BaseModel):
     id: str
     provider: str
     provider_id: str
+    capabilities: Capabilities
+    fallback_models: list[str] = Field(default_factory=list)
     cooldown_seconds: float = Field(default=60.0, gt=0)
     """How long to wait after a rate limit before this model may be dispatched again.
 
@@ -234,6 +307,27 @@ class ModelConfig(BaseModel):
                 f"model '{self.id}' declares {len(self.key_aliases)} key aliases but "
                 f"provider '{self.provider}' permits at most {cap}. Pooling is capped "
                 "under CONSTITUTION 6.1 Conservative Compliance Mode; see ADR-0003."
+            )
+        return self
+
+    @field_validator("fallback_models")
+    @classmethod
+    def _validate_fallback_duplicates(cls, value: list[str]) -> list[str]:
+        seen: set[str] = set()
+        for item in value:
+            if item in seen:
+                raise ValueError(
+                    f"duplicate fallback_models entry '{item}'. Fallbacks must be unique."
+                )
+            seen.add(item)
+        return value
+
+    @model_validator(mode="after")
+    def _validate_fallback_self_reference(self) -> ModelConfig:
+        if self.id in self.fallback_models:
+            raise ValueError(
+                f"model '{self.id}' declares self-referential fallback_models entry "
+                f"'{self.id}'. A model cannot fall back to itself (spec §7)."
             )
         return self
 
@@ -428,6 +522,58 @@ class Config(BaseSettings):
     configuration.
     """
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+
+    def model_by_id(self, model_id: str) -> ModelConfig | None:
+        """Look up a model configuration by its external identifier.
+
+        Decision C3: lookups are provided directly on Config rather than introducing
+        a separate ModelRegistry wrapper class (CONSTITUTION §2.3).
+        """
+        for model in self.models:
+            if model.id == model_id:
+                return model
+        return None
+
+    @model_validator(mode="after")
+    def _validate_unique_model_ids(self) -> Config:
+        """Refuse duplicate external ids.
+
+        Ids became load-bearing in M3: ``model_by_id`` and fallback resolution both
+        look a model up by id. Two models sharing an id would make the two lookups
+        pick different entries (``model_by_id`` returns the first, a dict
+        comprehension keeps the last), so the same question would have two answers.
+        """
+        seen: set[str] = set()
+        for model in self.models:
+            if model.id in seen:
+                raise ValueError(
+                    f"duplicate model id '{model.id}'. Model ids are the routing key "
+                    "for explicit requests and fallbacks, so they must be unique "
+                    "(spec §5, §7)."
+                )
+            seen.add(model.id)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_fallback_relationships(self) -> Config:
+        models_by_id = {model.id: model for model in self.models}
+        for model in self.models:
+            for fallback_id in model.fallback_models:
+                if fallback_id not in models_by_id:
+                    raise ValueError(
+                        f"model '{model.id}' declares unknown fallback_models entry "
+                        f"'{fallback_id}'. All fallback models must be declared in "
+                        "configuration (spec §7)."
+                    )
+                fallback = models_by_id[fallback_id]
+                if fallback.fallback_models:
+                    raise ValueError(
+                        f"model '{model.id}' declares fallback '{fallback_id}' which itself "
+                        f"declares fallback_models ({fallback.fallback_models}). Fallback "
+                        "chains are refused: substitution is strictly single-hop "
+                        "(spec §5 rule 4, §7, ADR-0009)."
+                    )
+        return self
 
     def key_slots(self) -> dict[tuple[str, str], list[str]]:
         """Declared aliases for every model, keyed by ``(provider, provider_id)``.
@@ -649,7 +795,7 @@ def load_config(path: str | Path | None = None, *, resolve_keys: bool = True) ->
     try:
         config = Config()
     except ValidationError as exc:
-        raise ConfigError(_format_validation_error(exc)) from exc
+        raise ConfigError(_format_validation_error(exc, _model_ids_by_index(resolved))) from exc
     finally:
         _config_path_override.reset(token)
 
@@ -673,16 +819,58 @@ def _modified_at(path: Path) -> int:
         return 0
 
 
-def _format_validation_error(exc: ValidationError) -> str:
+def _model_ids_by_index(path: Path) -> dict[int, str]:
+    """Map a ``models.<index>`` path component to the model's declared id.
+
+    Pydantic reports a location such as ``models.0.capabilities``. An operator's
+    configuration has model ids, not positions, and the id is the only part of
+    that path they can search for. The document is read again here, but only on
+    the error path, so a successful load is unchanged.
+
+    Any failure is swallowed: a diagnostic must never mask the validation error
+    it exists to explain.
+    """
+    try:
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return {}
+    if not isinstance(document, dict):
+        return {}
+    entries = document.get("models")
+    if not isinstance(entries, list):
+        return {}
+
+    ids: dict[int, str] = {}
+    for index, entry in enumerate(entries):
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str):
+            ids[index] = entry["id"]
+    return ids
+
+
+def _format_validation_error(
+    exc: ValidationError, model_ids: Mapping[int, str] | None = None
+) -> str:
     """Render a validation failure for a human operator.
 
     Only the location and the message are reported. Pydantic's ``input`` value
     is deliberately omitted so that a malformed secret can never be echoed into
     logs or a crash message.
+
+    A location under a model is rewritten from the list index to the model id,
+    because "models.0.capabilities" does not tell an operator which model to fix.
     """
     problems = []
     for error in exc.errors():
-        location = ".".join(str(part) for part in error["loc"]) or "<root>"
+        parts: list[object] = list(error["loc"])
+        if (
+            len(parts) >= 2
+            and parts[0] == "models"
+            and isinstance(parts[1], int)
+            and model_ids is not None
+            and parts[1] in model_ids
+        ):
+            parts = [f"models[{model_ids[parts[1]]}]", *parts[2:]]
+        location = ".".join(str(part) for part in parts) or "<root>"
         problems.append(f"  - {location}: {error['msg']}")
     detail = "\n".join(problems)
     return f"Invalid router configuration:\n{detail}"

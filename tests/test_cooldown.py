@@ -18,6 +18,7 @@ from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 
 import pytest
+from conftest import sample_capabilities
 
 from free_router.core.config import ModelConfig
 from free_router.quota.cooldown import (
@@ -282,6 +283,7 @@ def test_config_cooldown_default_is_configurable_per_model() -> None:
         provider="mistral",
         provider_id="m",
         cooldown_seconds=300.0,
+        capabilities=sample_capabilities(),
     )
 
     assert model.cooldown_seconds == 300.0
@@ -290,14 +292,25 @@ def test_config_cooldown_default_is_configurable_per_model() -> None:
 async def test_config_rejects_a_non_positive_cooldown() -> None:
     """A zero cooldown would mean 'do not wait', which is the prohibited retry."""
     with pytest.raises(ValueError):
-        ModelConfig(id="m/m", provider="m", provider_id="m", cooldown_seconds=0.0)
+        ModelConfig(
+            id="m/m",
+            provider="m",
+            provider_id="m",
+            cooldown_seconds=0.0,
+            capabilities=sample_capabilities(),
+        )
 
 
 def test_config_default_covers_a_rolling_window() -> None:
     """The default must span the shortest documented window, not be arbitrary."""
     assert DEFAULT_COOLDOWN_SECONDS >= 60.0
     assert (
-        ModelConfig(id="g/m", provider="google", provider_id="m").cooldown_seconds
+        ModelConfig(
+            id="g/m",
+            provider="google",
+            provider_id="m",
+            capabilities=sample_capabilities(),
+        ).cooldown_seconds
         == DEFAULT_COOLDOWN_SECONDS
     )
 

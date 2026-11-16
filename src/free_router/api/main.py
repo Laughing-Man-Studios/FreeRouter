@@ -32,6 +32,8 @@ from free_router.core.config import Config, ConfigError, load_config
 from free_router.core.debug_logging import configure_debug_payload_logging
 from free_router.core.dispatch import Dispatcher
 from free_router.core.exceptions import (
+    CapabilityUnsatisfiableError,
+    ContextWindowExceededError,
     NoAvailableCapacityError,
     PersistenceUnavailableError,
     ProviderAuthError,
@@ -121,8 +123,10 @@ PROVIDER_ERROR_STATUS_MAP: dict[type[RouterBaseError], int] = {
     ProviderValidationError: 400,
     ProviderServerError: 502,
     StreamingUnsupportedError: 400,
-    ValidationError: 400,
     UnsupportedModelError: 400,
+    CapabilityUnsatisfiableError: 400,
+    ContextWindowExceededError: 400,
+    ValidationError: 400,
 }
 """Exception-to-status mapping required by spec 10.
 

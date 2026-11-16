@@ -144,3 +144,10 @@ support *conversational* use; agentic use requires tool calling, which #36 place
 outside M2's boundary. This ADR makes streaming correct, but does not make OpenHands
 an agent. That is a scoping decision for the operator, not an implementation
 detail.
+
+**Status 2026-11-03: still open, and now scheduled for M4.** M3 was expected to
+close it and did not — its scope is capability awareness, and it refuses tool
+requests rather than forwarding them (`specs/004-capability-aware-router/spec.md`
+§ C5). The open item therefore outlives two milestones. Nothing in this ADR changes:
+fail-fast after the first delivered chunk remains the streaming contract, and it is
+independent of whether the client is agentic.

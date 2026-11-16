@@ -486,7 +486,7 @@ recorded with its reasoning so it does not have to be reconstructed later.
 
 | # | Decision |
 | :--- | :--- |
-| A1 | The OpenHands objective is **deferred to M3** (was D3) |
+| A1 | The OpenHands objective is **deferred to M3** (was D3) — **re-deferred to M4** on 2026-11-03; see the note under A1 |
 | A2 | The **dispatcher stays unary-only**; the streaming path lives in the route layer |
 | A3 | **One implementation** — in-memory hot state with a persistence layer attached |
 | A4 | Error classification: **all four** improvements |
@@ -519,6 +519,25 @@ section carries the same deferral.
 
 This is a scope decision about the milestone, not an implementation detail, and it
 is recorded as a deviation rather than absorbed silently.
+
+**Amended 2026-11-03: the deferral above did not hold, and the objective is now
+carried by Milestone 4.** M3's design (`specs/004-capability-aware-router/`) found
+that the convergence assumed here does not exist: M3's four issues scope capability
+*awareness* — the schema, local requirement detection and filtering — and no issue
+scopes adapter work. Neither adapter forwards `tools`; the ingress boundary discards
+the field before dispatch (`core/normalization.py`, `SUPPORTED_INGRESS_FIELDS`). A
+filter that admitted a tools request would pass it to an adapter that strips the
+tools, which is the silent degradation CONSTITUTION §7.1 names first.
+
+So M3 **refuses** tool, vision and structured-output requests rather than serving
+them, and declares no model able to serve them. OpenHands stays unreachable. The
+objective and the pass-through work it needs move together to M4; see
+`specs/004-capability-aware-router/spec.md` § *Clarifications Recorded* (C5),
+ADR-0009, and ROADMAP § *Milestone 3* and § *Milestone 4* for the amended text.
+
+This does not change what M2 delivered or claimed. It corrects where the M2
+deferral pointed, which is a claim this document made and which turned out to be
+wrong.
 
 ### A2 — the dispatcher stays unary-only
 
