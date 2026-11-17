@@ -10,9 +10,10 @@ Verifies Issue #18, spec §3, §2, and plan.md § Detection:
 - JSON schema: json_object and json_schema response_format.
 - Streaming: stream=True vs stream=False or omitted.
 - Reserved output: max_tokens or max_completion_tokens, fallback to assumed_output.
-- Input tokens: shared reservation estimator, under-counting bias documented.
-- Detection precedes normalization: payload carrying tools is detected, but normalizer
-  discards tools.
+- Input tokens: shared reservation estimator, including framing, serialised payloads
+  and image parts sized by assumption.
+- Detection precedes normalization: payload carrying tools is detected and preserved on
+  the boundary, but no adapter forwards it yet.
 """
 
 from __future__ import annotations
@@ -24,6 +25,8 @@ from pydantic import ValidationError
 
 from free_router.core.capabilities import RequestRequirements, detect_requirements
 from free_router.core.normalization import normalize_chat_completion_request
+from free_router.providers.google.adapter import to_gemini_request
+from free_router.providers.mistral.adapter import to_mistral_request
 from free_router.quota.estimation import (
     DEFAULT_OUTPUT_TOKEN_ASSUMPTION,
     estimate_input_tokens,
@@ -429,9 +432,6 @@ def test_detection_precedes_normalization_ordering() -> None:
     assert normalized.response_format == {"type": "json_object"}
 
     # Asserted at the adapter boundary: no adapter forwards them yet in Batch 1
-    from free_router.providers.google.adapter import to_gemini_request
-    from free_router.providers.mistral.adapter import to_mistral_request
-
     gemini_body = to_gemini_request(normalized)
     assert "tools" not in gemini_body
     assert "toolConfig" not in gemini_body

@@ -61,8 +61,9 @@ class RequestRequirements(BaseModel):
             ``json_schema``. Both map to structured output requirements.
         requires_streaming: True if ``payload.stream is True``.
         input_tokens: Estimated input tokens computed using the shared reservation
-            estimator. Documented bias: under-counts per-message framing overhead and
-            returns 1 for list-shaped content.
+            estimator, which counts per-message framing overhead, serialised tool
+            and response-format payloads, and image parts by a configured
+            tokens-per-image assumption rather than by base64 length.
         reserved_output: Expected response tokens: ``max_tokens`` or ``max_completion_tokens``
             when either is a positive integer, otherwise the caller-supplied
             ``assumed_output`` (normally ``quota.output_token_assumption``).

@@ -185,19 +185,25 @@ def test_normalizer_rejects_invalid_tool_types() -> None:
     assert exc4.value.param == "response_format"
 
 
-def test_normalizer_accepts_list_shaped_content_and_assistant_tool_calls() -> None:
-    """Messages can carry part-shaped content or assistant tool calls with null content."""
+def test_normalizer_accepts_image_parts_and_assistant_tool_calls() -> None:
+    """Image part arrays and assistant tool calls with null content are accepted."""
     payload_parts = {
         "model": "google/gemini-3.5-flash-lite",
         "messages": [
             {
                 "role": "user",
-                "content": [{"type": "text", "text": "hello"}],
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.com/cat.png"},
+                    },
+                ],
             }
         ],
     }
     norm_parts = normalize_chat_completion_request(payload_parts)
-    assert norm_parts.messages[0]["content"] == [{"type": "text", "text": "hello"}]
+    assert norm_parts.messages[0]["content"] == payload_parts["messages"][0]["content"]
 
     payload_tool_call = {
         "model": "google/gemini-3.5-flash-lite",
@@ -216,6 +222,29 @@ def test_normalizer_accepts_list_shaped_content_and_assistant_tool_calls() -> No
     }
     norm_tc = normalize_chat_completion_request(payload_tool_call)
     assert "tool_calls" in norm_tc.messages[0]
+
+
+def test_normalizer_refuses_text_only_part_arrays() -> None:
+    """A part array carrying only text is refused until vision forwarding exists.
+
+    Text parts do not set ``requires_vision``, so admitting them here would let the
+    capability filter pass the request to an adapter that stringifies the list
+    rather than sending the text. Refusing locally keeps the boundary honest;
+    Batch 4 lifts this restriction.
+    """
+    payload = {
+        "model": "google/gemini-3.5-flash-lite",
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "hello"}],
+            }
+        ],
+    }
+    with pytest.raises(ValidationError) as exc:
+        normalize_chat_completion_request(payload)
+    assert exc.value.code == "invalid_message"
+    assert exc.value.param == "messages[0].content"
 
 
 def test_normalized_response_content_is_optional() -> None:

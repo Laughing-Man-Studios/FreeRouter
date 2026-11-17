@@ -22,7 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from free_router.core.exceptions import ValidationError
 
 __all__ = [
-    "SUPPORTED_INGRESS_FIELDS",
+    "REQUIRED_INGRESS_FIELDS",
     "FinishReason",
     "NormalizedChunk",
     "NormalizedRequest",
@@ -34,8 +34,13 @@ __all__ = [
     "to_openai_completion",
 ]
 
-SUPPORTED_INGRESS_FIELDS = ("model", "messages")
-"""The only request fields M0 honours. Everything else is discarded (spec 3)."""
+REQUIRED_INGRESS_FIELDS = ("model", "messages")
+"""The request fields that must be present; everything else is optional.
+
+This is a *required-field* list, not a list of honoured fields. Optional fields
+this router reads are named in :func:`normalize_chat_completion_request`; every
+other parameter is discarded here and never reaches an adapter (spec 3).
+"""
 
 FinishReason = Literal["stop", "length", "content_filter", "tool_calls"]
 """Completion termination reasons, matching the OpenAI vocabulary."""
@@ -193,10 +198,13 @@ def normalize_chat_completion_request(payload: dict[str, Any]) -> NormalizedRequ
 
     Raises:
         ValidationError: If ``model`` or ``messages`` is missing, ``messages``
-            is empty, or a message is missing ``role``/``content``. Raised
-            before any outbound call (spec Scenario 6).
+            is empty, a message is missing ``role`` or ``content`` (an assistant
+            message carrying ``tool_calls`` may omit ``content``), or its content
+            is a part array carrying text only — parts are accepted solely when
+            they include an image, which the capability filter then judges.
+            Raised before any outbound call (spec Scenario 6).
     """
-    missing = [name for name in SUPPORTED_INGRESS_FIELDS if name not in payload]
+    missing = [name for name in REQUIRED_INGRESS_FIELDS if name not in payload]
     if missing:
         raise ValidationError(
             f"Missing required field(s): {', '.join(missing)}.",
@@ -247,6 +255,7 @@ def normalize_chat_completion_request(payload: dict[str, Any]) -> NormalizedRequ
                 param=f"messages[{index}].content",
             )
         if isinstance(content, list):
+            has_image_part = False
             for part_idx, part in enumerate(content):
                 if not isinstance(part, dict):
                     raise ValidationError(
@@ -254,6 +263,14 @@ def normalize_chat_completion_request(payload: dict[str, Any]) -> NormalizedRequ
                         code="invalid_message",
                         param=f"messages[{index}].content[{part_idx}]",
                     )
+                has_image_part = has_image_part or _is_image_part(part)
+            if not has_image_part:
+                raise ValidationError(
+                    "Content part arrays carrying only text are not supported; "
+                    "send the message content as a string.",
+                    code="invalid_message",
+                    param=f"messages[{index}].content",
+                )
 
     return NormalizedRequest(
         model=payload["model"],
@@ -263,6 +280,21 @@ def normalize_chat_completion_request(payload: dict[str, Any]) -> NormalizedRequ
         tools=_optional_tools(payload),
         tool_choice=_optional_tool_choice(payload),
         response_format=_optional_response_format(payload),
+    )
+
+
+def _is_image_part(part: dict[str, Any]) -> bool:
+    """Whether a content part carries image input, in either OpenAI spelling.
+
+    Deliberately the same test :func:`~free_router.core.capabilities.detect_requirements`
+    applies: a part array this boundary accepts must be one the vision requirement
+    will then judge. If the two disagreed, a request could pass normalization and
+    reach an adapter that never expected it.
+    """
+    return (
+        part.get("type") in ("image_url", "input_image")
+        or "image_url" in part
+        or "input_image" in part
     )
 
 
@@ -381,9 +413,7 @@ def to_openai_completion(
     """
     message: dict[str, Any] = {"role": "assistant", "content": response.content}
     if response.tool_calls is not None:
-        message["tool_calls"] = [
-            tc.model_dump() if isinstance(tc, BaseModel) else tc for tc in response.tool_calls
-        ]
+        message["tool_calls"] = [tool_call.model_dump() for tool_call in response.tool_calls]
     return {
         "id": response_id,
         "object": "chat.completion",
