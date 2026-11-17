@@ -14,6 +14,8 @@ milestone makes it *accurate* rather than merely present:
 
 from __future__ import annotations
 
+import pytest
+
 from free_router.core.normalization import NormalizedRequest, NormalizedResponse, TokenUsage
 from free_router.providers.google.adapter import from_gemini_response
 from free_router.providers.mistral.adapter import from_mistral_response
@@ -320,3 +322,160 @@ def test_usage_is_metadata_and_never_content() -> None:
 
     assert set(payload) == {"input_tokens", "output_tokens", "total_tokens"}
     assert all(isinstance(value, int) or value is None for value in payload.values())
+
+
+# --- Batch 1 framing, tools, and part-shaped content sizing ------------------
+
+
+@pytest.mark.parametrize(
+    ("msg_count", "expected_at_least"),
+    [
+        (1, 4),  # 1 message × 4 framing tokens
+        (3, 12),  # 3 messages × 4 framing tokens
+        (5, 20),  # 5 messages × 4 framing tokens
+    ],
+)
+def test_framing_rises_with_message_count(msg_count: int, expected_at_least: int) -> None:
+    """Estimate rises with message count even on empty content."""
+    messages = [{"role": "user", "content": ""}] * msg_count
+    req = NormalizedRequest(model="google/x", messages=messages)
+    assert estimate_input_tokens(req) >= expected_at_least
+
+
+def test_tools_block_increases_estimate() -> None:
+    """A tools block is counted by its serialised size."""
+    without_tools = NormalizedRequest(
+        model="google/x", messages=[{"role": "user", "content": "hi"}]
+    )
+    with_tools = NormalizedRequest(
+        model="google/x",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {"type": "object", "properties": {"loc": {"type": "string"}}},
+                },
+            }
+        ],
+    )
+    assert estimate_input_tokens(with_tools) > estimate_input_tokens(without_tools)
+
+
+def test_tool_choice_and_response_format_increase_estimate() -> None:
+    """tool_choice and response_format are counted by serialised size."""
+    base = NormalizedRequest(model="google/x", messages=[{"role": "user", "content": "hi"}])
+    with_choice = NormalizedRequest(
+        model="google/x",
+        messages=[{"role": "user", "content": "hi"}],
+        tool_choice={"type": "function", "function": {"name": "get_weather"}},
+    )
+    with_format = NormalizedRequest(
+        model="google/x",
+        messages=[{"role": "user", "content": "hi"}],
+        response_format={"type": "json_object"},
+    )
+    assert estimate_input_tokens(with_choice) > estimate_input_tokens(base)
+    assert estimate_input_tokens(with_format) > estimate_input_tokens(base)
+
+
+def test_image_part_counted_by_assumption_not_base64_length() -> None:
+    """An image part is counted by the configured assumption, not base64 length."""
+    short_b64 = "data:image/png;base64,abc"
+    long_b64 = "data:image/png;base64," + "A" * 5000
+    req_short = NormalizedRequest(
+        model="google/x",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": short_b64}},
+                ],
+            }
+        ],
+    )
+    req_long = NormalizedRequest(
+        model="google/x",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": long_b64}},
+                ],
+            }
+        ],
+    )
+    # Both produce the exact same estimate (assumption-based: 258 + 4 = 262 tokens)
+    assert estimate_input_tokens(req_short) == estimate_input_tokens(req_long)
+    assert estimate_input_tokens(req_short) == 262
+
+
+def test_text_part_counted_as_text() -> None:
+    """A text part in list-shaped content is counted by its character length."""
+    req = NormalizedRequest(
+        model="google/x",
+        messages=[
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "hello world"}],
+            }
+        ],
+    )
+    # "hello world" (11 chars -> 3 tokens) + 4 framing = 7 tokens
+    assert estimate_input_tokens(req) == 7
+
+
+def test_before_after_estimate_comparison() -> None:
+    """Documents the before/after delta for the batch note.
+
+    Numbers are pinned here so future changes to the estimator are deliberate edits.
+    - 1-msg ('hello world'): was 3 tokens -> now 7 tokens (+4 framing)
+    - 5-msg multi-turn: was 10 tokens -> now 30 tokens (+20 framing)
+    - 1-msg + tools: was 3 tokens -> now 49 tokens (+4 framing + 42 tools JSON)
+    - 1-msg image: was 1 token -> now 262 tokens (+4 framing + 258 assumption)
+    """
+    req_1msg = NormalizedRequest(
+        model="google/x", messages=[{"role": "user", "content": "hello world"}]
+    )
+    req_5msg = NormalizedRequest(
+        model="google/x",
+        messages=[
+            {"role": "user", "content": "hello world"},
+            {"role": "assistant", "content": "hi there"},
+            {"role": "user", "content": "continue"},
+            {"role": "assistant", "content": "ok sure"},
+            {"role": "user", "content": "done"},
+        ],
+    )
+    req_tools = NormalizedRequest(
+        model="google/x",
+        messages=[{"role": "user", "content": "hello world"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {"type": "object", "properties": {"loc": {"type": "string"}}},
+                },
+            }
+        ],
+    )
+    req_img = NormalizedRequest(
+        model="google/x",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+                ],
+            }
+        ],
+    )
+
+    assert estimate_input_tokens(req_1msg) == 7
+    assert estimate_input_tokens(req_5msg) == 30
+    assert estimate_input_tokens(req_tools) == 49
+    assert estimate_input_tokens(req_img) == 262

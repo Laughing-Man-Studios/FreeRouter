@@ -27,6 +27,9 @@ __all__ = [
     "NormalizedChunk",
     "NormalizedRequest",
     "NormalizedResponse",
+    "TokenUsage",
+    "ToolCall",
+    "ToolCallDelta",
     "normalize_chat_completion_request",
     "to_openai_completion",
 ]
@@ -34,8 +37,28 @@ __all__ = [
 SUPPORTED_INGRESS_FIELDS = ("model", "messages")
 """The only request fields M0 honours. Everything else is discarded (spec 3)."""
 
-FinishReason = Literal["stop", "length", "content_filter"]
+FinishReason = Literal["stop", "length", "content_filter", "tool_calls"]
 """Completion termination reasons, matching the OpenAI vocabulary."""
+
+
+class ToolCall(BaseModel):
+    """An assistant-generated function invocation (OpenAI shape)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    type: Literal["function"] = "function"
+    function: dict[str, str]  # {"name": ..., "arguments": <JSON string>}
+
+
+class ToolCallDelta(BaseModel):
+    """One fragment of a streamed tool call (OpenAI delta shape)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    index: int
+    id: str | None = None
+    function: dict[str, str] | None = None  # partial name / partial arguments
 
 
 class NormalizedRequest(BaseModel):
@@ -51,6 +74,9 @@ class NormalizedRequest(BaseModel):
             always reports usage on the final chunk, Mistral only when asked --
             so the adapter needs the client's preference to translate it, not to
             invent one.
+        tools: Client-supplied tool definitions.
+        tool_choice: Client-supplied tool selection policy.
+        response_format: Client-supplied structured-output constraint.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -59,6 +85,9 @@ class NormalizedRequest(BaseModel):
     messages: list[dict[str, Any]] = Field(min_length=1)
     stream: bool = False
     include_usage: bool = False
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: str | dict[str, Any] | None = None
+    response_format: dict[str, Any] | None = None
 
 
 class TokenUsage(BaseModel):
@@ -93,7 +122,8 @@ class NormalizedResponse(BaseModel):
     """A provider-agnostic chat completion result.
 
     Attributes:
-        content: The assistant's message text.
+        content: The assistant's message text, or ``None`` when generation
+            produced a tool call.
         model_used: The provider-native model id that actually served the
             request, for operational logging.
         finish_reason: Why generation stopped.
@@ -101,14 +131,16 @@ class NormalizedResponse(BaseModel):
             none. A provider that does not report usage leaves the
             reservation's estimate standing rather than releasing capacity that
             may well have been used.
+        tool_calls: Tool calls the model emitted, or ``None`` when it produced text.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    content: str
+    content: str | None = None
     model_used: str
     finish_reason: FinishReason = "stop"
     usage: TokenUsage | None = None
+    tool_calls: list[ToolCall] | None = None
 
 
 class NormalizedChunk(BaseModel):
@@ -134,6 +166,7 @@ class NormalizedChunk(BaseModel):
         usage: Token counts, when the provider reports them. Gemini reports usage
             on the final chunk; Mistral only when asked. ``None`` means the
             reservation's estimate stands, which is the conservative direction.
+        tool_call_deltas: Tool-call fragments emitted by this chunk.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -141,21 +174,16 @@ class NormalizedChunk(BaseModel):
     delta: str = ""
     finish_reason: FinishReason | None = None
     usage: TokenUsage | None = None
+    tool_call_deltas: list[ToolCallDelta] | None = None
 
 
 def normalize_chat_completion_request(payload: dict[str, Any]) -> NormalizedRequest:
     """Translate an OpenAI-style request body into a :class:`NormalizedRequest`.
 
-    Only ``model``, ``messages``, ``stream`` and ``stream_options.include_usage``
-    are read. Any other parameter -- including ``temperature``, ``max_tokens``,
-    and ``top_p`` -- is discarded here and can therefore never reach a provider
-    adapter (spec 3, Scenario 5).
-
-    The two streaming fields are read because the route must branch on them and
-    the adapter must honour them (B7). They are still read *here* rather than in
-    the route, because normalization is the single place that decides which
-    fields are meaningful -- a second reader would be a second list of honoured
-    fields to keep in step.
+    Honours ``model``, ``messages``, ``stream``, ``stream_options.include_usage``,
+    ``tools``, ``tool_choice``, and ``response_format``. Any other parameter --
+    including ``temperature``, ``max_tokens``, and ``top_p`` -- is discarded
+    here and can therefore never reach a provider adapter (spec 3, Scenario 5).
 
     Args:
         payload: The decoded JSON request body.
@@ -197,20 +225,94 @@ def normalize_chat_completion_request(payload: dict[str, Any]) -> NormalizedRequ
                 code="invalid_message",
                 param=f"messages[{index}]",
             )
-        for field in ("role", "content"):
-            if field not in message:
-                raise ValidationError(
-                    f"messages[{index}] is missing required field '{field}'.",
-                    code="invalid_message",
-                    param=f"messages[{index}].{field}",
-                )
+        if "role" not in message:
+            raise ValidationError(
+                f"messages[{index}] is missing required field 'role'.",
+                code="invalid_message",
+                param=f"messages[{index}].role",
+            )
+        if "content" not in message and not (
+            message.get("role") == "assistant" and "tool_calls" in message
+        ):
+            raise ValidationError(
+                f"messages[{index}] is missing required field 'content'.",
+                code="invalid_message",
+                param=f"messages[{index}].content",
+            )
+        content = message.get("content")
+        if content is not None and not isinstance(content, (str, list)):
+            raise ValidationError(
+                f"messages[{index}].content must be a string, an array of parts, or null.",
+                code="invalid_message",
+                param=f"messages[{index}].content",
+            )
+        if isinstance(content, list):
+            for part_idx, part in enumerate(content):
+                if not isinstance(part, dict):
+                    raise ValidationError(
+                        f"messages[{index}].content[{part_idx}] must be an object.",
+                        code="invalid_message",
+                        param=f"messages[{index}].content[{part_idx}]",
+                    )
 
     return NormalizedRequest(
         model=payload["model"],
         messages=messages,
         stream=_optional_bool(payload, "stream") or False,
         include_usage=_include_usage(payload),
+        tools=_optional_tools(payload),
+        tool_choice=_optional_tool_choice(payload),
+        response_format=_optional_response_format(payload),
     )
+
+
+def _optional_tools(payload: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Read and validate the optional ``tools`` array."""
+    if "tools" not in payload:
+        return None
+    tools = payload["tools"]
+    if not isinstance(tools, list):
+        raise ValidationError(
+            "'tools' must be an array.",
+            code="invalid_field_type",
+            param="tools",
+        )
+    for idx, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            raise ValidationError(
+                f"tools[{idx}] must be an object.",
+                code="invalid_field_type",
+                param=f"tools[{idx}]",
+            )
+    return tools
+
+
+def _optional_tool_choice(payload: dict[str, Any]) -> str | dict[str, Any] | None:
+    """Read and validate the optional ``tool_choice`` parameter."""
+    if "tool_choice" not in payload:
+        return None
+    tool_choice = payload["tool_choice"]
+    if not isinstance(tool_choice, (str, dict)):
+        raise ValidationError(
+            "'tool_choice' must be a string or object.",
+            code="invalid_field_type",
+            param="tool_choice",
+        )
+    return tool_choice
+
+
+def _optional_response_format(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Read and validate the optional ``response_format`` object."""
+    if "response_format" not in payload:
+        return None
+    response_format = payload["response_format"]
+    if not isinstance(response_format, dict):
+        raise ValidationError(
+            "'response_format' must be an object.",
+            code="invalid_field_type",
+            param="response_format",
+        )
+    return response_format
 
 
 def _optional_bool(payload: dict[str, Any], name: str) -> bool | None:
@@ -277,6 +379,11 @@ def to_openai_completion(
     Returns:
         A JSON-ready OpenAI-compatible chat completion object (spec 5).
     """
+    message: dict[str, Any] = {"role": "assistant", "content": response.content}
+    if response.tool_calls is not None:
+        message["tool_calls"] = [
+            tc.model_dump() if isinstance(tc, BaseModel) else tc for tc in response.tool_calls
+        ]
     return {
         "id": response_id,
         "object": "chat.completion",
@@ -285,7 +392,7 @@ def to_openai_completion(
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": response.content},
+                "message": message,
                 "finish_reason": response.finish_reason,
             }
         ],
