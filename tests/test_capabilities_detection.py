@@ -10,9 +10,10 @@ Verifies Issue #18, spec §3, §2, and plan.md § Detection:
 - JSON schema: json_object and json_schema response_format.
 - Streaming: stream=True vs stream=False or omitted.
 - Reserved output: max_tokens or max_completion_tokens, fallback to assumed_output.
-- Input tokens: shared reservation estimator, under-counting bias documented.
-- Detection precedes normalization: payload carrying tools is detected, but normalizer
-  discards tools.
+- Input tokens: shared reservation estimator, including framing, serialised payloads
+  and image parts sized by assumption.
+- Detection precedes normalization: payload carrying tools is detected and preserved on
+  the boundary, but no adapter forwards it yet.
 """
 
 from __future__ import annotations
@@ -24,6 +25,8 @@ from pydantic import ValidationError
 
 from free_router.core.capabilities import RequestRequirements, detect_requirements
 from free_router.core.normalization import normalize_chat_completion_request
+from free_router.providers.google.adapter import to_gemini_request
+from free_router.providers.mistral.adapter import to_mistral_request
 from free_router.quota.estimation import (
     DEFAULT_OUTPUT_TOKEN_ASSUMPTION,
     estimate_input_tokens,
@@ -373,8 +376,8 @@ def test_input_tokens_uses_shared_reservation_estimator() -> None:
     assert req.input_tokens > 1
 
 
-def test_input_tokens_documented_bias_for_list_shaped_content() -> None:
-    """The estimator returns 1 for list-shaped content parts (documented in plan.md § Risks)."""
+def test_input_tokens_sizes_list_shaped_content() -> None:
+    """The estimator sizes list-shaped content parts (framing + image token assumption)."""
     payload: dict[str, Any] = {
         "model": "google/gemini-3.5-flash-lite",
         "messages": [
@@ -391,14 +394,13 @@ def test_input_tokens_documented_bias_for_list_shaped_content() -> None:
     }
     req = detect_requirements(payload, DEFAULT_OUTPUT_TOKEN_ASSUMPTION)
     assert req.requires_vision is True
-    # The shared estimator returns 1 for list-shaped content:
-    assert req.input_tokens == 1
+    # In M4 Batch 1 (T077), image parts are sized by assumption (258) + message framing (4):
+    assert req.input_tokens == 262
 
 
 def test_detection_precedes_normalization_ordering() -> None:
-    """A payload carrying tools is detected, and still normalizes to a request with no tools.
-
-    This proves detection runs on the raw payload before normalization strips tools.
+    """A payload carrying tools is detected, normalizes with tools on the boundary,
+    and no adapter forwards them yet (Batch 1 boundary growth).
     """
     raw_payload: dict[str, Any] = {
         "model": "google/gemini-3.5-flash-lite",
@@ -421,13 +423,22 @@ def test_detection_precedes_normalization_ordering() -> None:
     assert requirements.requires_tools is True
     assert requirements.requires_json_schema is True
 
-    # Normalization strips tools and response_format
+    # Normalization preserves the fields on NormalizedRequest
     normalized = normalize_chat_completion_request(raw_payload)
     assert normalized.model == "google/gemini-3.5-flash-lite"
     assert len(normalized.messages) == 1
-    assert not hasattr(normalized, "tools")
-    assert not hasattr(normalized, "tool_choice")
-    assert not hasattr(normalized, "response_format")
+    assert normalized.tools == raw_payload["tools"]
+    assert normalized.tool_choice == "auto"
+    assert normalized.response_format == {"type": "json_object"}
+
+    # Asserted at the adapter boundary: no adapter forwards them yet in Batch 1
+    gemini_body = to_gemini_request(normalized)
+    assert "tools" not in gemini_body
+    assert "toolConfig" not in gemini_body
+
+    mistral_body = to_mistral_request(normalized, "mistral-small-latest")
+    assert "tools" not in mistral_body
+    assert "tool_choice" not in mistral_body
 
 
 def test_request_requirements_immutability() -> None:
