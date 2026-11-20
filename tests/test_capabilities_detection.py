@@ -400,7 +400,7 @@ def test_input_tokens_sizes_list_shaped_content() -> None:
 
 def test_detection_precedes_normalization_ordering() -> None:
     """A payload carrying tools is detected, normalizes with tools on the boundary,
-    and no adapter forwards them yet (Batch 1 boundary growth).
+    and both adapters forward them in Batch 2 (T078/T079).
     """
     raw_payload: dict[str, Any] = {
         "model": "google/gemini-3.5-flash-lite",
@@ -431,14 +431,16 @@ def test_detection_precedes_normalization_ordering() -> None:
     assert normalized.tool_choice == "auto"
     assert normalized.response_format == {"type": "json_object"}
 
-    # Asserted at the adapter boundary: no adapter forwards them yet in Batch 1
+    # Asserted at the adapter boundary: both adapters forward tools in Batch 2
     gemini_body = to_gemini_request(normalized)
-    assert "tools" not in gemini_body
-    assert "toolConfig" not in gemini_body
+    assert "tools" in gemini_body
+    assert gemini_body["tools"][0]["functionDeclarations"][0]["name"] == "get_weather"
+    assert "toolConfig" in gemini_body
 
     mistral_body = to_mistral_request(normalized, "mistral-small-latest")
-    assert "tools" not in mistral_body
-    assert "tool_choice" not in mistral_body
+    assert "tools" in mistral_body
+    assert mistral_body["tools"] == raw_payload["tools"]
+    assert mistral_body["tool_choice"] == "auto"
 
 
 def test_request_requirements_immutability() -> None:

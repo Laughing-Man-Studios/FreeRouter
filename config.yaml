@@ -14,16 +14,17 @@ models:
         value: true
         provenance: measured
         source: "T062 measurement, Google, 20/20 streamed, 2026-10-30"
-      # The model supports function calling, image input and structured output;
-      # this router does not. Neither adapter forwards tools, vision or
-      # response_format, so these are recorded as `assumed` -- treated as unknown
-      # and never usable -- rather than `published: false`, which would claim the
-      # provider documents the feature as unsupported. Declaring `true` would
-      # pass the filter and then silently degrade at the ingress boundary
-      # (decision C5, CONSTITUTION §7.1).
+      # The model supports function calling, image input and structured output.
+      # Tools are now forwarded by both adapters and were verified here by live
+      # measurement (M4 Batch 2, T081): a call, its result and a follow-up, unary
+      # and streamed. Vision and structured output are still not forwarded, so
+      # they stay `assumed` -- treated as unknown and never usable -- rather than
+      # `published: false`, which would claim the provider documents the feature
+      # as unsupported (decision C5, CONSTITUTION §7.1; ADR-0011).
       supports_tools:
-        value: false
-        provenance: assumed
+        value: true
+        provenance: measured
+        source: "T081 measurement, Google, unary + second turn + streamed, 2026-11-19"
       supports_vision:
         value: false
         provenance: assumed
@@ -56,11 +57,15 @@ models:
 #         value: true
 #         provenance: measured
 #         source: "T061 manual matrix, Mistral, 1 streamed request, 12 chunks, 2026-10-30"
-#       # The model supports function calling, image input and structured output;
-#       # this router does not, for the reasons given in the Google block above.
+#       # The model supports function calling, image input and structured output.
+#       # Tools are forwarded by this adapter and were verified by live measurement
+#       # (M4 Batch 2, T081), same shape as the Google entry above: unary call,
+#       # its result, a follow-up, and a streamed call. Vision and structured
+#       # output are still not forwarded, so they remain `assumed`.
 #       supports_tools:
-#         value: false
-#         provenance: assumed
+#         value: true
+#         provenance: measured
+#         source: "T081 measurement, Mistral, unary + second turn + streamed, 2026-11-19"
 #       supports_vision:
 #         value: false
 #         provenance: assumed
