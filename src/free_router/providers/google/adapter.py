@@ -20,11 +20,10 @@ timeout instead. A single window cannot mean both things, and a 5 s one silently
 capped unary generation at five seconds.
 
 **Only what the boundary admitted is sent.** The normalizer keeps ``model``,
-``messages``, ``stream``, ``include_usage`` and the tool fields
-(``tools``/``tool_choice``); ``temperature`` and ``max_tokens`` are stripped at
-ingress and have no representation here. ``response_format`` is admitted by the
-boundary but not yet forwarded. Adding a generationConfig would be scope for a
-later milestone, not a fix.
+``messages``, ``stream``, ``include_usage``, the tool fields
+(``tools``/``tool_choice``), and ``response_format``; ``temperature`` and
+``max_tokens`` are stripped at ingress and have no representation here. Adding
+other generationConfig parameters would be scope for a later milestone, not a fix.
 
 Note the API surface: Gemini's newer Interactions API is not used here. The
 spec mandates ``generateContent``, and confining all Gemini specifics to this
@@ -443,6 +442,29 @@ def _tool_choice_to_gemini(tool_choice: str | dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _response_format_to_gemini(response_format: dict[str, Any]) -> dict[str, Any]:
+    """Translate an OpenAI response_format into Gemini's generationConfig parameters.
+
+    OpenAI supports {"type": "json_object"} and {"type": "json_schema", "json_schema": {...}}.
+    Gemini maps both to responseMimeType="application/json", adding responseSchema
+    only when a json_schema payload is provided.
+
+    The schema is forwarded directly without local validation or rewriting,
+    letting the provider accept its OpenAPI 3.0 subset or surface a 400.
+    """
+    fmt_type = response_format.get("type")
+    if fmt_type in ("json_object", "json_schema"):
+        config: dict[str, Any] = {"responseMimeType": "application/json"}
+        if fmt_type == "json_schema":
+            schema_container = response_format.get("json_schema")
+            if isinstance(schema_container, dict):
+                schema = schema_container.get("schema")
+                if schema is not None:
+                    config["responseSchema"] = schema
+        return config
+    return {}
+
+
 def to_gemini_request(request: NormalizedRequest) -> dict[str, Any]:
     """Translate a :class:`NormalizedRequest` into a Gemini payload.
 
@@ -577,6 +599,11 @@ def to_gemini_request(request: NormalizedRequest) -> dict[str, Any]:
 
     if request.tool_choice is not None:
         payload["toolConfig"] = _tool_choice_to_gemini(request.tool_choice)
+
+    if request.response_format:
+        gen_config = _response_format_to_gemini(request.response_format)
+        if gen_config:
+            payload.setdefault("generationConfig", {}).update(gen_config)
 
     return payload
 

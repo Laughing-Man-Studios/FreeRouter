@@ -103,12 +103,14 @@ def _request(
     messages: list[dict[str, Any]] | None = None,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str | dict[str, Any] | None = None,
+    response_format: dict[str, Any] | None = None,
 ) -> NormalizedRequest:
     return NormalizedRequest(
         model=f"mistral/{MODEL_ID}",
         messages=messages if messages is not None else [{"role": "user", "content": "hello"}],
         tools=tools,
         tool_choice=tool_choice,
+        response_format=response_format,
     )
 
 
@@ -809,3 +811,84 @@ async def test_mistral_unary_second_turn_round_trip(
     assert resp2.finish_reason == "stop"
     assert resp2.content == "AAPL is at $150.00."
     assert resp2.tool_calls is None
+
+
+class TestStructuredOutput:
+    """Translation and handling of response_format in MistralAdapter."""
+
+    def test_json_object_passthrough(self) -> None:
+        req = _request(
+            messages=[{"role": "user", "content": "Return json"}],
+            response_format={"type": "json_object"},
+        )
+        payload = to_mistral_request(req, MODEL_ID)
+        assert payload.get("response_format") == {"type": "json_object"}
+
+    def test_json_schema_passthrough(self) -> None:
+        schema = {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        }
+        fmt = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "Person",
+                "schema": schema,
+            },
+        }
+        req = _request(
+            messages=[{"role": "user", "content": "Return json"}],
+            response_format=fmt,
+        )
+        payload = to_mistral_request(req, MODEL_ID)
+        assert payload.get("response_format") == fmt
+
+    def test_no_response_format(self) -> None:
+        req = _request(messages=[{"role": "user", "content": "Return text"}])
+        payload = to_mistral_request(req, MODEL_ID)
+        assert "response_format" not in payload
+
+    def test_response_format_coexists_with_tools(self) -> None:
+        tools = [{"type": "function", "function": {"name": "get_stock"}}]
+        req = _request(
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=tools,
+            response_format={"type": "json_object"},
+        )
+        payload = to_mistral_request(req, MODEL_ID)
+        assert payload.get("response_format") == {"type": "json_object"}
+        assert payload.get("tools") == tools
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_round_trip_with_response_format(
+        self, http_client: httpx.AsyncClient, key: KeyRef
+    ) -> None:
+        route = respx.post(CHAT_URL).respond(
+            200,
+            json={
+                "id": "cmpl-fmt-1",
+                "object": "chat.completion",
+                "created": 1702256327,
+                "model": MODEL_ID,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": '{"success": true}'},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            },
+        )
+        adapter = MistralAdapter(http_client=http_client)
+        req = _request(
+            messages=[{"role": "user", "content": "Return json"}],
+            response_format={"type": "json_object"},
+        )
+        resp = await adapter.chat_completion(req, MODEL_ID, key)
+        assert resp.content == '{"success": true}'
+        assert resp.finish_reason == "stop"
+        sent_body = json.loads(route.calls[0].request.content)
+        assert sent_body.get("response_format") == {"type": "json_object"}

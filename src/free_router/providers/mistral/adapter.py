@@ -26,12 +26,12 @@ Google's heuristic would add a branch that Mistral's error taxonomy can never
 reach.
 
 **Only what the boundary admitted is sent.** The normalizer keeps ``model``,
-``messages``, ``stream``, ``include_usage`` and the tool fields
-(``tools``/``tool_choice``), plus ``tool_calls`` and ``role: "tool"`` messages
-in the history; ``temperature`` and ``max_tokens`` are stripped at ingress and
-have no representation here. ``response_format`` is admitted by the boundary but
-not yet forwarded. Mistral accepts those controls, and ``temperature`` is capped
-at 1.5 rather than 2.0, but wiring them up is scope for a later milestone.
+``messages``, ``stream``, ``include_usage``, the tool fields
+(``tools``/``tool_choice``), ``response_format``, plus ``tool_calls`` and
+``role: "tool"`` messages in the history; ``temperature`` and ``max_tokens``
+are stripped at ingress and have no representation here. Mistral accepts those
+controls, and ``temperature`` is capped at 1.5 rather than 2.0, but wiring them
+up is scope for a later milestone.
 """
 
 from __future__ import annotations
@@ -408,6 +408,8 @@ def to_mistral_request(request: NormalizedRequest, provider_model_id: str) -> di
         payload["tools"] = request.tools
     if request.tool_choice is not None:
         payload["tool_choice"] = request.tool_choice
+    if request.response_format is not None:
+        payload["response_format"] = request.response_format
     return payload
 
 
