@@ -23,8 +23,10 @@ from pathlib import Path
 import httpx
 import pytest
 import respx
+from conftest import capabilities_yaml
 from fastapi.testclient import TestClient
 
+from free_router.api.main import create_app
 from free_router.core.normalization import NormalizedRequest
 from free_router.providers.google.adapter import API_VERSION, GOOGLE_API_BASE
 from free_router.providers.mistral.adapter import MISTRAL_API_BASE, MISTRAL_CHAT_PATH
@@ -406,3 +408,71 @@ def test_stream_flag_is_carried_on_the_normalized_request() -> None:
     assert isinstance(normalized, NormalizedRequest)
     assert normalized.stream is True
     assert normalized.include_usage is True
+
+
+@respx.mock
+def test_stream_tool_calls_delivered_through_route(
+    workdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A streaming tools request delivers delta.tool_calls.
+
+    Also delivers terminal tool_calls finish_reason and [DONE].
+    """
+    config_yaml = (
+        "models:\n"
+        f'  - id: "google/{GOOGLE_MODEL}"\n'
+        '    provider: "google"\n'
+        f'    provider_id: "{GOOGLE_MODEL}"\n'
+        + capabilities_yaml(tools=True, tools_provenance="measured")
+    )
+    (workdir / "config.yaml").write_text(config_yaml)
+    monkeypatch.setenv("GOOGLE_KEY_PRIMARY", "test-key")
+
+    gemini_sse = (
+        'data: {"candidates": [{"content": {"parts": [{"functionCall": '
+        '{"name": "get_stock", "args": {"ticker": "GOOG"}}}], "role": "model"}, '
+        '"finishReason": "STOP", "index": 0}], '
+        '"usageMetadata": {"promptTokenCount": "10", "candidatesTokenCount": "5", '
+        '"totalTokenCount": "15"}}\n\n'
+    )
+
+    respx.post(GOOGLE_STREAM_URL).mock(
+        return_value=httpx.Response(
+            200,
+            text=gemini_sse,
+            headers={"content-type": "text/event-stream"},
+        )
+    )
+
+    app = create_app()
+    with TestClient(app) as test_client:
+        response = test_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": f"google/{GOOGLE_MODEL}",
+                "messages": [{"role": "user", "content": "What is GOOG stock?"}],
+                "stream": True,
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "get_stock", "parameters": {"type": "object"}},
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    events = response.text.strip().split("\n\n")
+    assert events[-1] == "data: [DONE]"
+
+    # Parse JSON chunks
+    payloads = [json.loads(e[len("data: ") :]) for e in events if e.startswith("data: {")]
+    # Role chunk
+    assert payloads[0]["choices"][0]["delta"] == {"role": "assistant"}
+    # Tool call chunk
+    tool_chunk = payloads[1]["choices"][0]
+    assert "tool_calls" in tool_chunk["delta"]
+    assert tool_chunk["delta"]["tool_calls"][0]["function"]["name"] == "get_stock"
+    # Finish chunk
+    finish_chunk = payloads[2]["choices"][0]
+    assert finish_chunk["finish_reason"] == "tool_calls"

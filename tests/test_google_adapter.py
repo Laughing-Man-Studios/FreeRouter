@@ -23,6 +23,7 @@ from free_router.providers.google.adapter import (
     GOOGLE_API_BASE,
     PROVIDER_TIMEOUT_SECONDS,
     GoogleAdapter,
+    _chunk_from_gemini,
     from_gemini_response,
     to_gemini_request,
 )
@@ -67,10 +68,16 @@ def http_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=httpx.Timeout(10.0))
 
 
-def _request(messages: list[dict[str, Any]] | None = None) -> NormalizedRequest:
+def _request(
+    messages: list[dict[str, Any]] | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
+) -> NormalizedRequest:
     return NormalizedRequest(
         model="google/gemini-3.5-flash-lite",
         messages=messages or [{"role": "user", "content": "hello"}],
+        tools=tools,
+        tool_choice=tool_choice,
     )
 
 
@@ -547,3 +554,455 @@ class _SlowBody(httpx.AsyncByteStream):
     async def __aiter__(self) -> Any:
         await asyncio.sleep(PROVIDER_TIMEOUT_SECONDS + 0.5)
         yield self._payload
+
+
+# --- Tools and function calling (M4 T078 / T080) ---
+
+
+def test_to_gemini_request_tools_and_tool_choice() -> None:
+    """tools maps to functionDeclarations, and tool_choice maps to functionCallingConfig."""
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get current weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"],
+                },
+            },
+        }
+    ]
+
+    # auto mode
+    req_auto = _request(tools=tools, tool_choice="auto")
+    payload_auto = to_gemini_request(req_auto)
+    assert payload_auto["tools"] == [
+        {
+            "functionDeclarations": [
+                {
+                    "name": "get_weather",
+                    "description": "Get current weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                        "required": ["location"],
+                    },
+                }
+            ]
+        }
+    ]
+    assert payload_auto["toolConfig"] == {"functionCallingConfig": {"mode": "AUTO"}}
+
+    # none mode
+    payload_none = to_gemini_request(_request(tools=tools, tool_choice="none"))
+    assert payload_none["toolConfig"] == {"functionCallingConfig": {"mode": "NONE"}}
+
+    # required mode -> ANY
+    payload_required = to_gemini_request(_request(tools=tools, tool_choice="required"))
+    assert payload_required["toolConfig"] == {"functionCallingConfig": {"mode": "ANY"}}
+
+    # specific function choice
+    payload_named = to_gemini_request(
+        _request(
+            tools=tools,
+            tool_choice={"type": "function", "function": {"name": "get_weather"}},
+        )
+    )
+    assert payload_named["toolConfig"] == {
+        "functionCallingConfig": {
+            "mode": "ANY",
+            "allowedFunctionNames": ["get_weather"],
+        }
+    }
+
+
+def test_tool_choice_unknown_value_is_refused_not_defaulted() -> None:
+    """A mode the boundary would reject must not quietly become ``AUTO`` here."""
+    with pytest.raises(ValueError, match="Unsupported tool_choice"):
+        to_gemini_request(_request(tool_choice="banana"))
+
+
+def test_to_gemini_request_assistant_tool_calls_in_history() -> None:
+    """An assistant message with tool_calls converts to a 'model' turn with functionCall parts."""
+    req = _request(
+        messages=[
+            {"role": "user", "content": "What is the weather in Tokyo?"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_123",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"location": "Tokyo"}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    payload = to_gemini_request(req)
+    assert payload["contents"] == [
+        {"role": "user", "parts": [{"text": "What is the weather in Tokyo?"}]},
+        {
+            "role": "model",
+            "parts": [
+                {
+                    "functionCall": {
+                        "name": "get_weather",
+                        "args": {"location": "Tokyo"},
+                    },
+                    # The client echoed no signature, and Gemini 3 rejects the
+                    # turn without one, so the documented placeholder is sent.
+                    "thoughtSignature": "skip_thought_signature_validator",
+                }
+            ],
+        },
+    ]
+
+
+def test_to_gemini_request_second_turn_tool_response() -> None:
+    """A role: "tool" message maps to functionResponse in a role: "user" turn."""
+    req = _request(
+        messages=[
+            {"role": "user", "content": "What is the weather in Tokyo?"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_tokyo_1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"location": "Tokyo"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_tokyo_1",
+                "content": '{"temperature": 15, "unit": "celsius"}',
+            },
+        ]
+    )
+    payload = to_gemini_request(req)
+    assert len(payload["contents"]) == 3
+    tool_turn = payload["contents"][2]
+    assert tool_turn["role"] == "user"
+    assert tool_turn["parts"] == [
+        {
+            "functionResponse": {
+                "name": "get_weather",
+                "response": {"temperature": 15, "unit": "celsius"},
+            }
+        }
+    ]
+
+
+def test_to_gemini_request_replays_the_thought_signature() -> None:
+    """A signature echoed by the client goes back on the same part it arrived on."""
+    req = _request(
+        messages=[
+            {"role": "user", "content": "What is the weather in Tokyo?"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_tokyo_1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"location": "Tokyo"}',
+                        },
+                        "extra_content": {"google": {"thought_signature": "a-real-signature"}},
+                    }
+                ],
+            },
+        ]
+    )
+    payload = to_gemini_request(req)
+    model_turn = payload["contents"][1]
+    assert model_turn["parts"][0]["thoughtSignature"] == "a-real-signature"
+    # The passthrough field itself is not a Gemini field and must not leak out.
+    assert "extra_content" not in model_turn["parts"][0]["functionCall"]
+
+
+def test_to_gemini_request_signs_only_the_first_parallel_call() -> None:
+    """Parallel calls carry the signature on the first part only, as Gemini sends it."""
+    req = _request(
+        messages=[
+            {"role": "user", "content": "Weather in Tokyo and Paris?"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": '{"city": "Tokyo"}'},
+                        "extra_content": {"google": {"thought_signature": "sig-one"}},
+                    },
+                    {
+                        "id": "c2",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'},
+                    },
+                ],
+            },
+        ]
+    )
+    parts = to_gemini_request(req)["contents"][1]["parts"]
+    assert parts[0]["thoughtSignature"] == "sig-one"
+    assert "thoughtSignature" not in parts[1]
+
+
+def test_from_gemini_response_ignores_an_empty_thought_signature() -> None:
+    """An empty signature is absence, not data; the placeholder covers it later."""
+    raw = {
+        "candidates": [
+            {
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": {"name": "get_weather", "args": {}},
+                            "thoughtSignature": "",
+                        }
+                    ],
+                },
+                "finishReason": "STOP",
+            }
+        ]
+    }
+    resp = from_gemini_response(raw, "gemini-3.5-flash-lite")
+    assert resp.tool_calls is not None
+    assert resp.tool_calls[0].extra_content is None
+
+
+def test_to_gemini_request_consecutive_tool_responses_bundled() -> None:
+    """Consecutive tool result messages bundle into a single 'user' turn with multiple parts."""
+    req = _request(
+        messages=[
+            {"role": "user", "content": "Weather in Tokyo and Paris?"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": '{"location": "Tokyo"}'},
+                    },
+                    {
+                        "id": "c2",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": '{"location": "Paris"}'},
+                    },
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": "Sunny 15C",
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "c2",
+                "content": '{"temp": 12}',
+            },
+        ]
+    )
+    payload = to_gemini_request(req)
+    assert len(payload["contents"]) == 3
+    tool_turn = payload["contents"][2]
+    assert tool_turn["role"] == "user"
+    assert len(tool_turn["parts"]) == 2
+    assert tool_turn["parts"][0] == {
+        "functionResponse": {
+            "name": "get_weather",
+            "response": {"output": "Sunny 15C"},
+        }
+    }
+    assert tool_turn["parts"][1] == {
+        "functionResponse": {
+            "name": "get_weather",
+            "response": {"temp": 12},
+        }
+    }
+
+
+def test_from_gemini_response_tool_call() -> None:
+    """Gemini response with functionCall part produces tool_calls.
+
+    Produces content: None and finish_reason: tool_calls.
+    """
+    raw = {
+        "candidates": [
+            {
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "name": "get_current_weather",
+                                "args": {"location": "Boston, MA"},
+                            }
+                        }
+                    ],
+                },
+                "finishReason": "STOP",
+            }
+        ],
+        "usageMetadata": {
+            "promptTokenCount": "10",
+            "candidatesTokenCount": "5",
+            "totalTokenCount": "15",
+        },
+    }
+
+    resp = from_gemini_response(raw, "gemini-3.5-flash-lite")
+    assert resp.content is None
+    assert resp.finish_reason == "tool_calls"
+    assert resp.model_used == "gemini-3.5-flash-lite"
+    assert resp.tool_calls is not None
+    assert len(resp.tool_calls) == 1
+
+    tc = resp.tool_calls[0]
+    assert tc.type == "function"
+    assert tc.function["name"] == "get_current_weather"
+    assert json.loads(tc.function["arguments"]) == {"location": "Boston, MA"}
+    assert tc.id.startswith("call_")
+
+    # Call ID synthesis is deterministic for the same function and index
+    resp2 = from_gemini_response(raw, "gemini-3.5-flash-lite")
+    assert resp2.tool_calls is not None
+    assert resp2.tool_calls[0].id == tc.id
+
+
+def test_chunk_from_gemini_tool_call() -> None:
+    """Stream event with functionCall produces ToolCallDelta and finish_reason: tool_calls."""
+    event = {
+        "candidates": [
+            {
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "name": "calculator",
+                                "args": {"expr": "2+2"},
+                            }
+                        }
+                    ],
+                },
+                "finishReason": "STOP",
+            }
+        ],
+    }
+
+    chunk = _chunk_from_gemini(event)
+    assert chunk is not None
+    assert chunk.delta == ""
+    assert chunk.finish_reason == "tool_calls"
+    assert chunk.tool_call_deltas is not None
+    assert len(chunk.tool_call_deltas) == 1
+    assert chunk.tool_call_deltas[0].index == 0
+    assert chunk.tool_call_deltas[0].function == {
+        "name": "calculator",
+        "arguments": '{"expr": "2+2"}',
+    }
+
+
+@respx.mock
+async def test_gemini_unary_second_turn_round_trip(
+    http_client: httpx.AsyncClient,
+    key: KeyRef,
+) -> None:
+    """Second-turn tool result message produces a normal assistant answer.
+
+    The signature Gemini attached to the call must ride back out on the replayed
+    model turn, exactly where it arrived. Without it Gemini 3 answers the second
+    turn with a 400, which is what a mocked body could never have revealed.
+    """
+    signature = "signature-from-gemini-3"
+    # First turn: Gemini returns a function call
+    turn1_body = {
+        "candidates": [
+            {
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "name": "get_weather",
+                                "args": {"location": "Tokyo"},
+                            },
+                            "thoughtSignature": signature,
+                        }
+                    ],
+                },
+                "finishReason": "STOP",
+            }
+        ]
+    }
+    # Second turn: Gemini returns assistant text after tool result
+    turn2_body = {
+        "candidates": [
+            {
+                "content": {
+                    "role": "model",
+                    "parts": [{"text": "The weather in Tokyo is 15C and sunny."}],
+                },
+                "finishReason": "STOP",
+            }
+        ]
+    }
+
+    route = respx.post(GENERATE_URL)
+    route.side_effect = [
+        httpx.Response(200, json=turn1_body),
+        httpx.Response(200, json=turn2_body),
+    ]
+
+    adapter = GoogleAdapter(http_client=http_client)
+
+    # 1. First turn
+    req1 = _request(
+        messages=[{"role": "user", "content": "What is the weather in Tokyo?"}],
+        tools=[{"type": "function", "function": {"name": "get_weather"}}],
+    )
+    resp1 = await adapter.chat_completion(req1, "gemini-3.5-flash-lite", key)
+    assert resp1.finish_reason == "tool_calls"
+    assert resp1.tool_calls is not None
+    call_id = resp1.tool_calls[0].id
+    assert resp1.tool_calls[0].extra_content == {"google": {"thought_signature": signature}}
+
+    # 2. Second turn: client echoes tool result
+    req2 = _request(
+        messages=[
+            {"role": "user", "content": "What is the weather in Tokyo?"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [tc.model_dump(exclude_none=True) for tc in resp1.tool_calls],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": '{"temp": 15, "sky": "sunny"}',
+            },
+        ],
+        tools=[{"type": "function", "function": {"name": "get_weather"}}],
+    )
+    resp2 = await adapter.chat_completion(req2, "gemini-3.5-flash-lite", key)
+    assert resp2.finish_reason == "stop"
+    assert resp2.content == "The weather in Tokyo is 15C and sunny."
+    assert resp2.tool_calls is None
+
+    replayed = json.loads(route.calls[1].request.content)
+    model_turn = next(c for c in replayed["contents"] if c["role"] == "model")
+    assert model_turn["parts"][0]["thoughtSignature"] == signature

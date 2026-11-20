@@ -18,7 +18,7 @@ from typing import Any
 import pytest
 
 from free_router.api.streaming import DONE_EVENT, StreamRenderer
-from free_router.core.normalization import NormalizedChunk, TokenUsage
+from free_router.core.normalization import NormalizedChunk, TokenUsage, ToolCallDelta
 from free_router.providers.sse import SSEDecodeError, iter_sse_data
 
 
@@ -289,3 +289,184 @@ async def test_delivered_is_false_before_the_first_chunk_is_pulled() -> None:
     assert renderer.delivered is False
 
     await generator.aclose()
+
+
+# --- Streamed tool call rendering (M4 T080) ---
+
+
+async def test_stream_renderer_tool_call_delta_delivered_and_not_dropped() -> None:
+    """A chunk carrying only tool_call_deltas is yielded rather than dropped."""
+    renderer = StreamRenderer(model="m", chunk_id="c1", created=1)
+
+    events = [
+        event
+        async for event in renderer.events(
+            _chunks(
+                NormalizedChunk(
+                    delta="",
+                    tool_call_deltas=[
+                        ToolCallDelta(
+                            index=0,
+                            id="call_abc",
+                            function={"name": "lookup", "arguments": '{"id": "1"}'},
+                        )
+                    ],
+                ),
+                NormalizedChunk(delta="", finish_reason="tool_calls"),
+            )
+        )
+    ]
+
+    assert events[-1] == DONE_EVENT
+    payloads = _payloads(events)
+    # Event 0: leading role delta
+    assert payloads[0]["choices"][0]["delta"] == {"role": "assistant"}
+    # Event 1: tool call delta
+    assert payloads[1]["choices"][0]["delta"] == {
+        "tool_calls": [
+            {
+                "index": 0,
+                "id": "call_abc",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": '{"id": "1"}'},
+            }
+        ]
+    }
+    # Event 2: terminal finish_reason chunk
+    assert payloads[2]["choices"][0]["delta"] == {}
+    assert payloads[2]["choices"][0]["finish_reason"] == "tool_calls"
+    assert renderer.delivered is True
+    assert renderer.finish_reason == "tool_calls"
+
+
+async def test_stream_renderer_supports_gemini_whole_call_in_one_delta() -> None:
+    """Gemini emits the complete function call in a single chunk."""
+    renderer = StreamRenderer(model="google/gemini-3.5-flash-lite", chunk_id="c1", created=1)
+
+    events = [
+        event
+        async for event in renderer.events(
+            _chunks(
+                NormalizedChunk(
+                    delta="",
+                    finish_reason="tool_calls",
+                    tool_call_deltas=[
+                        ToolCallDelta(
+                            index=0,
+                            id="call_gemini_1",
+                            function={"name": "get_weather", "arguments": '{"location": "Tokyo"}'},
+                        )
+                    ],
+                )
+            )
+        )
+    ]
+
+    assert events[-1] == DONE_EVENT
+    payloads = _payloads(events)
+    assert payloads[0]["choices"][0]["delta"] == {"role": "assistant"}
+    assert payloads[1]["choices"][0]["delta"] == {
+        "tool_calls": [
+            {
+                "index": 0,
+                "id": "call_gemini_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": '{"location": "Tokyo"}'},
+            }
+        ]
+    }
+    assert payloads[2]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+async def test_stream_renderer_carries_provider_passthrough_data() -> None:
+    """A streamed signature reaches the client, so the loop can be continued.
+
+    A rendered delta that dropped it would leave an agent holding a call it
+    cannot replay to Gemini, which is why this path is asserted separately from
+    the unary response.
+    """
+    renderer = StreamRenderer(model="google/gemini-3.5-flash-lite", chunk_id="c1", created=1)
+
+    events = [
+        event
+        async for event in renderer.events(
+            _chunks(
+                NormalizedChunk(
+                    delta="",
+                    finish_reason="tool_calls",
+                    tool_call_deltas=[
+                        ToolCallDelta(
+                            index=0,
+                            id="call_gemini_1",
+                            function={"name": "get_weather", "arguments": "{}"},
+                            extra_content={"google": {"thought_signature": "sig"}},
+                        )
+                    ],
+                )
+            )
+        )
+    ]
+
+    tool_delta = _payloads(events)[1]["choices"][0]["delta"]["tool_calls"][0]
+    assert tool_delta["extra_content"] == {"google": {"thought_signature": "sig"}}
+
+
+async def test_stream_renderer_supports_fragment_deltas() -> None:
+    """OpenAI-shaped providers (like Mistral) stream argument fragments across chunks."""
+    renderer = StreamRenderer(model="mistral/ministral-3b-2512", chunk_id="c1", created=1)
+
+    events = [
+        event
+        async for event in renderer.events(
+            _chunks(
+                NormalizedChunk(
+                    delta="",
+                    tool_call_deltas=[
+                        ToolCallDelta(
+                            index=0,
+                            id="call_f1",
+                            function={"name": "search", "arguments": '{"q": "'},
+                        )
+                    ],
+                ),
+                NormalizedChunk(
+                    delta="",
+                    tool_call_deltas=[
+                        ToolCallDelta(
+                            index=0,
+                            function={"arguments": 'hello"}'},
+                        )
+                    ],
+                ),
+                NormalizedChunk(delta="", finish_reason="tool_calls"),
+            )
+        )
+    ]
+
+    assert events[-1] == DONE_EVENT
+    payloads = _payloads(events)
+    assert len(payloads) == 4
+    # Role
+    assert payloads[0]["choices"][0]["delta"] == {"role": "assistant"}
+    # Fragment 1
+    assert payloads[1]["choices"][0]["delta"] == {
+        "tool_calls": [
+            {
+                "index": 0,
+                "id": "call_f1",
+                "type": "function",
+                "function": {"name": "search", "arguments": '{"q": "'},
+            }
+        ]
+    }
+    # Fragment 2 (no id or type, just index and partial arguments)
+    assert payloads[2]["choices"][0]["delta"] == {
+        "tool_calls": [
+            {
+                "index": 0,
+                "function": {"arguments": 'hello"}'},
+            }
+        ]
+    }
+    # Terminal
+    assert payloads[3]["choices"][0]["finish_reason"] == "tool_calls"

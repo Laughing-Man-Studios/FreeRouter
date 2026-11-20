@@ -6,9 +6,10 @@ from pathlib import Path
 import httpx
 import pytest
 import respx
-from conftest import LogRecorder
+from conftest import LogRecorder, capabilities_yaml
 from fastapi.testclient import TestClient
 
+from free_router.api.main import create_app
 from free_router.providers.google.adapter import GOOGLE_API_BASE
 
 GENERATE_URL = f"{GOOGLE_API_BASE}/v1beta/models/gemini-3.5-flash-lite:generateContent"
@@ -294,3 +295,111 @@ def test_provider_timeout_log_has_no_secret_or_prompt(
 def test_db_file_is_created_in_working_directory(client: TestClient, workdir: Path) -> None:
     """Startup persists the database under the configured path."""
     assert Path(client.app.state.db_engine.url.database).exists()
+
+
+# --- Tools capability routing (M4 Batch 2) ---
+
+
+@respx.mock
+def test_tools_request_refused_when_supports_tools_is_assumed(client: TestClient) -> None:
+    """When supports_tools is assumed, capability filter refuses locally.
+
+    Zero outbound calls are made.
+    """
+    route = respx.post(GENERATE_URL).mock(return_value=httpx.Response(200, json=GEMINI_BODY))
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": VALID_BODY["model"],
+            "messages": [{"role": "user", "content": "What is the weather?"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "get_weather", "parameters": {"type": "object"}},
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["error"]["code"] == "capability_unsatisfiable"
+    assert body["error"]["param"] == "tools"
+    assert route.call_count == 0
+
+
+@respx.mock
+def test_tools_request_succeeds_when_supports_tools_measured(
+    workdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When supports_tools is measured: true, the request is forwarded and returns tool_calls."""
+    config_yaml = (
+        "models:\n"
+        '  - id: "google/gemini-3.5-flash-lite"\n'
+        '    provider: "google"\n'
+        '    provider_id: "gemini-3.5-flash-lite"\n'
+        + capabilities_yaml(tools=True, tools_provenance="measured")
+    )
+    (workdir / "config.yaml").write_text(config_yaml)
+    monkeypatch.setenv("GOOGLE_KEY_PRIMARY", "test-key")
+
+    app = create_app()
+
+    gemini_tool_resp = {
+        "candidates": [
+            {
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "name": "get_weather",
+                                "args": {"location": "Tokyo"},
+                            }
+                        }
+                    ],
+                },
+                "finishReason": "STOP",
+                "index": 0,
+            }
+        ],
+        "usageMetadata": {
+            "promptTokenCount": "10",
+            "candidatesTokenCount": "5",
+            "totalTokenCount": "15",
+        },
+    }
+
+    route = respx.post(GENERATE_URL).mock(return_value=httpx.Response(200, json=gemini_tool_resp))
+
+    with TestClient(app) as test_client:
+        response = test_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "google/gemini-3.5-flash-lite",
+                "messages": [{"role": "user", "content": "What is the weather in Tokyo?"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "get_weather", "parameters": {"type": "object"}},
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert route.call_count == 1
+    body = response.json()
+    assert body["choices"][0]["finish_reason"] == "tool_calls"
+    assert body["choices"][0]["message"]["content"] is None
+    assert body["choices"][0]["message"]["tool_calls"] == [
+        {
+            "id": body["choices"][0]["message"]["tool_calls"][0]["id"],
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "arguments": '{"location": "Tokyo"}',
+            },
+        }
+    ]

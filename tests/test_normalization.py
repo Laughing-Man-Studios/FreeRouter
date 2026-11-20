@@ -247,6 +247,153 @@ def test_normalizer_refuses_text_only_part_arrays() -> None:
     assert exc.value.param == "messages[0].content"
 
 
+def test_normalizer_refuses_malformed_tool_definitions() -> None:
+    """A tool the adapters cannot translate is a request error, not a crash."""
+    with pytest.raises(ValidationError) as exc:
+        normalize_chat_completion_request(
+            {**VALID_PAYLOAD, "tools": [{"type": "function", "function": "oops"}]}
+        )
+    assert exc.value.code == "invalid_field_type"
+    assert exc.value.param == "tools[0].function"
+
+    with pytest.raises(ValidationError) as exc2:
+        normalize_chat_completion_request(
+            {**VALID_PAYLOAD, "tools": [{"type": "function", "function": {"name": ""}}]}
+        )
+    assert exc2.value.param == "tools[0].function.name"
+
+    with pytest.raises(ValidationError) as exc3:
+        normalize_chat_completion_request(
+            {**VALID_PAYLOAD, "tools": [{"type": "retrieval", "function": {"name": "f"}}]}
+        )
+    assert exc3.value.param == "tools[0].type"
+
+
+def test_normalizer_refuses_malformed_assistant_tool_calls() -> None:
+    """An echoed tool call with a broken shape would 500 inside an adapter."""
+
+    def payload(tool_calls: list[object]) -> dict[str, object]:
+        return {
+            "model": "google/gemini-3.5-flash-lite",
+            "messages": [{"role": "assistant", "tool_calls": tool_calls}],
+        }
+
+    with pytest.raises(ValidationError) as exc:
+        normalize_chat_completion_request(
+            payload([{"id": "c1", "type": "function", "function": "nope"}])
+        )
+    assert exc.value.code == "invalid_message"
+    assert exc.value.param == "messages[0].tool_calls[0].function"
+
+    with pytest.raises(ValidationError) as exc2:
+        normalize_chat_completion_request(
+            payload([{"type": "function", "function": {"name": "f"}}])
+        )
+    assert exc2.value.param == "messages[0].tool_calls[0].id"
+
+    with pytest.raises(ValidationError) as exc3:
+        normalize_chat_completion_request(
+            payload(
+                [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": {"a": 1}},
+                    }
+                ]
+            )
+        )
+    assert exc3.value.param == "messages[0].tool_calls[0].function.arguments"
+
+
+def test_normalizer_refuses_a_tool_message_without_a_call_id() -> None:
+    """A tool result that cannot be matched to a call is refused, not guessed."""
+    payload = {
+        "model": "google/gemini-3.5-flash-lite",
+        "messages": [{"role": "tool", "content": "42"}],
+    }
+    with pytest.raises(ValidationError) as exc:
+        normalize_chat_completion_request(payload)
+    assert exc.value.code == "invalid_message"
+    assert exc.value.param == "messages[0].tool_call_id"
+
+
+@pytest.mark.parametrize("tool_choice", ["banana", "", "AUTO"])
+def test_normalizer_refuses_an_unrecognised_tool_choice(tool_choice: str) -> None:
+    """An unknown mode is refused rather than silently becoming ``auto``."""
+    with pytest.raises(ValidationError) as exc:
+        normalize_chat_completion_request({**VALID_PAYLOAD, "tool_choice": tool_choice})
+    assert exc.value.code == "invalid_field_type"
+    assert exc.value.param == "tool_choice"
+
+
+def test_normalizer_refuses_a_non_object_extra_content() -> None:
+    """Provider passthrough data is carried, so its shape is checked like the rest."""
+    payload = {
+        "model": "google/gemini-3.5-flash-lite",
+        "messages": [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{}"},
+                        "extra_content": "not-an-object",
+                    }
+                ],
+            }
+        ],
+    }
+    with pytest.raises(ValidationError) as exc:
+        normalize_chat_completion_request(payload)
+    assert exc.value.code == "invalid_message"
+    assert exc.value.param == "messages[0].tool_calls[0].extra_content"
+
+
+def test_normalizer_refuses_a_malformed_tool_choice_object() -> None:
+    """The object form must name a function, so the adapter has something to send."""
+    with pytest.raises(ValidationError) as exc:
+        normalize_chat_completion_request({**VALID_PAYLOAD, "tool_choice": {"type": "function"}})
+    assert exc.value.param == "tool_choice.function"
+
+    with pytest.raises(ValidationError) as exc2:
+        normalize_chat_completion_request({**VALID_PAYLOAD, "tool_choice": {"name": "f"}})
+    assert exc2.value.param == "tool_choice.type"
+
+
+def test_normalizer_accepts_a_second_turn_tool_payload() -> None:
+    """Call, result and follow-up survive the boundary intact."""
+    payload = {
+        "model": "google/gemini-3.5-flash-lite",
+        "messages": [
+            {"role": "user", "content": "What is the weather in Tokyo?"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": '{"city": "Tokyo"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": '{"temp": 15}'},
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {"name": "get_weather", "parameters": {"type": "object"}},
+            }
+        ],
+        "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+    }
+    normalized = normalize_chat_completion_request(payload)
+    assert normalized.messages[1]["tool_calls"][0]["id"] == "call_1"
+    assert normalized.messages[2]["tool_call_id"] == "call_1"
+
+
 def test_normalized_response_content_is_optional() -> None:
     """content can be None on NormalizedResponse when returning tool_calls."""
     resp = NormalizedResponse(

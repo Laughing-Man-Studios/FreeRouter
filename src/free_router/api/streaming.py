@@ -166,6 +166,15 @@ class StreamRenderer:
                 self.delivered = True
                 yield _sse(self._chunk({"role": "assistant"}))
 
+            if chunk.tool_call_deltas:
+                tool_calls_payload: list[dict[str, Any]] = []
+                for tc in chunk.tool_call_deltas:
+                    tc_dict = tc.model_dump(exclude_none=True)
+                    if "id" in tc_dict and "type" not in tc_dict:
+                        tc_dict["type"] = "function"
+                    tool_calls_payload.append(tc_dict)
+                yield _sse(self._chunk({"tool_calls": tool_calls_payload}))
+
             if chunk.delta:
                 yield _sse(self._chunk({"content": chunk.delta}))
 

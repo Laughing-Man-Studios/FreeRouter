@@ -94,12 +94,18 @@ def _mistral_key() -> KeyRef:
     )
 
 
-def _request(model: str, *, include_usage: bool = False) -> NormalizedRequest:
+def _request(
+    model: str,
+    *,
+    include_usage: bool = False,
+    tools: list[dict[str, Any]] | None = None,
+) -> NormalizedRequest:
     return NormalizedRequest(
         model=model,
         messages=[{"role": "user", "content": "hello"}],
         stream=True,
         include_usage=include_usage,
+        tools=tools,
     )
 
 
@@ -336,24 +342,146 @@ async def test_google_mid_stream_timeout_is_a_timeout_not_a_server_error(
         await anext(iterator)
 
 
+# --- Tool call streaming (M4 T080) ---
+
+
 @respx.mock
-async def test_mistral_mid_stream_timeout_is_a_timeout_not_a_server_error(
+async def test_gemini_streams_tool_call_deltas(http_client: httpx.AsyncClient) -> None:
+    """Gemini streams a complete functionCall with its signature and finish_reason."""
+    sse_body = "\n\n".join(
+        [
+            'data: {"candidates": [{"content": {"parts": [{"functionCall": '
+            '{"name": "fetch_stock", "args": {"symbol": "GOOG"}}, '
+            '"thoughtSignature": "streamed-signature"}], "role": "model"}, '
+            '"finishReason": "STOP", "index": 0}], '
+            '"usageMetadata": {"promptTokenCount": "12", "candidatesTokenCount": "8", '
+            '"totalTokenCount": "20"}}'
+        ]
+    )
+
+    respx.post(GEMINI_STREAM_URL).mock(
+        return_value=httpx.Response(200, text=sse_body, headers=SSE_HEADERS)
+    )
+
+    req = _request(
+        f"google/{GEMINI_MODEL}",
+        tools=[{"type": "function", "function": {"name": "fetch_stock"}}],
+    )
+    chunks = [
+        chunk
+        async for chunk in GoogleAdapter(http_client=http_client).stream_chat_completion(
+            req, GEMINI_MODEL, _google_key()
+        )
+    ]
+
+    assert len(chunks) == 1
+    chunk = chunks[0]
+    assert chunk.tool_call_deltas is not None
+    assert len(chunk.tool_call_deltas) == 1
+    assert chunk.tool_call_deltas[0].function == {
+        "name": "fetch_stock",
+        "arguments": '{"symbol": "GOOG"}',
+    }
+    # The streamed path is the one an agent uses, so the signature must survive it.
+    assert chunk.tool_call_deltas[0].extra_content == {
+        "google": {"thought_signature": "streamed-signature"}
+    }
+    assert chunk.finish_reason == "tool_calls"
+    assert chunk.usage is not None
+    assert chunk.usage.total_tokens == 20
+
+
+@respx.mock
+async def test_gemini_emits_one_terminal_chunk_when_the_reason_repeats(
     http_client: httpx.AsyncClient,
 ) -> None:
-    from free_router.core.exceptions import ProviderTimeoutError
+    """A call event and a later STOP event must not both end the stream.
+
+    Gemini can report the terminal reason on the event after the one carrying the
+    functionCall, which already said "tool_calls". The client must see one
+    terminal chunk, and any usage on the repeat must survive.
+    """
+    sse_body = "\n\n".join(
+        [
+            'data: {"candidates": [{"content": {"parts": [{"functionCall": '
+            '{"name": "fetch_stock", "args": {"symbol": "GOOG"}}}], "role": "model"}, '
+            '"index": 0}]}',
+            'data: {"candidates": [{"content": {"parts": [], "role": "model"}, '
+            '"finishReason": "STOP", "index": 0}], "usageMetadata": '
+            '{"promptTokenCount": "12", "candidatesTokenCount": "8", "totalTokenCount": "20"}}',
+        ]
+    )
+
+    respx.post(GEMINI_STREAM_URL).mock(
+        return_value=httpx.Response(200, text=sse_body, headers=SSE_HEADERS)
+    )
+
+    chunks = [
+        chunk
+        async for chunk in GoogleAdapter(http_client=http_client).stream_chat_completion(
+            _request(f"google/{GEMINI_MODEL}"), GEMINI_MODEL, _google_key()
+        )
+    ]
+
+    reasons = [chunk.finish_reason for chunk in chunks if chunk.finish_reason is not None]
+    assert reasons == ["tool_calls"]
+    assert chunks[-1].usage is not None
+    assert chunks[-1].usage.total_tokens == 20
+
+
+@respx.mock
+async def test_mistral_streams_tool_call_deltas(http_client: httpx.AsyncClient) -> None:
+    """Mistral streams tool_calls fragments across SSE chunks."""
+    sse_body = "\n\n".join(
+        [
+            'data: {"id": "cmpl-t1", "object": "chat.completion.chunk", "created": 1, '
+            f'"model": "{MISTRAL_MODEL}", '
+            '"choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, '
+            '"finish_reason": null}]}',
+            'data: {"id": "cmpl-t1", "object": "chat.completion.chunk", "created": 1, '
+            f'"model": "{MISTRAL_MODEL}", '
+            '"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_m1", '
+            '"function": {"name": "fetch_stock", "arguments": "{\\"sym"}}]}, '
+            '"finish_reason": null}]}',
+            'data: {"id": "cmpl-t1", "object": "chat.completion.chunk", "created": 1, '
+            f'"model": "{MISTRAL_MODEL}", '
+            '"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, '
+            '"function": {"arguments": "bol\\": \\"GOOG\\"}"}}]}, '
+            '"finish_reason": null}]}',
+            'data: {"id": "cmpl-t1", "object": "chat.completion.chunk", "created": 1, '
+            f'"model": "{MISTRAL_MODEL}", '
+            '"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}',
+        ]
+    )
 
     respx.post(MISTRAL_STREAM_URL).mock(
-        return_value=httpx.Response(
-            200,
-            stream=_StallingStream('{"choices": [{"delta": {"content": "hi"}}]}'),
-            headers=SSE_HEADERS,
+        return_value=httpx.Response(200, text=sse_body, headers=SSE_HEADERS)
+    )
+
+    req = _request(
+        f"mistral/{MISTRAL_MODEL}",
+        tools=[{"type": "function", "function": {"name": "fetch_stock"}}],
+    )
+    chunks = [
+        chunk
+        async for chunk in MistralAdapter(http_client=http_client).stream_chat_completion(
+            req, MISTRAL_MODEL, _mistral_key()
         )
-    )
+    ]
 
-    iterator = MistralAdapter(http_client=http_client).stream_chat_completion(
-        _request(f"mistral/{MISTRAL_MODEL}"), MISTRAL_MODEL, _mistral_key()
-    )
+    # Chunk 0 has empty delta/role and is dropped by adapter
+    # Chunk 1 has tool_calls fragment 1
+    # Chunk 2 has tool_calls fragment 2
+    # Chunk 3 has finish_reason: "tool_calls"
+    assert len(chunks) == 3
+    assert chunks[0].tool_call_deltas is not None
+    assert chunks[0].tool_call_deltas[0].id == "call_m1"
+    assert chunks[0].tool_call_deltas[0].function == {
+        "name": "fetch_stock",
+        "arguments": '{"sym',
+    }
 
-    assert await anext(iterator) is not None
-    with pytest.raises(ProviderTimeoutError):
-        await anext(iterator)
+    assert chunks[1].tool_call_deltas is not None
+    assert chunks[1].tool_call_deltas[0].function == {"arguments": 'bol": "GOOG"}'}
+
+    assert chunks[2].finish_reason == "tool_calls"

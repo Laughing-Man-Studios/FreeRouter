@@ -47,23 +47,40 @@ FinishReason = Literal["stop", "length", "content_filter", "tool_calls"]
 
 
 class ToolCall(BaseModel):
-    """An assistant-generated function invocation (OpenAI shape)."""
+    """An assistant-generated function invocation (OpenAI shape).
+
+    Attributes:
+        extra_content: Provider-specific data the client must echo back, keyed
+            by provider. Gemini's own OpenAI-compatible surface spells its
+            required thought signature as ``{"google": {"thought_signature":
+            ...}}``, so the router uses the same spelling rather than inventing
+            one. A client that drops the field still gets a usable second turn;
+            see the Google adapter for how that is handled.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     id: str
     type: Literal["function"] = "function"
     function: dict[str, str]  # {"name": ..., "arguments": <JSON string>}
+    extra_content: dict[str, Any] | None = None
 
 
 class ToolCallDelta(BaseModel):
-    """One fragment of a streamed tool call (OpenAI delta shape)."""
+    """One fragment of a streamed tool call (OpenAI delta shape).
+
+    ``extra_content`` matters on this side too: an agentic client streams the
+    call, reassembles it, and replays the whole message on the next turn. If the
+    signature were only attached to the unary response, the streamed path -- the
+    one an agent actually uses -- could never complete its loop.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     index: int
     id: str | None = None
     function: dict[str, str] | None = None  # partial name / partial arguments
+    extra_content: dict[str, Any] | None = None
 
 
 class NormalizedRequest(BaseModel):
@@ -202,7 +219,10 @@ def normalize_chat_completion_request(payload: dict[str, Any]) -> NormalizedRequ
             message carrying ``tool_calls`` may omit ``content``), or its content
             is a part array carrying text only — parts are accepted solely when
             they include an image, which the capability filter then judges.
-            Raised before any outbound call (spec Scenario 6).
+            Also raised when ``tools``, ``tool_choice`` or a message's
+            ``tool_calls`` / ``tool_call_id`` has a shape no adapter can
+            translate, so a malformed tool is a request error rather than an
+            adapter crash. Raised before any outbound call (spec Scenario 6).
     """
     missing = [name for name in REQUIRED_INGRESS_FIELDS if name not in payload]
     if missing:
@@ -271,6 +291,7 @@ def normalize_chat_completion_request(payload: dict[str, Any]) -> NormalizedRequ
                     code="invalid_message",
                     param=f"messages[{index}].content",
                 )
+        _validate_message_tool_fields(message, index)
 
     return NormalizedRequest(
         model=payload["model"],
@@ -298,6 +319,125 @@ def _is_image_part(part: dict[str, Any]) -> bool:
     )
 
 
+_TOOL_CHOICE_MODES = frozenset({"auto", "none", "required"})
+"""The string forms of ``tool_choice`` this router can express to a provider."""
+
+
+def _validate_function(function: Any, param: str, *, code: str = "invalid_field_type") -> None:
+    """Validate an OpenAI ``function`` object by name.
+
+    Both adapters dereference this object, and it arrives as free-form JSON. A
+    string here used to pass the boundary and raise ``AttributeError`` inside
+    the adapter, after the request had been accepted — a 500 for a client error.
+    Checking the shape once, here, keeps adapter failure modes to provider ones.
+
+    Raises:
+        ValidationError: With ``code``, so a top-level ``tools`` entry reports
+            ``invalid_field_type`` while a message's ``tool_calls`` entry reports
+            ``invalid_message`` like the rest of that message's checks.
+    """
+    if not isinstance(function, dict):
+        raise ValidationError(
+            f"{param}.function must be an object.",
+            code=code,
+            param=f"{param}.function",
+        )
+    name = function.get("name")
+    if not isinstance(name, str) or not name:
+        raise ValidationError(
+            f"{param}.function.name must be a non-empty string.",
+            code=code,
+            param=f"{param}.function.name",
+        )
+    description = function.get("description")
+    if description is not None and not isinstance(description, str):
+        raise ValidationError(
+            f"{param}.function.description must be a string.",
+            code=code,
+            param=f"{param}.function.description",
+        )
+    parameters = function.get("parameters")
+    if parameters is not None and not isinstance(parameters, dict):
+        raise ValidationError(
+            f"{param}.function.parameters must be an object.",
+            code=code,
+            param=f"{param}.function.parameters",
+        )
+
+
+def _validate_tool_call(tool_call: Any, param: str) -> None:
+    """Validate one assistant ``tool_calls`` entry, which adapters read back."""
+    if not isinstance(tool_call, dict):
+        raise ValidationError(
+            f"{param} must be an object.",
+            code="invalid_message",
+            param=param,
+        )
+    call_id = tool_call.get("id")
+    if not isinstance(call_id, str) or not call_id:
+        raise ValidationError(
+            f"{param}.id must be a non-empty string.",
+            code="invalid_message",
+            param=f"{param}.id",
+        )
+    if tool_call.get("type", "function") != "function":
+        raise ValidationError(
+            f"{param}.type must be 'function'.",
+            code="invalid_message",
+            param=f"{param}.type",
+        )
+    _validate_function(tool_call.get("function"), param, code="invalid_message")
+    arguments = tool_call["function"].get("arguments", "{}")
+    if not isinstance(arguments, str):
+        raise ValidationError(
+            f"{param}.function.arguments must be a JSON string.",
+            code="invalid_message",
+            param=f"{param}.function.arguments",
+        )
+    extra_content = tool_call.get("extra_content")
+    if extra_content is not None and not isinstance(extra_content, dict):
+        raise ValidationError(
+            f"{param}.extra_content must be an object.",
+            code="invalid_message",
+            param=f"{param}.extra_content",
+        )
+
+
+def _validate_message_tool_fields(message: dict[str, Any], index: int) -> None:
+    """Validate the tool-call fields of one message, when present.
+
+    An assistant turn replays calls this router issued, and a ``tool`` turn
+    answers one. Mistral forwards both verbatim, so their shape is checked once
+    here rather than discovered by a provider rejecting the payload.
+    """
+    tool_calls = message.get("tool_calls")
+    if tool_calls is not None:
+        if not isinstance(tool_calls, list):
+            raise ValidationError(
+                f"messages[{index}].tool_calls must be an array.",
+                code="invalid_message",
+                param=f"messages[{index}].tool_calls",
+            )
+        for call_index, tool_call in enumerate(tool_calls):
+            _validate_tool_call(tool_call, f"messages[{index}].tool_calls[{call_index}]")
+
+    if message.get("role") == "tool":
+        call_id = message.get("tool_call_id")
+        if not isinstance(call_id, str) or not call_id:
+            raise ValidationError(
+                f"messages[{index}].tool_call_id must be a non-empty string on a tool message.",
+                code="invalid_message",
+                param=f"messages[{index}].tool_call_id",
+            )
+        name = message.get("name")
+        if name is not None and not isinstance(name, str):
+            raise ValidationError(
+                f"messages[{index}].name must be a string.",
+                code="invalid_message",
+                param=f"messages[{index}].name",
+            )
+
+
 def _optional_tools(payload: dict[str, Any]) -> list[dict[str, Any]] | None:
     """Read and validate the optional ``tools`` array."""
     if "tools" not in payload:
@@ -316,20 +456,50 @@ def _optional_tools(payload: dict[str, Any]) -> list[dict[str, Any]] | None:
                 code="invalid_field_type",
                 param=f"tools[{idx}]",
             )
+        if tool.get("type", "function") != "function":
+            raise ValidationError(
+                f"tools[{idx}].type must be 'function'.",
+                code="invalid_field_type",
+                param=f"tools[{idx}].type",
+            )
+        _validate_function(tool.get("function"), f"tools[{idx}]")
     return tools
 
 
 def _optional_tool_choice(payload: dict[str, Any]) -> str | dict[str, Any] | None:
-    """Read and validate the optional ``tool_choice`` parameter."""
+    """Read and validate the optional ``tool_choice`` parameter.
+
+    An unrecognised string is refused rather than defaulted. The Google adapter
+    used to map anything unknown to ``AUTO``, which silently replaced the
+    client's instruction with a different one; Mistral would have forwarded the
+    string and let the provider reject it. Refusing here makes both providers
+    behave the same way and keeps the adapter's mapping total.
+    """
     if "tool_choice" not in payload:
         return None
     tool_choice = payload["tool_choice"]
-    if not isinstance(tool_choice, (str, dict)):
+    if isinstance(tool_choice, str):
+        if tool_choice not in _TOOL_CHOICE_MODES:
+            raise ValidationError(
+                '\'tool_choice\' must be one of "auto", "none", "required", '
+                "or a function selector object.",
+                code="invalid_field_type",
+                param="tool_choice",
+            )
+        return tool_choice
+    if not isinstance(tool_choice, dict):
         raise ValidationError(
             "'tool_choice' must be a string or object.",
             code="invalid_field_type",
             param="tool_choice",
         )
+    if tool_choice.get("type") != "function":
+        raise ValidationError(
+            "'tool_choice.type' must be 'function'.",
+            code="invalid_field_type",
+            param="tool_choice.type",
+        )
+    _validate_function(tool_choice.get("function"), "tool_choice")
     return tool_choice
 
 
@@ -413,7 +583,12 @@ def to_openai_completion(
     """
     message: dict[str, Any] = {"role": "assistant", "content": response.content}
     if response.tool_calls is not None:
-        message["tool_calls"] = [tool_call.model_dump() for tool_call in response.tool_calls]
+        # exclude_none keeps the OpenAI shape byte-identical when a provider
+        # supplied no provider-specific passthrough data. Only Gemini fills
+        # ``extra_content``, and only when it returned a thought signature.
+        message["tool_calls"] = [
+            tool_call.model_dump(exclude_none=True) for tool_call in response.tool_calls
+        ]
     return {
         "id": response_id,
         "object": "chat.completion",
