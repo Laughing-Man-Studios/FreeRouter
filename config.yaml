@@ -31,7 +31,7 @@ models:
       supports_json_schema:
         value: true
         provenance: measured
-        source: "T083 measurement, Google, json_object + json_schema, 2026-11-19"
+        source: "T083 measurement, Google gemini-3.5-flash-lite, json_object + json_schema, unary + streamed, 2026-11-19"
     fallback_models: []
 
 # The Mistral adapter ships in M1 (Issue #7) and is selectable purely through
@@ -73,7 +73,7 @@ models:
 #       supports_json_schema:
 #         value: true
 #         provenance: measured
-#         source: "T083 measurement, Mistral, json_object + json_schema, 2026-11-19"
+#         source: "T083 measurement, Mistral ministral-3b-2512, json_object + json_schema, unary + streamed, 2026-11-19"
 #     fallback_models: []
 #     # Measured free-tier limits (Issue #7, workspace console):
 #     #   12.50 requests/second, 1,300,000 tokens/minute.

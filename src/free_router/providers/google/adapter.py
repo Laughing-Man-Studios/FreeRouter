@@ -443,26 +443,39 @@ def _tool_choice_to_gemini(tool_choice: str | dict[str, Any]) -> dict[str, Any]:
 
 
 def _response_format_to_gemini(response_format: dict[str, Any]) -> dict[str, Any]:
-    """Translate an OpenAI response_format into Gemini's generationConfig parameters.
+    """Translate an OpenAI ``response_format`` into Gemini ``generationConfig`` keys.
 
-    OpenAI supports {"type": "json_object"} and {"type": "json_schema", "json_schema": {...}}.
-    Gemini maps both to responseMimeType="application/json", adding responseSchema
-    only when a json_schema payload is provided.
+    ``json_object`` becomes ``responseMimeType`` alone; ``json_schema`` adds
+    ``responseSchema``; ``text`` means "no constraint" and contributes nothing.
 
-    The schema is forwarded directly without local validation or rewriting,
-    letting the provider accept its OpenAPI 3.0 subset or surface a 400.
+    The schema is forwarded as the client wrote it rather than rewritten. Gemini
+    accepts an OpenAPI 3.0 subset, so a schema outside that subset cannot be
+    forwarded faithfully; the choice made in Batch 3 was to let the provider
+    reject it and surface that rejection (ADR-0011 decision 7), rather than
+    approximate it locally and return something that looks like compliance.
+
+    Every form is enumerated, and anything else raises. Normalization refuses
+    those values before dispatch, so reaching the raise means that contract
+    broke — and falling back to *no* constraint would answer a request that
+    asked for structured output with prose.
     """
     fmt_type = response_format.get("type")
-    if fmt_type in ("json_object", "json_schema"):
-        config: dict[str, Any] = {"responseMimeType": "application/json"}
-        if fmt_type == "json_schema":
-            schema_container = response_format.get("json_schema")
-            if isinstance(schema_container, dict):
-                schema = schema_container.get("schema")
-                if schema is not None:
-                    config["responseSchema"] = schema
-        return config
-    return {}
+    if fmt_type == "text":
+        return {}
+    if fmt_type == "json_object":
+        return {"responseMimeType": "application/json"}
+    if fmt_type == "json_schema":
+        container = response_format.get("json_schema")
+        schema = container.get("schema") if isinstance(container, dict) else None
+        if not isinstance(schema, dict):
+            raise ValueError(
+                "response_format.json_schema.schema is missing; "
+                "normalization should have refused it."
+            )
+        return {"responseMimeType": "application/json", "responseSchema": schema}
+    raise ValueError(
+        f"Unsupported response_format type {fmt_type!r}; normalization should have refused it."
+    )
 
 
 def to_gemini_request(request: NormalizedRequest) -> dict[str, Any]:
