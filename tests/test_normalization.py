@@ -1,6 +1,6 @@
 """Ingress normalization and egress serialization."""
 
-from typing import get_args
+from typing import Any, get_args
 
 import pytest
 
@@ -151,6 +151,54 @@ def test_normalizer_accepts_response_format() -> None:
     rf = {"type": "json_object"}
     payload = {**VALID_PAYLOAD, "response_format": rf}
     assert normalize_chat_completion_request(payload).response_format == rf
+
+
+def test_normalizer_accepts_text_response_format() -> None:
+    """``text`` is OpenAI's explicit "no constraint", so it stays accepted."""
+    payload = {**VALID_PAYLOAD, "response_format": {"type": "text"}}
+    assert normalize_chat_completion_request(payload).response_format == {"type": "text"}
+
+
+@pytest.mark.parametrize(
+    ("response_format", "param"),
+    [
+        ({}, "response_format.type"),
+        ({"type": "banana"}, "response_format.type"),
+        ({"type": "json_schema"}, "response_format.json_schema"),
+        ({"type": "json_schema", "json_schema": "nope"}, "response_format.json_schema"),
+        (
+            {"type": "json_schema", "json_schema": {"name": "W"}},
+            "response_format.json_schema.schema",
+        ),
+        (
+            {"type": "json_schema", "json_schema": {"name": "W", "schema": "nope"}},
+            "response_format.json_schema.schema",
+        ),
+        (
+            {"type": "json_schema", "json_schema": {"schema": {}}},
+            "response_format.json_schema.name",
+        ),
+        (
+            {"type": "json_schema", "json_schema": {"name": "", "schema": {}}},
+            "response_format.json_schema.name",
+        ),
+    ],
+)
+def test_normalizer_refuses_unusable_response_format(
+    response_format: dict[str, Any], param: str
+) -> None:
+    """A constraint no provider can honour is refused locally, and named.
+
+    Gemini maps ``json_schema`` to a mime type and attaches a schema if it finds
+    one, so a schema-less form would be delivered as "valid JSON, any shape"
+    while the client asked for a specific one — the weakened ``response_format``
+    spec §7.9 prohibits. Mistral would forward the same payload and return a
+    provider 400, so the same request would also behave differently per
+    provider. Refusing once, at the boundary, keeps both providers honest.
+    """
+    with pytest.raises(ValidationError) as exc:
+        normalize_chat_completion_request({**VALID_PAYLOAD, "response_format": response_format})
+    assert exc.value.param == param
 
 
 def test_normalizer_still_strips_temperature_when_tools_present() -> None:

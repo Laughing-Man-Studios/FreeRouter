@@ -20,11 +20,10 @@ timeout instead. A single window cannot mean both things, and a 5 s one silently
 capped unary generation at five seconds.
 
 **Only what the boundary admitted is sent.** The normalizer keeps ``model``,
-``messages``, ``stream``, ``include_usage`` and the tool fields
-(``tools``/``tool_choice``); ``temperature`` and ``max_tokens`` are stripped at
-ingress and have no representation here. ``response_format`` is admitted by the
-boundary but not yet forwarded. Adding a generationConfig would be scope for a
-later milestone, not a fix.
+``messages``, ``stream``, ``include_usage``, the tool fields
+(``tools``/``tool_choice``), and ``response_format``; ``temperature`` and
+``max_tokens`` are stripped at ingress and have no representation here. Adding
+other generationConfig parameters would be scope for a later milestone, not a fix.
 
 Note the API surface: Gemini's newer Interactions API is not used here. The
 spec mandates ``generateContent``, and confining all Gemini specifics to this
@@ -443,6 +442,42 @@ def _tool_choice_to_gemini(tool_choice: str | dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _response_format_to_gemini(response_format: dict[str, Any]) -> dict[str, Any]:
+    """Translate an OpenAI ``response_format`` into Gemini ``generationConfig`` keys.
+
+    ``json_object`` becomes ``responseMimeType`` alone; ``json_schema`` adds
+    ``responseSchema``; ``text`` means "no constraint" and contributes nothing.
+
+    The schema is forwarded as the client wrote it rather than rewritten. Gemini
+    accepts an OpenAPI 3.0 subset, so a schema outside that subset cannot be
+    forwarded faithfully; the choice made in Batch 3 was to let the provider
+    reject it and surface that rejection (ADR-0011 decision 7), rather than
+    approximate it locally and return something that looks like compliance.
+
+    Every form is enumerated, and anything else raises. Normalization refuses
+    those values before dispatch, so reaching the raise means that contract
+    broke — and falling back to *no* constraint would answer a request that
+    asked for structured output with prose.
+    """
+    fmt_type = response_format.get("type")
+    if fmt_type == "text":
+        return {}
+    if fmt_type == "json_object":
+        return {"responseMimeType": "application/json"}
+    if fmt_type == "json_schema":
+        container = response_format.get("json_schema")
+        schema = container.get("schema") if isinstance(container, dict) else None
+        if not isinstance(schema, dict):
+            raise ValueError(
+                "response_format.json_schema.schema is missing; "
+                "normalization should have refused it."
+            )
+        return {"responseMimeType": "application/json", "responseSchema": schema}
+    raise ValueError(
+        f"Unsupported response_format type {fmt_type!r}; normalization should have refused it."
+    )
+
+
 def to_gemini_request(request: NormalizedRequest) -> dict[str, Any]:
     """Translate a :class:`NormalizedRequest` into a Gemini payload.
 
@@ -577,6 +612,11 @@ def to_gemini_request(request: NormalizedRequest) -> dict[str, Any]:
 
     if request.tool_choice is not None:
         payload["toolConfig"] = _tool_choice_to_gemini(request.tool_choice)
+
+    if request.response_format:
+        gen_config = _response_format_to_gemini(request.response_format)
+        if gen_config:
+            payload.setdefault("generationConfig", {}).update(gen_config)
 
     return payload
 

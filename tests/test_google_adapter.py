@@ -72,12 +72,14 @@ def _request(
     messages: list[dict[str, Any]] | None = None,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str | dict[str, Any] | None = None,
+    response_format: dict[str, Any] | None = None,
 ) -> NormalizedRequest:
     return NormalizedRequest(
         model="google/gemini-3.5-flash-lite",
         messages=messages or [{"role": "user", "content": "hello"}],
         tools=tools,
         tool_choice=tool_choice,
+        response_format=response_format,
     )
 
 
@@ -1006,3 +1008,131 @@ async def test_gemini_unary_second_turn_round_trip(
     replayed = json.loads(route.calls[1].request.content)
     model_turn = next(c for c in replayed["contents"] if c["role"] == "model")
     assert model_turn["parts"][0]["thoughtSignature"] == signature
+
+
+# --- Structured output (T082) ---
+
+
+def test_json_object_sets_mime_type() -> None:
+    """``json_object`` constrains the mime type and sends no schema."""
+    req = _request(
+        messages=[{"role": "user", "content": "Return json"}],
+        response_format={"type": "json_object"},
+    )
+    payload = to_gemini_request(req)
+    assert payload.get("generationConfig") == {"responseMimeType": "application/json"}
+
+
+def test_json_schema_sets_mime_type_and_schema() -> None:
+    """``json_schema`` forwards the client's schema unaltered."""
+    schema = {
+        "type": "object",
+        "properties": {"name": {"type": "string"}},
+        "required": ["name"],
+    }
+    req = _request(
+        messages=[{"role": "user", "content": "Return json"}],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "Person",
+                "schema": schema,
+            },
+        },
+    )
+    payload = to_gemini_request(req)
+    assert payload.get("generationConfig") == {
+        "responseMimeType": "application/json",
+        "responseSchema": schema,
+    }
+
+
+def test_no_response_format_no_generation_config() -> None:
+    req = _request(messages=[{"role": "user", "content": "Return text"}])
+    payload = to_gemini_request(req)
+    assert "generationConfig" not in payload
+
+
+def test_text_response_format_adds_no_generation_config() -> None:
+    """``text`` is OpenAI's explicit "no constraint", so nothing is injected."""
+    req = _request(
+        messages=[{"role": "user", "content": "Return text"}],
+        response_format={"type": "text"},
+    )
+    payload = to_gemini_request(req)
+    assert "generationConfig" not in payload
+
+
+def test_json_schema_without_schema_is_refused_not_weakened() -> None:
+    """A schema-less ``json_schema`` must not degrade to bare JSON mode.
+
+    Normalization refuses this shape, so reaching the adapter means the
+    boundary contract broke. Silently dropping ``responseSchema`` would answer
+    a request for a specific shape with "valid JSON, any shape" — the weakened
+    ``response_format`` spec §7.9 prohibits.
+    """
+    with pytest.raises(ValueError, match=r"response_format\.json_schema\.schema"):
+        to_gemini_request(
+            _request(
+                messages=[{"role": "user", "content": "Return json"}],
+                response_format={"type": "json_schema", "json_schema": {"name": "NoSchema"}},
+            )
+        )
+
+
+def test_unknown_response_format_type_is_refused_not_dropped() -> None:
+    """An unknown form must not become "no constraint" without an error."""
+    with pytest.raises(ValueError, match="Unsupported response_format type"):
+        to_gemini_request(
+            _request(
+                messages=[{"role": "user", "content": "Return text"}],
+                response_format={"type": "banana"},
+            )
+        )
+
+
+def test_response_format_coexists_with_tools() -> None:
+    tools = [{"type": "function", "function": {"name": "get_weather"}}]
+    req = _request(
+        messages=[{"role": "user", "content": "Hi"}],
+        tools=tools,
+        response_format={"type": "json_object"},
+    )
+    payload = to_gemini_request(req)
+    assert payload.get("generationConfig") == {"responseMimeType": "application/json"}
+    assert "tools" in payload
+    assert len(payload["tools"][0]["functionDeclarations"]) == 1
+
+
+@respx.mock
+async def test_round_trip_with_response_format(http_client: httpx.AsyncClient, key: KeyRef) -> None:
+    route = respx.post(GENERATE_URL).respond(
+        200,
+        json={
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [{"text": '{"result": "ok"}'}],
+                        "role": "model",
+                    },
+                    "finishReason": "STOP",
+                    "index": 0,
+                }
+            ],
+            "usageMetadata": {
+                "promptTokenCount": 5,
+                "candidatesTokenCount": 4,
+                "totalTokenCount": 9,
+            },
+        },
+    )
+    adapter = GoogleAdapter(http_client=http_client)
+    req = _request(
+        messages=[{"role": "user", "content": "Return json"}],
+        response_format={"type": "json_object"},
+    )
+    resp = await adapter.chat_completion(req, "gemini-3.5-flash-lite", key)
+    assert resp.content == '{"result": "ok"}'
+    assert resp.finish_reason == "stop"
+    sent_body = json.loads(route.calls[0].request.content)
+    assert sent_body.get("generationConfig") == {"responseMimeType": "application/json"}

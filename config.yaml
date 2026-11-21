@@ -15,10 +15,10 @@ models:
         provenance: measured
         source: "T062 measurement, Google, 20/20 streamed, 2026-10-30"
       # The model supports function calling, image input and structured output.
-      # Tools are now forwarded by both adapters and were verified here by live
-      # measurement (M4 Batch 2, T081): a call, its result and a follow-up, unary
-      # and streamed. Vision and structured output are still not forwarded, so
-      # they stay `assumed` -- treated as unknown and never usable -- rather than
+      # Tools and structured output are forwarded by both adapters and were verified
+      # here by live measurement (M4 Batch 2, T081; M4 Batch 3, T083): tool calls,
+      # json_object and json_schema. Vision is still not forwarded, so it stays
+      # `assumed` -- treated as unknown and never usable -- rather than
       # `published: false`, which would claim the provider documents the feature
       # as unsupported (decision C5, CONSTITUTION §7.1; ADR-0011).
       supports_tools:
@@ -29,8 +29,9 @@ models:
         value: false
         provenance: assumed
       supports_json_schema:
-        value: false
-        provenance: assumed
+        value: true
+        provenance: measured
+        source: "T083 measurement, Google gemini-3.5-flash-lite, json_object + json_schema, unary + streamed, 2026-11-19"
     fallback_models: []
 
 # The Mistral adapter ships in M1 (Issue #7) and is selectable purely through
@@ -58,10 +59,10 @@ models:
 #         provenance: measured
 #         source: "T061 manual matrix, Mistral, 1 streamed request, 12 chunks, 2026-10-30"
 #       # The model supports function calling, image input and structured output.
-#       # Tools are forwarded by this adapter and were verified by live measurement
-#       # (M4 Batch 2, T081), same shape as the Google entry above: unary call,
-#       # its result, a follow-up, and a streamed call. Vision and structured
-#       # output are still not forwarded, so they remain `assumed`.
+#       # Tools and structured output are forwarded by this adapter and were verified
+#       # by live measurement (M4 Batch 2, T081; M4 Batch 3, T083), same shape as the
+#       # Google entry above: tool calls, json_object and json_schema. Vision is still
+#       # not forwarded, so it remains `assumed`.
 #       supports_tools:
 #         value: true
 #         provenance: measured
@@ -70,8 +71,9 @@ models:
 #         value: false
 #         provenance: assumed
 #       supports_json_schema:
-#         value: false
-#         provenance: assumed
+#         value: true
+#         provenance: measured
+#         source: "T083 measurement, Mistral ministral-3b-2512, json_object + json_schema, unary + streamed, 2026-11-19"
 #     fallback_models: []
 #     # Measured free-tier limits (Issue #7, workspace console):
 #     #   12.50 requests/second, 1,300,000 tokens/minute.

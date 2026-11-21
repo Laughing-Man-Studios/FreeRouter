@@ -503,8 +503,30 @@ def _optional_tool_choice(payload: dict[str, Any]) -> str | dict[str, Any] | Non
     return tool_choice
 
 
+_RESPONSE_FORMAT_TYPES = frozenset({"text", "json_object", "json_schema"})
+"""The ``response_format`` forms an OpenAI-compatible client may send."""
+
+
 def _optional_response_format(payload: dict[str, Any]) -> dict[str, Any] | None:
-    """Read and validate the optional ``response_format`` object."""
+    """Read and validate the optional ``response_format`` object.
+
+    Only the shape is checked here; the adapters translate it. That split is
+    deliberate, and the shape is checked *completely* because a ``json_schema``
+    that reaches an adapter without a schema is dangerous rather than merely
+    useless: Gemini maps ``type: json_schema`` to a mime type and attaches a
+    schema only if it finds one, so a missing schema container degrades to
+    "valid JSON, any shape" — a weaker constraint than the client asked for,
+    delivered with a 200. Spec §7.9 forbids exactly that, and the only place to
+    notice it is before the request is accepted, where both providers can agree.
+
+    ``text`` is legitimate — it is OpenAI's "no constraint" default — so it is
+    accepted and left to the adapters, which drop or forward it as they see fit.
+
+    Raises:
+        ValidationError: If the field is present and is not an object, names a
+            ``type`` no provider can honour, or carries a ``json_schema``
+            without a name and an object schema.
+    """
     if "response_format" not in payload:
         return None
     response_format = payload["response_format"]
@@ -513,6 +535,36 @@ def _optional_response_format(payload: dict[str, Any]) -> dict[str, Any] | None:
             "'response_format' must be an object.",
             code="invalid_field_type",
             param="response_format",
+        )
+    fmt_type = response_format.get("type")
+    if fmt_type not in _RESPONSE_FORMAT_TYPES:
+        raise ValidationError(
+            "'response_format.type' must be 'text', 'json_object' or 'json_schema'.",
+            code="invalid_field_type",
+            param="response_format.type",
+        )
+    if fmt_type != "json_schema":
+        return response_format
+
+    container = response_format.get("json_schema")
+    if not isinstance(container, dict):
+        raise ValidationError(
+            "'response_format.json_schema' must be an object.",
+            code="invalid_field_type",
+            param="response_format.json_schema",
+        )
+    name = container.get("name")
+    if not isinstance(name, str) or not name:
+        raise ValidationError(
+            "'response_format.json_schema.name' must be a non-empty string.",
+            code="invalid_field_type",
+            param="response_format.json_schema.name",
+        )
+    if not isinstance(container.get("schema"), dict):
+        raise ValidationError(
+            "'response_format.json_schema.schema' must be an object.",
+            code="invalid_field_type",
+            param="response_format.json_schema.schema",
         )
     return response_format
 

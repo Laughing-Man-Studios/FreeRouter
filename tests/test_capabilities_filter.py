@@ -1037,3 +1037,34 @@ def test_cooldown_fallback_skipped_for_next_eligible(
     assert response.json()["model"] == "model-large"
     assert pro_route.call_count == 1
     assert lite_route.call_count == 1
+
+
+def test_assumed_json_schema_capability_raises_unsatisfiable() -> None:
+    """When supports_json_schema is assumed, requests requiring json are refused."""
+    model = _make_model(
+        "model-assumed",
+        json_schema=True,
+        json_schema_provenance="assumed",
+    )
+    req_json_obj = RequestRequirements(
+        requires_tools=False,
+        requires_vision=False,
+        requires_json_schema=True,
+        requires_streaming=False,
+        input_tokens=10,
+        reserved_output=100,
+    )
+    result = mismatch(model, req_json_obj)
+    assert result is not None
+    assert result.code == "capability_unsatisfiable"
+    assert result.param == "response_format"
+
+    cfg = Config(models=[model])
+    with pytest.raises(CapabilityUnsatisfiableError) as exc_info:
+        resolve_target(
+            config=cfg,
+            requested_model="model-assumed",
+            requirements=req_json_obj,
+        )
+    assert exc_info.value.code == "capability_unsatisfiable"
+    assert "JSON schema / structured output is required" in exc_info.value.message
