@@ -15,19 +15,17 @@ models:
         provenance: measured
         source: "T062 measurement, Google, 20/20 streamed, 2026-10-30"
       # The model supports function calling, image input and structured output.
-      # Tools and structured output are forwarded by both adapters and were verified
-      # here by live measurement (M4 Batch 2, T081; M4 Batch 3, T083): tool calls,
-      # json_object and json_schema. Vision is still not forwarded, so it stays
-      # `assumed` -- treated as unknown and never usable -- rather than
-      # `published: false`, which would claim the provider documents the feature
-      # as unsupported (decision C5, CONSTITUTION §7.1; ADR-0011).
+      # All three are forwarded by both adapters and were verified here by live
+      # measurement (M4 Batch 2, T081; M4 Batch 3, T083; M4 Batch 4, T084): tool calls,
+      # json_object / json_schema, and base64 vision input.
       supports_tools:
         value: true
         provenance: measured
         source: "T081 measurement, Google, unary + second turn + streamed, 2026-11-19"
       supports_vision:
-        value: false
-        provenance: assumed
+        value: true
+        provenance: measured
+        source: "T084 measurement, Google gemini-3.5-flash-lite, base64 inline, unary + streamed, 2026-11-21"
       supports_json_schema:
         value: true
         provenance: measured
@@ -59,17 +57,18 @@ models:
 #         provenance: measured
 #         source: "T061 manual matrix, Mistral, 1 streamed request, 12 chunks, 2026-10-30"
 #       # The model supports function calling, image input and structured output.
-#       # Tools and structured output are forwarded by this adapter and were verified
-#       # by live measurement (M4 Batch 2, T081; M4 Batch 3, T083), same shape as the
-#       # Google entry above: tool calls, json_object and json_schema. Vision is still
-#       # not forwarded, so it remains `assumed`.
+#       # All three are forwarded by this adapter and were verified by live
+#       # measurement (M4 Batch 2, T081; M4 Batch 3, T083; M4 Batch 4, T085), same
+#       # shape as the Google entry above: tool calls, json_object / json_schema,
+#       # and base64 vision input.
 #       supports_tools:
 #         value: true
 #         provenance: measured
 #         source: "T081 measurement, Mistral, unary + second turn + streamed, 2026-11-19"
 #       supports_vision:
-#         value: false
-#         provenance: assumed
+#         value: true
+#         provenance: measured
+#         source: "T085 measurement, Mistral ministral-3b-2512, base64 inline, unary + streamed, 2026-11-21"
 #       supports_json_schema:
 #         value: true
 #         provenance: measured

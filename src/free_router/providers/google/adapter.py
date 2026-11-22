@@ -402,6 +402,35 @@ class GoogleAdapter:
         return decoded
 
 
+def _content_part_to_gemini(part: dict[str, Any]) -> dict[str, Any]:
+    """Translate one content part into a Gemini part.
+
+    Normalization admits only two kinds of part and requires an image to be a
+    base64 ``data:`` URL, so this translates what arrived rather than deciding
+    what is acceptable. Anything else raises instead of being rendered as
+    ``str(part)``: a Python ``repr`` in the prompt is not a translation of what
+    the client asked for, and pretending otherwise would be the silent
+    degradation spec 7.9 prohibits.
+    """
+    if part.get("type") == "text":
+        return {"text": part["text"]}
+
+    image = part.get("image_url") if "image_url" in part else part.get("input_image")
+    url = image.get("url") if isinstance(image, dict) else image
+    if not isinstance(url, str):
+        raise ValueError(
+            "image part reached the adapter without a data URL; "
+            "normalization should have refused it."
+        )
+    header, separator, data = url.partition(",")
+    mime_type = header.partition(";")[0].partition(":")[2]
+    if not separator or not mime_type or not data:
+        raise ValueError(
+            "malformed image data URL reached the adapter; normalization should have refused it."
+        )
+    return {"inlineData": {"mimeType": mime_type, "data": data}}
+
+
 def _synthesise_call_id(fn_name: str, call_index: int) -> str:
     """Synthesise a deterministic call id within a response.
 
@@ -588,9 +617,17 @@ def to_gemini_request(request: NormalizedRequest) -> dict[str, Any]:
             continue
 
         content = message.get("content", "")
-        if not isinstance(content, str):
-            content = str(content)
-        contents.append({"role": role, "parts": [{"text": content}]})
+        if isinstance(content, list):
+            parts_list: list[dict[str, Any]] = [
+                _content_part_to_gemini(p) for p in content if isinstance(p, dict)
+            ]
+            if not parts_list:
+                parts_list = [{"text": ""}]
+            contents.append({"role": role, "parts": parts_list})
+        else:
+            if not isinstance(content, str):
+                content = str(content)
+            contents.append({"role": role, "parts": [{"text": content}]})
 
     payload: dict[str, Any] = {"contents": contents}
     if system_instruction is not None:

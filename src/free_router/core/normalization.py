@@ -19,7 +19,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from free_router.core.exceptions import ValidationError
+from free_router.core.exceptions import CapabilityUnsatisfiableError, ValidationError
 
 __all__ = [
     "REQUIRED_INGRESS_FIELDS",
@@ -283,7 +283,7 @@ def normalize_chat_completion_request(payload: dict[str, Any]) -> NormalizedRequ
                         code="invalid_message",
                         param=f"messages[{index}].content[{part_idx}]",
                     )
-                has_image_part = has_image_part or _is_image_part(part)
+                has_image_part = _validate_content_part(part, index, part_idx) or has_image_part
             if not has_image_part:
                 raise ValidationError(
                     "Content part arrays carrying only text are not supported; "
@@ -317,6 +317,101 @@ def _is_image_part(part: dict[str, Any]) -> bool:
         or "image_url" in part
         or "input_image" in part
     )
+
+
+_IMAGE_SCHEMES = frozenset({"http", "https"})
+"""Schemes R11 refuses: fetching one would make the router an image proxy."""
+
+
+def _validate_image_url(url: Any, param: str) -> None:
+    """Require a base64 ``data:`` image URL, and refuse a remote one by policy.
+
+    R11: the router is not an image proxy. A plain ``http(s)`` URL would have to
+    be fetched by somebody, and fetching a client-supplied URL server-side is an
+    SSRF surface and an egress proxy this project has no reason to open. The rule
+    is deliberately provider-independent — Mistral can fetch URLs, and the
+    contract still refuses them, because one consistent rule is worth more than
+    provider-specific leniency.
+
+    The check lives here, at the boundary, rather than in each adapter: an
+    adapter-level refusal happens after a key is selected and quota is reserved,
+    so a request the router never sends still costs capacity and is logged as
+    dispatched.
+
+    Raises:
+        CapabilityUnsatisfiableError: For a remote ``http(s)`` URL. The client
+            sees 400 with the limitation named and nothing was fetched
+            (spec Scenario 15).
+        ValidationError: For anything that is not a base64 ``data:`` URL.
+    """
+    if not isinstance(url, str) or not url:
+        raise ValidationError(
+            f"{param} must be a string carrying an image data URL.",
+            code="invalid_field_type",
+            param=param,
+        )
+    scheme, _, _ = url.partition(":")
+    if scheme.lower() in _IMAGE_SCHEMES:
+        raise CapabilityUnsatisfiableError(
+            "Remote http(s) image URLs cannot be fetched by this router. "
+            "Encode the image as a base64 data URL and send it inline "
+            "(spec R11, ADR-0011).",
+            param="messages",
+        )
+    header, separator, payload = url.partition(",")
+    mime_type, _, encoding = header.partition(";")
+    if (
+        scheme.lower() != "data"
+        or not separator
+        or encoding.lower() != "base64"
+        or not mime_type.partition(":")[2]
+        or not payload
+    ):
+        raise ValidationError(
+            f"{param} must be a base64 data URL of the form 'data:<mime-type>;base64,<data>'.",
+            code="invalid_field_type",
+            param=param,
+        )
+
+
+def _validate_content_part(part: dict[str, Any], index: int, part_idx: int) -> bool:
+    """Validate one content part and report whether it carries an image.
+
+    The boundary admits exactly two kinds of part: ``text``, and an image in
+    either OpenAI spelling. Anything else used to travel onward, where Gemini
+    rendered it with ``str(part)`` — a Python ``repr`` pasted into the prompt as
+    if the client had written it — and Mistral forwarded it to a 422. Neither is
+    a translation of what was asked for, so the part is refused here instead.
+
+    Returns:
+        True when the part is an image.
+
+    Raises:
+        ValidationError: If the part is malformed or is not a supported kind.
+    """
+    param = f"messages[{index}].content[{part_idx}]"
+    if _is_image_part(part):
+        field = "image_url" if "image_url" in part else "input_image"
+        image = part[field]
+        _validate_image_url(
+            image.get("url") if isinstance(image, dict) else image,
+            f"{param}.{field}",
+        )
+        return True
+
+    if part.get("type") != "text":
+        raise ValidationError(
+            f"{param}.type must be 'text' or 'image_url'.",
+            code="invalid_message",
+            param=f"{param}.type",
+        )
+    if not isinstance(part.get("text"), str):
+        raise ValidationError(
+            f"{param}.text must be a string.",
+            code="invalid_message",
+            param=f"{param}.text",
+        )
+    return False
 
 
 _TOOL_CHOICE_MODES = frozenset({"auto", "none", "required"})

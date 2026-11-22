@@ -1136,3 +1136,108 @@ async def test_round_trip_with_response_format(http_client: httpx.AsyncClient, k
     assert resp.finish_reason == "stop"
     sent_body = json.loads(route.calls[0].request.content)
     assert sent_body.get("generationConfig") == {"responseMimeType": "application/json"}
+
+
+# --- Vision pass-through (T084) ---
+
+
+def test_to_gemini_request_base64_image_part() -> None:
+    """A base64 image_url part is translated to inlineData with its mime type."""
+    b64 = "iVBORw0KGgo="
+    request = _request(
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is in this image?"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                ],
+            }
+        ]
+    )
+    payload = to_gemini_request(request)
+    parts = payload["contents"][0]["parts"]
+    assert parts[0] == {"text": "What is in this image?"}
+    assert parts[1] == {"inlineData": {"mimeType": "image/png", "data": b64}}
+
+
+def test_to_gemini_request_input_image_spelling() -> None:
+    """The Responses spelling ``input_image`` translates the same way."""
+    request = _request(
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "input_image": {"url": "data:image/jpeg;base64,AAA"}},
+                ],
+            }
+        ]
+    )
+    payload = to_gemini_request(request)
+    assert payload["contents"][0]["parts"] == [
+        {"inlineData": {"mimeType": "image/jpeg", "data": "AAA"}}
+    ]
+
+
+def test_content_part_without_url_is_refused_not_stringified() -> None:
+    """A part the boundary would reject must raise, not become prompt text.
+
+    ``str(part)`` used to put a Python ``repr`` — single quotes and all — into
+    the prompt as if the client had written it.
+    """
+    request = _request(
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+                    {"type": "file", "file": {"file_id": "f-1"}},
+                ],
+            }
+        ]
+    )
+    with pytest.raises(ValueError, match="without a data URL|malformed image data URL"):
+        to_gemini_request(request)
+
+
+@respx.mock
+async def test_gemini_image_round_trip(http_client: httpx.AsyncClient, key: KeyRef) -> None:
+    """A base64 image part round-trips and the completion is returned (T084)."""
+    route = respx.post(GENERATE_URL).respond(
+        200,
+        json={
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": "A red pixel."}], "role": "model"},
+                    "finishReason": "STOP",
+                    "index": 0,
+                }
+            ],
+            "usageMetadata": {
+                "promptTokenCount": 5,
+                "candidatesTokenCount": 3,
+                "totalTokenCount": 8,
+            },
+        },
+    )
+    adapter = GoogleAdapter(http_client=http_client)
+    req = _request(
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What colour is this?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+                ],
+            }
+        ]
+    )
+    resp = await adapter.chat_completion(req, "gemini-3.5-flash-lite", key)
+
+    assert resp.content == "A red pixel."
+    assert resp.finish_reason == "stop"
+    sent_body = json.loads(route.calls[0].request.content)
+    assert sent_body["contents"][0]["parts"] == [
+        {"text": "What colour is this?"},
+        {"inlineData": {"mimeType": "image/png", "data": "AAA"}},
+    ]

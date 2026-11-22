@@ -908,3 +908,114 @@ async def test_round_trip_with_response_format(http_client: httpx.AsyncClient, k
     assert resp.finish_reason == "stop"
     sent_body = json.loads(route.calls[0].request.content)
     assert sent_body.get("response_format") == {"type": "json_object"}
+
+
+# --- Vision pass-through (T085) ---
+
+
+def test_to_mistral_request_base64_image_part() -> None:
+    """A base64 image part is forwarded in the shape Mistral documents."""
+    b64 = "iVBORw0KGgo="
+    request = NormalizedRequest(
+        model="mistral/ministral-3b-2512",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe:"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                ],
+            }
+        ],
+    )
+    payload = to_mistral_request(request, MODEL_ID)
+    content = payload["messages"][0]["content"]
+    assert isinstance(content, list)
+    assert content == [
+        {"type": "text", "text": "Describe:"},
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+    ]
+
+
+def test_to_mistral_request_input_image_spelling_is_normalised() -> None:
+    """``input_image`` becomes ``image_url``: Mistral rejects the former.
+
+    Measured (T085): forwarding the Responses spelling verbatim returns 422.
+    """
+    request = NormalizedRequest(
+        model="mistral/ministral-3b-2512",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "input_image": {"url": "data:image/png;base64,AAA"}},
+                ],
+            }
+        ],
+    )
+    payload = to_mistral_request(request, MODEL_ID)
+    assert payload["messages"][0]["content"] == [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}
+    ]
+
+
+def test_content_part_without_url_is_refused_not_forwarded() -> None:
+    """A part the boundary would reject raises rather than reaching the provider."""
+    request = NormalizedRequest(
+        model="mistral/ministral-3b-2512",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+                    {"type": "file", "file": {"file_id": "f-1"}},
+                ],
+            }
+        ],
+    )
+    with pytest.raises(ValueError, match="without a data URL"):
+        to_mistral_request(request, MODEL_ID)
+
+
+@respx.mock
+async def test_mistral_image_round_trip(http_client: httpx.AsyncClient, key: KeyRef) -> None:
+    """A base64 image part round-trips and the completion is returned (T085)."""
+    route = respx.post(CHAT_URL).respond(
+        200,
+        json={
+            "id": "cmpl-img-1",
+            "object": "chat.completion",
+            "created": 1702256327,
+            "model": MODEL_ID,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "A red pixel."},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14},
+        },
+    )
+    adapter = MistralAdapter(http_client=http_client)
+    req = NormalizedRequest(
+        model="mistral/ministral-3b-2512",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What colour is this?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+                ],
+            }
+        ],
+    )
+    resp = await adapter.chat_completion(req, MODEL_ID, key)
+
+    assert resp.content == "A red pixel."
+    assert resp.finish_reason == "stop"
+    sent_body = json.loads(route.calls[0].request.content)
+    assert sent_body["messages"][0]["content"] == [
+        {"type": "text", "text": "What colour is this?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+    ]
