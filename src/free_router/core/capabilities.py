@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -24,10 +24,14 @@ from free_router.core.exceptions import (
 )
 from free_router.quota.estimation import estimate_input_tokens
 
+if TYPE_CHECKING:
+    from free_router.core.routing import ModelScore
+
 __all__ = [
     "CapacityProbe",
     "Mismatch",
     "RequestRequirements",
+    "SelectionKind",
     "Target",
     "detect_requirements",
     "eligible_models",
@@ -215,13 +219,19 @@ class Mismatch(BaseModel):
     detail: str
 
 
+SelectionKind = Literal["explicit", "substituted", "auto"]
+
+
 @dataclass(frozen=True, slots=True)
 class Target:
     """Resolved execution target for a request."""
 
     model: ModelConfig
+    selection: SelectionKind = "explicit"
     substituted_from: str | None = None
     forcing_requirement: str | None = None
+    score: ModelScore | None = None
+    """The winning score, populated only when ``selection == "auto"``."""
 
 
 def _capability_mismatch(model: ModelConfig, requirements: RequestRequirements) -> Mismatch | None:
@@ -346,7 +356,9 @@ def resolve_target(
 
     m = mismatch(model, requirements)
     if m is None:
-        return Target(model=model, substituted_from=None, forcing_requirement=None)
+        return Target(
+            model=model, selection="explicit", substituted_from=None, forcing_requirement=None
+        )
 
     considered: list[ModelConfig] = [model]
     capacity_error: RouterBaseError | None = None
@@ -367,6 +379,7 @@ def resolve_target(
 
         return Target(
             model=fallback,
+            selection="substituted",
             substituted_from=requested_model,
             forcing_requirement=m.code,
         )

@@ -407,3 +407,341 @@ def test_process_starts_and_echoes_request_id(write_config: Callable[..., Path])
         )
 
     assert follow_up.headers["X-Request-ID"] == "req-under-test"
+
+
+# ==============================================================================
+# Routing Policy Schema & Validation Tests (M4 Batch 5, T086)
+# ==============================================================================
+
+
+def test_refuses_unknown_weight_key(write_config: Callable[..., Path]) -> None:
+    """Startup refuses unknown weight keys naming the key."""
+    yaml_content = """\
+routing:
+  weights:
+    quality: 0.6
+    tool_support: 0.3
+    latency: 0.1
+    popularity: 0.5
+models:
+  - id: "google/gemini-3.5-flash-lite"
+    provider: "google"
+    provider_id: "gemini-3.5-flash-lite"
+    routing:
+      quality: 80
+      latency_ms: 1000
+    capabilities:
+      context_window: { value: 100000, provenance: "published", source: "docs" }
+      supports_streaming: { value: true, provenance: "measured", source: "test" }
+      supports_tools: { value: true, provenance: "measured", source: "test" }
+      supports_vision: { value: false, provenance: "assumed" }
+      supports_json_schema: { value: false, provenance: "assumed" }
+"""
+    write_config(yaml_content)
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(resolve_keys=False)
+    assert "unknown weight key 'popularity'" in str(exc_info.value)
+
+
+def test_refuses_quota_and_reliability_weights(write_config: Callable[..., Path]) -> None:
+    """Startup specifically refuses quota and reliability as weights with the reason."""
+    for refused_key in ("quota", "reliability"):
+        yaml_content = f"""\
+routing:
+  weights:
+    quality: 0.6
+    tool_support: 0.3
+    {refused_key}: 0.1
+models:
+  - id: "google/gemini-3.5-flash-lite"
+    provider: "google"
+    provider_id: "gemini-3.5-flash-lite"
+    routing:
+      quality: 80
+      latency_ms: 1000
+    capabilities:
+      context_window:
+        value: 100000
+        provenance: "published"
+        source: "docs"
+      supports_streaming:
+        value: true
+        provenance: "measured"
+        source: "test"
+      supports_tools:
+        value: true
+        provenance: "measured"
+        source: "test"
+      supports_vision:
+        value: false
+        provenance: "assumed"
+      supports_json_schema:
+        value: false
+        provenance: "assumed"
+"""
+        write_config(yaml_content)
+        with pytest.raises(ConfigError) as exc_info:
+            load_config(resolve_keys=False)
+        assert f"weight '{refused_key}' is not supported" in str(exc_info.value)
+        assert "hard constraint" in str(exc_info.value)
+
+
+def test_refuses_zero_or_negative_total_weights(write_config: Callable[..., Path]) -> None:
+    """Startup refuses weights totaling zero."""
+    yaml_content = """\
+routing:
+  weights:
+    quality: 0.0
+    tool_support: 0.0
+    latency: 0.0
+models:
+  - id: "google/gemini-3.5-flash-lite"
+    provider: "google"
+    provider_id: "gemini-3.5-flash-lite"
+    routing:
+      quality: 80
+      latency_ms: 1000
+    capabilities:
+      context_window: { value: 100000, provenance: "published", source: "docs" }
+      supports_streaming: { value: true, provenance: "measured", source: "test" }
+      supports_tools: { value: true, provenance: "measured", source: "test" }
+      supports_vision: { value: false, provenance: "assumed" }
+      supports_json_schema: { value: false, provenance: "assumed" }
+"""
+    write_config(yaml_content)
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(resolve_keys=False)
+    assert "total weight must be greater than zero" in str(exc_info.value)
+
+
+def test_refuses_invalid_latency_ceiling(write_config: Callable[..., Path]) -> None:
+    """Startup refuses non-positive latency ceiling."""
+    yaml_content = """\
+routing:
+  weights:
+    quality: 1.0
+  latency_ceiling_ms: 0
+models:
+  - id: "google/gemini-3.5-flash-lite"
+    provider: "google"
+    provider_id: "gemini-3.5-flash-lite"
+    routing:
+      quality: 80
+      latency_ms: 1000
+    capabilities:
+      context_window: { value: 100000, provenance: "published", source: "docs" }
+      supports_streaming: { value: true, provenance: "measured", source: "test" }
+      supports_tools: { value: true, provenance: "measured", source: "test" }
+      supports_vision: { value: false, provenance: "assumed" }
+      supports_json_schema: { value: false, provenance: "assumed" }
+"""
+    write_config(yaml_content)
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(resolve_keys=False)
+    assert "latency_ceiling_ms" in str(exc_info.value)
+
+
+def test_refuses_invalid_priors_quality(write_config: Callable[..., Path]) -> None:
+    """Quality prior must be between 0 and 100."""
+    yaml_content = """\
+routing:
+  weights:
+    quality: 1.0
+models:
+  - id: "google/gemini-3.5-flash-lite"
+    provider: "google"
+    provider_id: "gemini-3.5-flash-lite"
+    routing:
+      quality: 105
+      latency_ms: 1000
+    capabilities:
+      context_window: { value: 100000, provenance: "published", source: "docs" }
+      supports_streaming: { value: true, provenance: "measured", source: "test" }
+      supports_tools: { value: true, provenance: "measured", source: "test" }
+      supports_vision: { value: false, provenance: "assumed" }
+      supports_json_schema: { value: false, provenance: "assumed" }
+"""
+    write_config(yaml_content)
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(resolve_keys=False)
+    assert "quality" in str(exc_info.value)
+
+
+def test_refuses_half_declared_priors(write_config: Callable[..., Path]) -> None:
+    """Quality and latency_ms are required together."""
+    yaml_content = """\
+routing:
+  weights:
+    quality: 1.0
+models:
+  - id: "google/gemini-3.5-flash-lite"
+    provider: "google"
+    provider_id: "gemini-3.5-flash-lite"
+    routing:
+      quality: 80
+    capabilities:
+      context_window: { value: 100000, provenance: "published", source: "docs" }
+      supports_streaming: { value: true, provenance: "measured", source: "test" }
+      supports_tools: { value: true, provenance: "measured", source: "test" }
+      supports_vision: { value: false, provenance: "assumed" }
+      supports_json_schema: { value: false, provenance: "assumed" }
+"""
+    write_config(yaml_content)
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(resolve_keys=False)
+    assert "latency_ms" in str(exc_info.value)
+
+
+def test_refuses_routing_with_no_scoreable_model(write_config: Callable[..., Path]) -> None:
+    """Routing configured but zero models have priors fails startup."""
+    yaml_content = """\
+routing:
+  weights:
+    quality: 1.0
+models:
+  - id: "google/gemini-3.5-flash-lite"
+    provider: "google"
+    provider_id: "gemini-3.5-flash-lite"
+    capabilities:
+      context_window: { value: 100000, provenance: "published", source: "docs" }
+      supports_streaming: { value: true, provenance: "measured", source: "test" }
+      supports_tools: { value: true, provenance: "measured", source: "test" }
+      supports_vision: { value: false, provenance: "assumed" }
+      supports_json_schema: { value: false, provenance: "assumed" }
+"""
+    write_config(yaml_content)
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(resolve_keys=False)
+    assert "routing policy is configured, but no model declares routing priors" in str(
+        exc_info.value
+    )
+
+
+def test_routing_warns_on_models_without_priors(
+    write_config: Callable[..., Path],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Startup warns when some models have no priors."""
+    yaml_content = """\
+routing:
+  weights:
+    quality: 1.0
+models:
+  - id: "google/model-with-priors"
+    provider: "google"
+    provider_id: "gemini-3.5-flash-lite"
+    routing:
+      quality: 80
+      latency_ms: 1000
+    capabilities:
+      context_window: { value: 100000, provenance: "published", source: "docs" }
+      supports_streaming: { value: true, provenance: "measured", source: "test" }
+      supports_tools: { value: true, provenance: "measured", source: "test" }
+      supports_vision: { value: false, provenance: "assumed" }
+      supports_json_schema: { value: false, provenance: "assumed" }
+  - id: "google/model-without-priors"
+    provider: "google"
+    provider_id: "gemini-3.5-flash-lite"
+    capabilities:
+      context_window: { value: 100000, provenance: "published", source: "docs" }
+      supports_streaming: { value: true, provenance: "measured", source: "test" }
+      supports_tools: { value: true, provenance: "measured", source: "test" }
+      supports_vision: { value: false, provenance: "assumed" }
+      supports_json_schema: { value: false, provenance: "assumed" }
+"""
+    write_config(yaml_content)
+    with caplog.at_level("WARNING"):
+        load_config(resolve_keys=False)
+
+    assert any("model-without-priors" in record.message for record in caplog.records)
+
+
+def test_refuses_routing_policy_without_weights(write_config: Callable[..., Path]) -> None:
+    """A routing block that states no policy is refused: presence is the switch."""
+    write_config(
+        """\
+routing:
+  latency_ceiling_ms: 5000
+models:
+  - id: "google/gemini-3.5-flash-lite"
+    provider: "google"
+    provider_id: "gemini-3.5-flash-lite"
+    routing:
+      quality: 80
+      latency_ms: 1000
+    capabilities:
+      context_window: { value: 100000, provenance: "published", source: "docs" }
+      supports_streaming: { value: true, provenance: "measured", source: "test" }
+      supports_tools: { value: false, provenance: "assumed" }
+      supports_vision: { value: false, provenance: "assumed" }
+      supports_json_schema: { value: false, provenance: "assumed" }
+"""
+    )
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(resolve_keys=False)
+    assert "weights" in str(exc_info.value)
+
+
+def test_refuses_negative_weight(write_config: Callable[..., Path]) -> None:
+    """A negative weight is a scoring error, not a preference."""
+    write_config(
+        """\
+routing:
+  weights:
+    quality: -0.1
+    tool_support: 0.3
+    latency: 0.1
+models:
+  - id: "google/gemini-3.5-flash-lite"
+    provider: "google"
+    provider_id: "gemini-3.5-flash-lite"
+    routing:
+      quality: 80
+      latency_ms: 1000
+    capabilities:
+      context_window: { value: 100000, provenance: "published", source: "docs" }
+      supports_streaming: { value: true, provenance: "measured", source: "test" }
+      supports_tools: { value: false, provenance: "assumed" }
+      supports_vision: { value: false, provenance: "assumed" }
+      supports_json_schema: { value: false, provenance: "assumed" }
+"""
+    )
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(resolve_keys=False)
+    assert "quality" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("quality", "latency_ms", "named"),
+    [
+        pytest.param(-1, 1000, "quality", id="negative-quality"),
+        pytest.param(80, 0, "latency_ms", id="zero-latency"),
+    ],
+)
+def test_refuses_invalid_routing_priors(
+    write_config: Callable[..., Path], quality: int, latency_ms: int, named: str
+) -> None:
+    """Priors are required to be non-negative and a positive latency."""
+    write_config(
+        f"""\
+routing:
+  weights:
+    quality: 1.0
+models:
+  - id: "google/gemini-3.5-flash-lite"
+    provider: "google"
+    provider_id: "gemini-3.5-flash-lite"
+    routing:
+      quality: {quality}
+      latency_ms: {latency_ms}
+    capabilities:
+      context_window: {{ value: 100000, provenance: "published", source: "docs" }}
+      supports_streaming: {{ value: true, provenance: "measured", source: "test" }}
+      supports_tools: {{ value: false, provenance: "assumed" }}
+      supports_vision: {{ value: false, provenance: "assumed" }}
+      supports_json_schema: {{ value: false, provenance: "assumed" }}
+"""
+    )
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(resolve_keys=False)
+    assert named in str(exc_info.value)

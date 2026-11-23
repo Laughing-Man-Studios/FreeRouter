@@ -466,9 +466,11 @@ def _debug_formatter() -> object:
 def test_operational_formatter_allowlist_is_unchanged() -> None:
     """CONSTITUTION 9.1's allowlist is a closed tuple and stayed closed.
 
-    T038 added no field to it. This test fails if a later change widens the
-    operational stream to accommodate debugging, which is the way that guarantee
-    would quietly erode.
+    T038 added no field to it. M4 Batch 5 (T089) added exactly the fields the
+    ``routing_decision`` record needs -- ids, scores, weights and reason codes
+    -- and nothing else. This test fails if a later change widens the
+    operational stream to accommodate debugging, which is the way that
+    guarantee would quietly erode.
     """
     import free_router.core.logging as operational
 
@@ -487,5 +489,12 @@ def test_operational_formatter_allowlist_is_unchanged() -> None:
         "cooldown_state",
         "error_category",
         "error",
+        "requested",
+        "selected",
+        "score",
+        "contributions",
+        "weights",
+        "candidates",
+        "excluded",
     )
     assert issubclass(JsonFormatter, logging.Formatter)

@@ -94,6 +94,8 @@ def test_prompt_and_completion_fields_dropped(log_recorder: LogRecorder):
         messages=[{"role": "user", "content": "ANOTHER_SECRET"}],
         completion="THE_MODEL_SECRET_COMPLETION",
         payload={"content": "PAYLOAD_SECRET"},
+        tools=[{"type": "function", "function": {"name": "SECRET_TOOL"}}],
+        response_format={"type": "json_schema", "json_schema": {"name": "SECRET_SCHEMA"}},
     )
 
     serialised = json.dumps(record)
@@ -101,8 +103,31 @@ def test_prompt_and_completion_fields_dropped(log_recorder: LogRecorder):
     assert "ANOTHER_SECRET" not in serialised
     assert "THE_MODEL_SECRET_COMPLETION" not in serialised
     assert "PAYLOAD_SECRET" not in serialised
-    for forbidden in ("prompt", "messages", "completion", "payload"):
+    assert "SECRET_TOOL" not in serialised
+    assert "SECRET_SCHEMA" not in serialised
+    for forbidden in ("prompt", "messages", "completion", "payload", "tools", "response_format"):
         assert forbidden not in record
+
+
+def test_routing_decision_fields_allowed(log_recorder: LogRecorder):
+    """Routing decision telemetry passes through JsonFormatter (T089)."""
+    record = log_recorder.emit(
+        "routing_decision",
+        requested="free",
+        selected="google/gemini-3.5-flash-lite",
+        score=0.783,
+        contributions={"quality": 0.42, "tool_support": 0.3, "latency": 0.063},
+        weights={"quality": 0.6, "tool_support": 0.3, "latency": 0.1},
+        candidates=[{"model": "google/gemini-3.5-flash-lite", "score": 0.783}],
+        excluded=[{"model": "test/model-b", "reason": "tools"}],
+    )
+    assert record["requested"] == "free"
+    assert record["selected"] == "google/gemini-3.5-flash-lite"
+    assert record["score"] == 0.783
+    assert record["contributions"] == {"quality": 0.42, "tool_support": 0.3, "latency": 0.063}
+    assert record["weights"] == {"quality": 0.6, "tool_support": 0.3, "latency": 0.1}
+    assert record["candidates"] == [{"model": "google/gemini-3.5-flash-lite", "score": 0.783}]
+    assert record["excluded"] == [{"model": "test/model-b", "reason": "tools"}]
 
 
 def test_secret_and_config_fields_dropped(log_recorder: LogRecorder):
