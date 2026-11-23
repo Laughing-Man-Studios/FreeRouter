@@ -341,6 +341,32 @@ class MistralAdapter:
         return decoded
 
 
+def _content_part_to_mistral(part: dict[str, Any]) -> dict[str, Any]:
+    """Translate one content part into the shape Mistral's endpoint accepts.
+
+    Mistral is OpenAI-compatible but narrower here, and measured (T085) is what
+    settles it: a text part passes through, and an image is
+    ``{"type": "image_url", "image_url": {"url": <data URL>}}``. The boundary
+    also admits the Responses spelling (``input_image``), which Mistral rejects
+    with a 422 when forwarded verbatim, so both spellings are normalised to the
+    one shape Mistral documents.
+
+    Normalization has already refused remote URLs and malformed data URLs, so
+    this translates what arrived rather than re-deciding what is acceptable.
+    """
+    if part.get("type") == "text":
+        return {"type": "text", "text": part["text"]}
+
+    image = part.get("image_url") if "image_url" in part else part.get("input_image")
+    url = image.get("url") if isinstance(image, dict) else image
+    if not isinstance(url, str):
+        raise ValueError(
+            "image part reached the adapter without a data URL; "
+            "normalization should have refused it."
+        )
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
 def _without_extra_content(tool_call: Any) -> Any:
     """Drop a provider passthrough key before forwarding a tool call to Mistral.
 
@@ -396,9 +422,13 @@ def to_mistral_request(request: NormalizedRequest, provider_model_id: str) -> di
             messages.append(entry)
         else:
             content = message.get("content", "")
-            if not isinstance(content, str):
-                content = str(content)
-            messages.append({"role": role, "content": content})
+            if isinstance(content, list):
+                parts = [_content_part_to_mistral(part) for part in content]
+                messages.append({"role": role, "content": parts})
+            else:
+                if not isinstance(content, str):
+                    content = str(content)
+                messages.append({"role": role, "content": content})
 
     # stream=False is explicit rather than omitted. The response is read with
     # aread() outside the header timeout, which requires a complete body, and

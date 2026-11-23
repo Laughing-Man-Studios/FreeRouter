@@ -4,7 +4,7 @@ from typing import Any, get_args
 
 import pytest
 
-from free_router.core.exceptions import ValidationError
+from free_router.core.exceptions import CapabilityUnsatisfiableError, ValidationError
 from free_router.core.normalization import (
     FinishReason,
     NormalizedChunk,
@@ -244,7 +244,7 @@ def test_normalizer_accepts_image_parts_and_assistant_tool_calls() -> None:
                     {"type": "text", "text": "what is this?"},
                     {
                         "type": "image_url",
-                        "image_url": {"url": "https://example.com/cat.png"},
+                        "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="},
                     },
                 ],
             }
@@ -293,6 +293,132 @@ def test_normalizer_refuses_text_only_part_arrays() -> None:
         normalize_chat_completion_request(payload)
     assert exc.value.code == "invalid_message"
     assert exc.value.param == "messages[0].content"
+
+
+def test_normalizer_refuses_remote_image_urls_locally() -> None:
+    """R11: an http(s) image URL is refused at the boundary, not by an adapter.
+
+    Refusing here means no model is selected and no quota is reserved for a
+    request the router will never send (Scenario 15).
+    """
+    payload = {
+        "model": "google/gemini-3.5-flash-lite",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+                ],
+            }
+        ],
+    }
+    with pytest.raises(CapabilityUnsatisfiableError) as exc:
+        normalize_chat_completion_request(payload)
+    assert exc.value.code == "capability_unsatisfiable"
+    assert exc.value.param == "messages"
+
+
+@pytest.mark.parametrize(
+    ("url", "param_suffix"),
+    [
+        ("https://example.com/cat.png", None),
+        ("HTTP://example.com/cat.png", None),
+        ("data:image/png,AAAA", "image_url"),
+        ("data:;base64,AAAA", "image_url"),
+        ("data:image/png;base64,", "image_url"),
+        ("image/png;base64,AAAA", "image_url"),
+        ("", "image_url"),
+    ],
+)
+def test_normalizer_refuses_unusable_image_urls(url: str, param_suffix: str | None) -> None:
+    """Only a base64 ``data:`` URL is admitted; nothing is guessed at.
+
+    A non-base64 payload used to be forwarded as if it were base64, a missing
+    mime type was invented as ``image/jpeg``, and an upper-case ``DATA:`` scheme
+    fell through to the text fallback — three ways for an image to stop being an
+    image without an error.
+    """
+    payload = {
+        "model": "google/gemini-3.5-flash-lite",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image_url", "image_url": {"url": url}},
+                ],
+            }
+        ],
+    }
+    if param_suffix is None:
+        with pytest.raises(CapabilityUnsatisfiableError):
+            normalize_chat_completion_request(payload)
+        return
+    with pytest.raises(ValidationError) as exc:
+        normalize_chat_completion_request(payload)
+    assert exc.value.code == "invalid_field_type"
+    assert exc.value.param == f"messages[0].content[1].{param_suffix}"
+
+
+def test_normalizer_refuses_unsupported_content_part_types() -> None:
+    """A part no adapter can translate is refused rather than stringified.
+
+    Gemini used to render an unknown part with ``str(part)``, putting a Python
+    ``repr`` into the prompt; Mistral forwarded it to a 422.
+    """
+    payload = {
+        "model": "google/gemini-3.5-flash-lite",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+                    {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}},
+                ],
+            }
+        ],
+    }
+    with pytest.raises(ValidationError) as exc:
+        normalize_chat_completion_request(payload)
+    assert exc.value.code == "invalid_message"
+    assert exc.value.param == "messages[0].content[1].type"
+
+
+def test_normalizer_refuses_non_string_text_parts() -> None:
+    """A text part's ``text`` must be a string, not coerced into one."""
+    payload = {
+        "model": "google/gemini-3.5-flash-lite",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": 42},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+                ],
+            }
+        ],
+    }
+    with pytest.raises(ValidationError) as exc:
+        normalize_chat_completion_request(payload)
+    assert exc.value.param == "messages[0].content[0].text"
+
+
+def test_normalizer_accepts_input_image_spelling() -> None:
+    """The Responses-API ``input_image`` part is admitted like ``image_url``."""
+    payload = {
+        "model": "google/gemini-3.5-flash-lite",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "input_image": {"url": "data:image/png;base64,AAA"}},
+                ],
+            }
+        ],
+    }
+    normalized = normalize_chat_completion_request(payload)
+    assert normalized.messages[0]["content"] == payload["messages"][0]["content"]
 
 
 def test_normalizer_refuses_malformed_tool_definitions() -> None:
