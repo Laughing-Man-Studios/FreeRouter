@@ -39,6 +39,14 @@ _ALLOWED_EXTRA_FIELDS = (
     "cooldown_state",
     "error_category",
     "error",
+    # M4 Batch 5 auto-routing decision telemetry (spec §6, T089)
+    "requested",
+    "selected",
+    "score",
+    "contributions",
+    "weights",
+    "candidates",
+    "excluded",
 )
 """Operational telemetry fields permitted in a log record (CONSTITUTION 9.1)."""
 

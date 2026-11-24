@@ -2,7 +2,8 @@
 
 The listing is a **projection of configuration** (``spec.md`` section 5). There is
 no discovery call, no cache to invalidate and no second source of truth: the ids
-are ``config.models``, the same list the dispatcher routes over, so "listed" and
+are ``config.models`` -- plus the virtual ``free`` entry when a routing policy is
+configured -- the same list the dispatcher routes over, so "listed" and
 "routable" cannot drift apart.
 
 Three properties are decisions rather than defaults (B5):
@@ -32,6 +33,7 @@ from pydantic import BaseModel, Field
 from free_router.api.routes import get_config, get_dispatcher
 from free_router.core.config import Config, ModelConfig
 from free_router.core.dispatch import Dispatcher
+from free_router.core.routing import FREE_MODEL_ID
 
 router = APIRouter(prefix="/v1", tags=["openai"])
 
@@ -93,7 +95,21 @@ async def list_models(
     config: Config = Depends(get_config),
     dispatcher: Dispatcher = Depends(get_dispatcher),
 ) -> ModelList:
-    """List every configured model, whether or not it is currently usable."""
-    return ModelList(
-        data=[_model_object(entry, config, dispatcher) for entry in config.models],
-    )
+    """List every configured model, whether or not it is currently usable.
+
+    ``free`` is appended when a routing policy is configured (R8). Its
+    ``available`` reports configuration readiness -- at least one model carries
+    priors -- because a model list carries no request shape to size against
+    capacity.
+    """
+    data = [_model_object(entry, config, dispatcher) for entry in config.models]
+    if config.routing is not None:
+        data.append(
+            ModelObject(
+                id=FREE_MODEL_ID,
+                created=config.config_mtime,
+                owned_by=config.owned_by,
+                available=any(m.routing is not None for m in config.models),
+            )
+        )
+    return ModelList(data=data)

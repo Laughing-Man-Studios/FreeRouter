@@ -106,12 +106,21 @@ def sample_capabilities(
 
 
 MINIMAL_CONFIG = (
+    "routing:\n"
+    "  weights:\n"
+    "    quality: 0.60\n"
+    "    tool_support: 0.30\n"
+    "    latency: 0.10\n"
+    "  latency_ceiling_ms: 5000\n"
     "models:\n"
     '  - id: "google/gemini-3.5-flash-lite"\n'
     '    provider: "google"\n'
-    '    provider_id: "gemini-3.5-flash-lite"\n' + capabilities_yaml()
+    '    provider_id: "gemini-3.5-flash-lite"\n'
+    "    routing:\n"
+    "      quality: 75\n"
+    "      latency_ms: 1200\n" + capabilities_yaml()
 )
-"""The shipped M0 configuration."""
+"""The shipped M4 configuration: one model, its priors, and the routing policy."""
 
 
 @pytest.fixture
@@ -127,7 +136,7 @@ def workdir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
 
 @pytest.fixture
 def minimal_config() -> str:
-    """The shipped M0 configuration, as a YAML document."""
+    """The shipped M4 configuration, as a YAML document."""
     return MINIMAL_CONFIG
 
 

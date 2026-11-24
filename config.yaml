@@ -1,3 +1,13 @@
+# Auto-routing policy (M4). The presence of this block enables model = "free";
+# there is no separate enable flag. Weights are relative and normalised by their
+# total, so fractions, percentages and raw points all work.
+routing:
+  weights:
+    quality: 0.60 # answer quality, the dominant objective (CONSTITUTION §2.4)
+    tool_support: 0.30 # capability fit for the project's primary workload
+    latency: 0.10 # deliberately the smallest factor (CONSTITUTION §2.5)
+  latency_ceiling_ms: 5000 # above this, latency scores zero and stays eligible
+
 models:
   - id: "google/gemini-3.5-flash-lite"
     provider: "google"
@@ -30,6 +40,23 @@ models:
         value: true
         provenance: measured
         source: "T083 measurement, Google gemini-3.5-flash-lite, json_object + json_schema, unary + streamed, 2026-11-19"
+    # Operator priors for auto-routing (spec §2, R2, ADR-0010).
+    #
+    # THESE ARE OPINIONS, NOT BENCHMARK RESULTS. Nothing in M4 observes, learns
+    # or measures them; a future reader must not cite `quality: 75` as evidence.
+    # Revisit them whenever a model is added or retired, and again when M5 adds
+    # observed estimates beside the prior.
+    #
+    # quality: 75   -- a capable small model, deliberately not scored at the top
+    #                  of the range, so adding a stronger model later ranks above
+    #                  it without lowering this one.
+    # latency_ms: 1200 -- a plausible free-tier response for a small model and
+    #                  well under the 5000 ms ceiling. Above the ceiling a model
+    #                  still scores (zero on latency) and stays eligible.
+    # quality is 0-100; latency_ms is an expected response time.
+    routing:
+      quality: 75
+      latency_ms: 1200
     fallback_models: []
 
 # The Mistral adapter ships in M1 (Issue #7) and is selectable purely through
@@ -73,6 +100,10 @@ models:
 #         value: true
 #         provenance: measured
 #         source: "T083 measurement, Mistral ministral-3b-2512, json_object + json_schema, unary + streamed, 2026-11-19"
+#     routing:
+#       # Opinions, not measurements -- see the note on the Google priors above.
+#       quality: 70
+#       latency_ms: 1500
 #     fallback_models: []
 #     # Measured free-tier limits (Issue #7, workspace console):
 #     #   12.50 requests/second, 1,300,000 tokens/minute.

@@ -42,6 +42,7 @@ _MODEL_KEYS = {
     "key_aliases",
     "quota",
     "capabilities",
+    "routing",
     "fallback_models",
 }
 """Fields a model entry may declare. Anything else is a mistake or a pasted secret."""
@@ -80,7 +81,7 @@ def test_shipped_config_declares_no_secret() -> None:
     document = yaml.safe_load(SHIPPED_CONFIG.read_text(encoding="utf-8"))
 
     assert isinstance(document, dict), "the shipped config is not a mapping"
-    unexpected_top = set(document) - {"models"}
+    unexpected_top = set(document) - {"models", "routing"}
     assert not unexpected_top, (
         f"the shipped config declares unexpected top-level keys {sorted(unexpected_top)}."
     )
@@ -188,6 +189,19 @@ def test_shipped_config_declares_the_verified_google_limits() -> None:
     assert google.capabilities.supports_streaming.value is True
     assert google.capabilities.supports_streaming.provenance == "measured"
     assert google.fallback_models == []
+    assert google.routing is not None
+    assert google.routing.quality == 75
+    assert google.routing.latency_ms == 1200
+
+
+def test_shipped_config_declares_routing_policy() -> None:
+    """The default configuration ships routing weights and priors (spec §2, T090)."""
+    config = _shipped()
+    assert config.routing is not None
+    assert config.routing.weights.quality == 0.60
+    assert config.routing.weights.tool_support == 0.30
+    assert config.routing.weights.latency == 0.10
+    assert config.routing.latency_ceiling_ms == 5000
 
 
 def test_commented_mistral_entry_is_a_valid_model_config(tmp_path: Path) -> None:
