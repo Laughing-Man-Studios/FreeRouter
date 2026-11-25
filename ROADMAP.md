@@ -1155,7 +1155,7 @@ sample of responses, as input to the dynamic quality estimates explored in
 Milestone 5. This is off by default, quota-guarded, and subject to the same privacy
 controls, because it would send model outputs to a third party.
 
-### Explicit non-goals
+### Explicit non-goals (advisory stage)
 
 - The decision model never determines eligibility, quota availability, capability
   fit or context fit.
