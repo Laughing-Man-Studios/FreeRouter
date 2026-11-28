@@ -95,7 +95,7 @@ Batch 1  boundary + estimator        (no behaviour change)
 
 ## Batch 1: Boundary and Estimator
 
-- [ ] **T076: Extend the internal models for the capabilities M3 detects.**
+- [x] **T076: Extend the internal models for the capabilities M3 detects.**
 
   `core/normalization.py`: `NormalizedRequest` gains `tools`, `tool_choice`,
   `response_format`, and message content that may be a list of parts;
@@ -115,7 +115,7 @@ Batch 1  boundary + estimator        (no behaviour change)
   `extra="forbid"` stays. `temperature` is still stripped, and a test asserts it —
   the boundary's original claim must survive the boundary growing.
 
-- [ ] **T077: Size the payload the router is now willing to forward.**
+- [x] **T077: Size the payload the router is now willing to forward.**
 
   `quota/estimation.py`: per-message framing overhead, serialised `tools` /
   `tool_choice` / `response_format` size, and list-shaped `content` (text parts counted
@@ -145,7 +145,7 @@ Batch 1  boundary + estimator        (no behaviour change)
 
 ## Batch 2: Tool Pass-Through
 
-- [ ] **T078: Gemini tools, unary, including the second turn.**
+- [x] **T078: Gemini tools, unary, including the second turn.**
 
   `providers/google/adapter.py`: `tools` → `functionDeclarations`; `tool_choice` →
   `toolConfig.functionCallingConfig`; assistant `tool_calls` → `functionCall` parts;
@@ -165,7 +165,7 @@ Batch 1  boundary + estimator        (no behaviour change)
   work, the finding is recorded and `supports_tools` stays `assumed` — no declaration
   ships on an unverified guess.
 
-- [ ] **T079: Mistral tools, unary, including the second turn.**
+- [x] **T079: Mistral tools, unary, including the second turn.**
 
   `providers/mistral/adapter.py`: forward `tools`, `tool_choice`, `tool_calls` and
   `role: "tool"` messages; pass `finish_reason: "tool_calls"` through; delete the
@@ -176,7 +176,7 @@ Batch 1  boundary + estimator        (no behaviour change)
   work here is proving the OpenAI-shaped fields survive the boundary intact, which is
   also the cheapest place to catch a boundary bug before blaming Google.
 
-- [ ] **T080: Streamed tool calls, both adapters.**
+- [x] **T080: Streamed tool calls, both adapters.**
 
   `api/streaming.py`: `StreamRenderer` emits `delta.tool_calls` and delivers a chunk
   whose only content is a call. Both adapters translate their streamed function-call
@@ -191,7 +191,7 @@ Batch 1  boundary + estimator        (no behaviour change)
   with `[DONE]`. M2's fail-fast rule is unchanged: once a chunk has been delivered, a
   later failure still terminates rather than replaying.
 
-- [ ] **T081: Measure and declare tool support.**
+- [x] **T081: Measure and declare tool support.**
 
   A live unary and streamed tool call through each configured model, then
   `supports_tools: {value: true, provenance: measured, source: "<measurement, date>"}`
@@ -221,7 +221,7 @@ Batch 1  boundary + estimator        (no behaviour change)
 
 ## Batch 3: Structured-Output Pass-Through
 
-- [ ] **T082: Gemini structured output.**
+- [x] **T082: Gemini structured output.**
 
   `response_format: json_schema` → `generationConfig.responseMimeType` plus
   `responseSchema`; `json_object` → the mime type alone.
@@ -232,7 +232,7 @@ Batch 1  boundary + estimator        (no behaviour change)
   Decide in this batch, record the decision, and refuse locally only if forwarding
   would change the constraint.
 
-- [ ] **T083: Mistral structured output, and declare both.**
+- [x] **T083: Mistral structured output, and declare both.**
 
   Forward `response_format` (near passthrough). Then measure `json_schema` and
   `json_object` against each provider and record `supports_json_schema` as `measured`
@@ -256,7 +256,7 @@ Batch 1  boundary + estimator        (no behaviour change)
 
 ## Batch 4: Vision Pass-Through
 
-- [ ] **T084: Gemini image input.**
+- [x] **T084: Gemini image input.**
 
   `image_url` parts with base64 data → `parts[].inlineData` with the mime type taken
   from the data URL. A plain `http(s)` URL is refused locally (R11).
@@ -265,7 +265,7 @@ Batch 1  boundary + estimator        (no behaviour change)
   is an SSRF surface and an egress proxy, and neither is in scope for a request proxy
   that has never made an outbound call the configuration did not declare.
 
-- [ ] **T085: Mistral image input, and declare both.**
+- [x] **T085: Mistral image input, and declare both.**
 
   Forward image content parts in the shape Mistral accepts, apply the same remote-URL
   rule, then measure and record `supports_vision` as `measured` for the models that
@@ -288,7 +288,7 @@ Batch 1  boundary + estimator        (no behaviour change)
 
 ## Batch 5: Routing Policy and `model = "free"`
 
-- [ ] **T086: The routing configuration schema.**
+- [x] **T086: The routing configuration schema.**
 
   `core/config.py`: `RoutingWeights` (quality, tool_support, latency; `extra="forbid"`;
   total > 0), `RoutingConfig` (`weights`, `latency_ceiling_ms`), and
@@ -304,7 +304,7 @@ Batch 1  boundary + estimator        (no behaviour change)
   and stays explicitly selectable. Routing configured with no scoreable model is a
   startup failure, because `free` could then never be served (R10).
 
-- [ ] **T087: Scoring.**
+- [x] **T087: Scoring.**
 
   `core/routing.py`: `score_model`, `rank_candidates`, `ModelScore`,
   `RankedCandidate`, `Exclusion`. Pure functions over configuration and the detected
@@ -318,7 +318,7 @@ Batch 1  boundary + estimator        (no behaviour change)
   - Weights are normalised by their total, so they may be fractions, percentages or
     points.
 
-- [ ] **T088: Selection and the `free` entry point.**
+- [x] **T088: Selection and the `free` entry point.**
 
   `resolve_request(config, requirements, requested_model, *, capacity_probe)` is the
   one function both routes call. Explicit ids delegate to M3's `resolve_target`,
@@ -334,7 +334,7 @@ Batch 1  boundary + estimator        (no behaviour change)
   "auto" from `requested == "free"` at the call site would put the special case in two
   handlers, which is the duplication M3 removed.
 
-- [ ] **T089: Explainability and discovery.**
+- [x] **T089: Explainability and discovery.**
 
   One `INFO` `routing_decision` record per auto selection: selected model, total score,
   per-dimension contributions, the weights in force, every candidate with its score,
@@ -350,7 +350,7 @@ Batch 1  boundary + estimator        (no behaviour change)
   reporting configuration readiness rather than capacity, because the endpoint carries
   no request shape to size.
 
-- [ ] **T090: Ship the policy and the priors.**
+- [x] **T090: Ship the policy and the priors.**
 
   `config.yaml` gains a `routing` block and a `routing` block per model. Priors are
   chosen deliberately and recorded with the reasoning, because they are opinions and
@@ -375,7 +375,7 @@ Batch 1  boundary + estimator        (no behaviour change)
 
 ## Batch 6: Exit-Criteria Verification and Milestone Report
 
-- [ ] **T091: Prove the exit criterion, run OpenHands, and report the gap.**
+- [x] **T091: Prove the exit criterion, run OpenHands, and report the gap.**
 
   Verify against a running router, not only in tests:
 
@@ -404,9 +404,89 @@ Batch 1  boundary + estimator        (no behaviour change)
   pass-through deliverables, and the OpenHands objective. M3's report exists because
   the first was briefly at risk of implying the third.
 
+  **Run 2026-11-23 20:29–20:34 local (2026-11-24 01:29–01:34 UTC).** Four
+  uvicorn processes were started against temporary SQLite databases. `:8121`
+  used the shipped `config.yaml`; `:8122` used a verification config enabling
+  both measured models with Mistral ranked above Google; `:8123` used the
+  shipped config with the `routing` block and every model prior removed. A
+  fourth process was prepared with a placeholder quota limit on the top-ranked
+  model but was not needed: Mistral's own free-tier rate limit produced the
+  exclusion first. No request, selection, dispatch or logging code was patched.
+
+  | Row | Condition | Observed | Label |
+  | :--- | :--- | :--- | :--- |
+  | 1 | `model = "free"`, two-model config, short prompt | `200` in 0.97 s; response `model` `mistral/ministral-3b-2512`; the decision scored Mistral 0.910 against Google 0.826 | pass, **observed** |
+  | 2 | the same request's `routing_decision` | `selected`, `score`, `contributions` (quality 0.54, tool_support 0.30, latency 0.07), `weights` (0.60 / 0.30 / 0.10), both candidates with scores and components, and `excluded: []`; the later takeover record carries `excluded: [{model: "mistral/…", reason: "cooling", detail: "rate limited for another 56.51s"}]` | pass, **observed** |
+  | 3a | unary tools, Google, `tool_choice: "required"`, then a `role: "tool"` second turn | `200` in 0.75 s: `content: null`, one `tool_calls` entry (`get_weather`, `{"city": "Paris"}`), `finish_reason: "tool_calls"`; second turn `200`, content answers 12 °C and light rain, `finish_reason: "stop"` | pass, **observed** |
+  | 3b | the same two turns, Mistral | `200` in 0.36 s with the same call shape; the second turn's first attempt was `429 provider_rate_limited` from the live free tier, and the retry after the 56 s cooldown returned `200` and answered from the tool result | pass, **observed** |
+  | 4 | `stream: true`, tools, Google | `200` in 0.56 s; four SSE records, one carrying `delta.tool_calls` with the call, terminal `finish_reason: "tool_calls"`, stream ending `[DONE]` | pass, **observed** |
+  | 5 | three consecutive `free` requests, two-model config | (1) Mistral selected and served; (2) Mistral selected, provider returned `429`; (3) Mistral excluded `cooling` (56.5 s) and Google selected, `200` | pass, **observed** |
+  | 6 | `routing` absent, shipped models | `free` → `400 unsupported_model` in 3.5 ms; `/v1/models` lists Google only; an explicit `google/gemini-3.5-flash-lite` request → `200` in 2.6 s | pass, **observed** |
+
+  **Pass-through was re-checked live, not inferred from the batch gates.** A
+  `json_object` request and a simple `json_schema` request each returned `200`
+  with valid JSON; a schema carrying `additionalProperties: false` was
+  forwarded and refused by the provider with `400 provider_validation_error`,
+  which is ADR-0011 decision 7 working as recorded. A 1×1 base64 PNG sent as an
+  `image_url` part returned `200` and a one-word answer. The capability
+  declarations in `config.yaml` remain `measured`, with the T081, T083, T084 and
+  T085 sources already recorded.
+
+  **OpenHands (carried from M2).** The run used OpenHands SDK 1.34.0
+  (`openhands-ai` 1.11.0) with its own `Agent`, `Conversation` and
+  `TerminalTool`, pointed at `http://127.0.0.1:8121/v1` with `model = "free"`.
+  The first attempt failed before any dispatch: the SDK sends text content as a
+  one-element parts array, and the router refused it with `400 invalid_message`,
+  *"Content part arrays carrying only text are not supported; send the message
+  content as a string."* Rerun with the SDK's documented
+  `force_string_serializer=True` (its option for providers that do not accept
+  list content), the agent completed: execution status `FINISHED`, final
+  response `openhands-router-ok`, `proof.txt` created in the workspace, and
+  exactly two `routing_decision` records with two successful dispatches through
+  the router (930 ms and 680 ms). The SDK also needed
+  `agent-client-protocol==0.10.1`, because 1.0.0 removes `acp.helpers`; that is
+  an upstream packaging incompatibility, not a router finding.
+
+  **Recorded discrepancy (not repaired here).** The Batch 1 review commit
+  `bc7ac75` says *"Batch 4 lifts the restriction"* on text-only content arrays.
+  Batch 4 delivered image parts but did not lift it, which is why an
+  unconfigured OpenHands client is refused. Batch 6 is verification-only, so
+  the gap is recorded and carried rather than patched.
+
+  **Milestone report — three claims, kept separate.**
+
+  1. **M4 exit criterion: met.** With `model = "free"`, the router selected the
+     higher-scoring eligible model without the client naming it, returned that
+     concrete id in `model`, explained the ranking from structured logs, kept
+     concentration until capacity failed, and fell to the next-ranked model
+     when the provider rate-limited the leader. Rows 1, 2, 5 and 6.
+  2. **Pass-through deliverables: delivered.** Tool calls and their results
+     crossed the boundary in both directions through each provider, a streamed
+     call carried `delta.tool_calls` and the `tool_calls` finish reason, and
+     structured output and vision requests were served. None of this is a
+     declaration-only claim: each was observed above or in its batch gate.
+  3. **OpenHands objective: verified for one agentic loop, with a client
+     setting required.** A two-turn terminal-tool loop completed on its own
+     terms. It does **not** establish the router as an unconfigured drop-in for
+     every OpenHands workload; the default message shape is refused, as recorded
+     above.
+
+  `spec.md` § *Explicit Non-Goals* was reviewed against the build: no learned
+  routing, no per-task dimensions, no quota-ratio score, no multi-hop chains, no
+  tool definitions or images in logs, no truncation, no policy API, no paid
+  routing, no image fetching, and no router-specific request field. No
+  discrepancy.
+
+  **Status:** verified 2026-11-24 (run window above). Batch 6 changes no request
+  behaviour. At the time of writing, Batches 0–5 are merged to `M4`, Batch 6 is
+  on its review branch, **no `M4 → main` integration PR exists**, and the
+  milestone is **not closed**. Opening that PR is step 4 above and happens after
+  review; the milestone must not be reported complete before it merges.
+
 **Verification & Stop:**
 
-1. `make check` green; `make test-hermetic` green with provider credentials unset.
+1. `make check` green (852 passed; ruff, format, `mypy --strict`, markdownlint);
+   `make test-hermetic` green with provider credentials unset (852 passed).
 2. Every numbered item above is recorded with its observed output and label.
 3. `spec.md` § *Explicit Non-Goals* reviewed against what was built, with any
    discrepancy recorded rather than the spec adjusted.
@@ -420,22 +500,22 @@ ROADMAP Milestone 4: *"The router can choose a free model without the client hav
 name the provider/model explicitly, while keeping the decision understandable from
 structured logs."*
 
-| Criterion | Status after Batch 0 |
+| Criterion | Status after Batch 6 |
 | :--- | :--- |
-| `model = "free"` selects without the client naming a model | Planned — Batch 5 |
-| The decision is understandable from structured logs | Planned — Batch 5 (T089) |
-| Configurable routing weights, validated at startup | Planned — Batch 5 (T086) |
-| Quota availability as a hard constraint, not a score | Planned — Batch 5 (T088) |
-| Concentration on the best eligible model, no distribution | Planned — Batch 5 (T087, R6) |
-| Tool support strongly weighted; latency deliberately lowest | Planned — defaults 0.30 / 0.10 (R3) |
-| Tool, vision and structured-output pass-through | Planned — Batches 2–4 |
-| Capability declared only once servable and measured | Planned — T081, T083, T085 (R9) |
+| `model = "free"` selects without the client naming a model | **Met** — observed live: 0.910 selected over 0.826, and the response names the concrete model (row 1) |
+| The decision is understandable from structured logs | **Met** — `routing_decision` carries candidates, scores, contributions, weights and exclusions (row 2) |
+| Configurable routing weights, validated at startup | **Met** — `RoutingWeights` refuses missing, non-positive and unknown dimensions; shipped weights are 0.60 / 0.30 / 0.10 (Batch 5 gate) |
+| Quota availability as a hard constraint, not a score | **Met** — capacity is probed before scoring; the leader was excluded as `cooling`, not down-weighted (rows 2 and 5) |
+| Concentration on the best eligible model, no distribution | **Met** — consecutive auto requests selected Mistral until its capacity failed (row 5) |
+| Tool support strongly weighted; latency deliberately lowest | **Met** — 0.30 against 0.10, with tool capability as a 0/1 component and latency under a ceiling |
+| Tool, vision and structured-output pass-through | **Met** — observed live: both-provider tools with second turns, streamed tool calls, both JSON modes, base64 image input |
+| Capability declared only once servable and measured | **Met** — every `true` carries a `measured` source from T081, T083, T084 or T085 |
 
 **Not claimed by this document:**
 
 | Objective | Status |
 | :--- | :--- |
-| OpenHands usable as an actual workload (deferred from M2, then M3) | **Unverified.** Batch 6 runs it or records that it could not. Nothing in a planning document closes it. |
+| OpenHands usable as an actual workload (deferred from M2, then M3) | **Partly verified.** One two-turn agentic loop completed through the router (see T091), but with `force_string_serializer=True`; the default OpenHands message shape is refused by the text-only-parts rule. One loop is a working loop, not a workload study. |
 
 ## Carried Into M5
 
@@ -450,3 +530,11 @@ structured logs."*
    classifier (prohibited by ROADMAP §3.7 and outside this project's direction).
 5. **Multi-hop fallback chains**, still deferred and still unrequested.
 6. **Routing policy management** through the Admin API — M6, not earlier.
+7. **OpenAI-valid text-only content arrays.** The boundary refuses a parts array that
+   carries only text, and Batch 1's stated intent that Batch 4 lift the restriction
+   was not carried out. OpenHands defaults to exactly this shape, so today the
+   workaround is a client setting rather than router support. Accept the shape
+   (normalising it to a string) or document the restriction; the first is preferable,
+   because the request is valid OpenAI.
+8. **OpenHands as a workload.** One terminal-tool loop is evidence that the router is
+   usable, not evidence of sustained agentic use. A workload study is still owed.

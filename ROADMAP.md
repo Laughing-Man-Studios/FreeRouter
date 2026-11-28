@@ -593,6 +593,9 @@ M6  Managed Router
  v
 M7  Extensible Provider Platform
  |  streamlined provider onboarding + expanded provider/model ecosystem
+ v
+M8  Decision-Model Advisory Routing
+ |  optional decision-model signals (Gemini Decision 1) feeding the scoring step
 ```
 
 The schedule is intentionally loose. A reasonable working expectation is roughly **three times** the duration suggested by a typical weekend/1–2-week/1-month progression. That translates to a roughly three-month development horizon for the sequence, but milestones should be allowed to move based on actual complexity and available personal development time.
@@ -1006,6 +1009,168 @@ enable provider/model(s)
 ```
 
 The precise level of automation depends on what each provider exposes reliably.
+
+---
+
+## Milestone 8: Decision-Model Advisory Routing
+
+> **Added 2026-11-24.** Milestones 3–5 deliberately keep request analysis
+> rules-based (§3.7; Milestone 3 non-goal: *no LLM-based request classifier*).
+> This milestone adds an optional model-based signal as a later layer on top of
+> that foundation. It does not replace the rules, the hard constraints, or the
+> Milestone 4 scoring.
+
+### Milestone 8: Objective
+
+Add an optional, advisory stage to the `model = free` routing decision in which a
+fast decision model, initially Google's Gemini Decision 1 (`gemini-decision-1`),
+answers a small fixed set of questions about the request (task type, difficulty,
+need for deep reasoning). Those answers adjust how already-eligible candidates are
+scored. They never decide eligibility.
+
+Whenever the advisory stage is disabled, skipped, or unavailable, the router must
+behave exactly as it did at the end of Milestone 4.
+
+### Background: the decision model
+
+A decision model scores predefined options in a single forward pass and returns
+probabilities and confidence values instead of generated text, with no output
+tokens. Gemini Decision 1 was released on 2026-11-11 alongside the Gemini Decisions
+API, which is in preview.
+
+The following figures come from launch coverage and third-party guides, not from
+Google's own reference pages. **Verify them against Google's pricing and rate-limit
+pages before implementation:**
+
+- Latency of roughly 150–250 ms end to end.
+- A free tier needing no billing account, listed at 200 requests/minute, 50,000
+  tokens/minute and 10,000 requests/day, applied **per project, not per key**.
+- Free-tier content may be used to improve Google's products.
+- Preview models can be throttled more heavily than stable ones.
+
+### Prerequisites
+
+- Milestone 4 (weighted scoring and explainable routing logs) is required.
+- Milestone 5 outcome tracking (success/failure, tool-call success) is strongly
+  recommended, because the shadow-mode evaluation below depends on it. Without it,
+  evaluation falls back to manual log review.
+
+### Milestone 8: Deliverables
+
+- **Decision-model client**, separate from the chat-completion provider adapters
+  and isolated behind a provider-agnostic interface so the specific model or API
+  can change while it is in preview.
+- **Utility resource, not a routing candidate.** The decision model is registered
+  with its own key pool, quota counters and cooldown handling, but it never
+  appears in `/v1/models` and is never selected to answer a chat request.
+- **Versioned question set**, defined in configuration, sent in a single call that
+  shares one input across all questions. Initial candidates:
+  - task type (coding, agentic tool use, chat/summarization, extraction, other)
+  - difficulty on a 1–5 scale
+  - whether deep reasoning is needed
+- **Input minimization.** Send a trimmed excerpt (for example the latest user turn
+  plus a short system-prompt summary) rather than the full payload. Apply a
+  configurable size cap, skip the call above it, and exclude tool outputs and file
+  contents by default.
+- **Invocation policy.** Call the decision model only when more than one candidate
+  remains after the hard filters (capability, context fit, quota/cooldown). For
+  agentic clients such as OpenHands, classify once per user turn or session, not on
+  every step of a tool loop. Cache signals by input hash with a TTL.
+- **Bounded influence on scoring.** Signals adjust the configured weights among
+  eligible candidates only (for example, the weight on answer quality scales with
+  predicted difficulty). A signal can reorder candidates but can never admit an
+  ineligible one. Maximum adjustment is configurable.
+- **Graceful degradation.** A timeout, error, cooldown or exhausted decision quota
+  skips the stage and routes with plain Milestone 4 scoring. A decision-model
+  failure never fails the user's request. A simple circuit breaker stops repeated
+  calls while it is unhealthy.
+- **Strict $0 enforcement.** Use a dedicated Google project with no billing account
+  attached. If usage ever indicates a non-free tier, fail closed by disabling the
+  advisory stage. There is no paid fallback. Decision-model quota is tracked per
+  project, so additional keys in the same project are not counted as additional
+  capacity.
+- **Privacy controls.** The advisory stage is opt-in per deployment and off by
+  default, because it sends prompt excerpts to a third party even when the request
+  is then routed to a different provider. It can be disabled per client, and the
+  behavior is documented alongside §8.
+- **Explainable decisions.** Routing logs record the questions asked, the returned
+  probabilities/confidence, whether the signals were applied, the resulting score
+  adjustments, the latency, and the skip reason when the stage did not run.
+- **Shadow mode.** The stage can run in observe-only mode: signals and the
+  hypothetical choice are logged, but routing is unchanged.
+
+### Routing sequence with the advisory stage
+
+```text
+model = free
+   ↓
+identify request requirements (rules)
+   ↓
+filter incompatible models            [deterministic]
+   ↓
+filter exhausted/cooling models       [deterministic]
+   ↓
+more than one candidate, advisory enabled,
+decision quota available, input within size cap?
+   ├─ no  → score with default weights
+   └─ yes → decision-model call → task / difficulty / reasoning signals
+                ↓
+         adjust weights (bounded) and score remaining models
+   ↓
+choose highest-scoring candidate (sticky while eligible)
+```
+
+### Design decision to resolve in this milestone
+
+§3.9 says to prefer the highest-quality eligible model and to concentrate traffic
+on it until a hard constraint forces a change. A difficulty signal makes a different
+policy possible: reserve the scarce free capacity of the best model for requests
+that need it, and send easy requests to lower-ranked models.
+
+Choose and document one of:
+
+1. **Best model always** (current §3.9 behavior). Signals only break near-ties and
+   inform logs.
+2. **Best model when it matters.** Signals may steer easy requests away from the
+   top model to conserve its quota.
+
+Expose the choice as a configuration flag, defaulting to option 1 so existing
+behavior is preserved. If option 2 is adopted as the default, amend §3.9
+accordingly.
+
+### Rollout and promotion criteria
+
+1. Run in shadow mode against real workloads, including OpenHands runs.
+2. Compare the advisory stage's hypothetical choices with the baseline and with
+   observed outcomes (request success, tool-call success, retries).
+3. Define the promotion criteria at the start of the milestone. For example:
+   advisory-influenced selections show better observed outcomes than baseline
+   selections while staying within the free-tier budget.
+4. Enable influence on routing only after those criteria are met.
+
+### Exploratory follow-on (optional)
+
+Evaluate using the same decision model with rubric-style questions to score a
+sample of responses, as input to the dynamic quality estimates explored in
+Milestone 5. This is off by default, quota-guarded, and subject to the same privacy
+controls, because it would send model outputs to a third party.
+
+### Explicit non-goals (advisory stage)
+
+- The decision model never determines eligibility, quota availability, capability
+  fit or context fit.
+- The decision model is never used to answer chat requests.
+- No paid usage and no automatic paid fallback.
+- No dependence on a single decision provider: the router must work without it.
+
+### Milestone 8: Exit criteria
+
+With the advisory stage enabled, the router uses decision-model signals to adjust
+scoring among eligible candidates, and every such decision is understandable from
+structured logs. With the stage disabled or unavailable, routing is identical to
+Milestone 4. The stage has completed a shadow-mode evaluation against the agreed
+promotion criteria, operates within the free-tier limits, and the quota-conservation
+policy has been explicitly chosen and documented.
 
 ---
 
