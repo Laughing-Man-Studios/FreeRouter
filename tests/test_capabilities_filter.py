@@ -937,6 +937,82 @@ def test_response_format_refused_locally(no_fallback_app: Callable[[], FastAPI])
 
 
 @respx.mock
+def test_remote_image_refused_before_any_reservation(
+    workdir: Path,
+    tmp_path: Path,
+    write_config: Callable[..., Path],
+    set_api_key: Callable[..., str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R11 is enforced before routing, so a refusal costs no quota and no dispatch.
+
+    Two requests against a one-request window. An adapter-level refusal would
+    have reserved capacity first and never reconciled it, so the second request
+    would come back 503 NoAvailableCapacity instead of another 400 — and the
+    first would have been logged as dispatched though nothing was sent.
+    """
+    from free_router.api.main import create_app
+
+    set_api_key()
+    monkeypatch.setenv("ROUTER_DB_PATH", str(tmp_path / "router.db"))
+    write_config(
+        "models:\n"
+        '  - id: "google/gemini-3.5-flash-lite"\n'
+        '    provider: "google"\n'
+        '    provider_id: "gemini-3.5-flash-lite"\n'
+        "    capabilities:\n"
+        "      context_window:\n"
+        "        value: 1048576\n"
+        "        provenance: published\n"
+        '        source: "https://example.test/model-docs, retrieved 2026-11-04"\n'
+        "      supports_streaming:\n"
+        "        value: true\n"
+        "        provenance: measured\n"
+        '        source: "test measurement, 1/1 streamed, 2026-11-04"\n'
+        "      supports_tools:\n"
+        "        value: false\n"
+        "        provenance: assumed\n"
+        "      supports_vision:\n"
+        "        value: true\n"
+        "        provenance: measured\n"
+        '        source: "test measurement, 1/1 image, 2026-11-04"\n'
+        "      supports_json_schema:\n"
+        "        value: false\n"
+        "        provenance: assumed\n"
+        "    quota:\n"
+        '      - resource: "requests"\n'
+        "        limit: 1\n"
+        "        window_seconds: 60\n"
+        "        provenance: measured\n"
+        "    fallback_models: []\n"
+    )
+    route = respx.post(GENERATE_URL).mock(return_value=httpx.Response(200, json=GEMINI_RESP))
+
+    body = {
+        "model": "google/gemini-3.5-flash-lite",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+                ],
+            }
+        ],
+    }
+
+    with TestClient(create_app()) as test_client:
+        first = test_client.post("/v1/chat/completions", json=body)
+        second = test_client.post("/v1/chat/completions", json=body)
+
+    for response in (first, second):
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "capability_unsatisfiable"
+        assert response.json()["error"]["param"] == "messages"
+    assert route.call_count == 0
+
+
+@respx.mock
 def test_streaming_unsupported_refused_with_zero_outbound(
     workdir: Path,
     tmp_path: Path,
@@ -1037,3 +1113,34 @@ def test_cooldown_fallback_skipped_for_next_eligible(
     assert response.json()["model"] == "model-large"
     assert pro_route.call_count == 1
     assert lite_route.call_count == 1
+
+
+def test_assumed_json_schema_capability_raises_unsatisfiable() -> None:
+    """When supports_json_schema is assumed, requests requiring json are refused."""
+    model = _make_model(
+        "model-assumed",
+        json_schema=True,
+        json_schema_provenance="assumed",
+    )
+    req_json_obj = RequestRequirements(
+        requires_tools=False,
+        requires_vision=False,
+        requires_json_schema=True,
+        requires_streaming=False,
+        input_tokens=10,
+        reserved_output=100,
+    )
+    result = mismatch(model, req_json_obj)
+    assert result is not None
+    assert result.code == "capability_unsatisfiable"
+    assert result.param == "response_format"
+
+    cfg = Config(models=[model])
+    with pytest.raises(CapabilityUnsatisfiableError) as exc_info:
+        resolve_target(
+            config=cfg,
+            requested_model="model-assumed",
+            requirements=req_json_obj,
+        )
+    assert exc_info.value.code == "capability_unsatisfiable"
+    assert "JSON schema / structured output is required" in exc_info.value.message

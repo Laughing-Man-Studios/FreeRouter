@@ -25,11 +25,13 @@ distinct ``authentication_error`` type, so status alone is sufficient. Copying
 Google's heuristic would add a branch that Mistral's error taxonomy can never
 reach.
 
-**Only the messages the normalizer kept are sent.** M0 honours ``model`` and
-``messages`` exclusively; ``temperature`` and ``max_tokens`` are stripped at
-ingress and have no representation here. Mistral accepts both, and
-``temperature`` is capped at 1.5 rather than 2.0, but wiring them up is scope
-for a later milestone.
+**Only what the boundary admitted is sent.** The normalizer keeps ``model``,
+``messages``, ``stream``, ``include_usage``, the tool fields
+(``tools``/``tool_choice``), ``response_format``, plus ``tool_calls`` and
+``role: "tool"`` messages in the history; ``temperature`` and ``max_tokens``
+are stripped at ingress and have no representation here. Mistral accepts those
+controls, and ``temperature`` is capped at 1.5 rather than 2.0, but wiring them
+up is scope for a later milestone.
 """
 
 from __future__ import annotations
@@ -56,6 +58,8 @@ from free_router.core.normalization import (
     NormalizedRequest,
     NormalizedResponse,
     TokenUsage,
+    ToolCall,
+    ToolCallDelta,
 )
 from free_router.keys.manager import KeyRef
 from free_router.providers.sse import SSEDecodeError, iter_sse_data, response_lines
@@ -83,15 +87,15 @@ beta variant for chat completions, so there is nothing to pin.
 """
 
 # Mistral documents these finish reasons: "stop", "length", "model_length",
-# "tool_calls", "content_filter". The first three are the only ones M1 can
-# reach, since tool calls are stripped at ingress. Anything unrecognised falls
-# back to "stop" rather than raising: an unknown termination reason is not a
-# reason to fail a completion the provider already produced.
+# "tool_calls", "content_filter". Anything unrecognised falls back to "stop"
+# rather than raising: an unknown termination reason is not a reason to fail a
+# completion the provider already produced.
 _FINISH_REASON_MAP: dict[str, FinishReason] = {
     "stop": "stop",
     "length": "length",
     "model_length": "length",
     "content_filter": "content_filter",
+    "tool_calls": "tool_calls",
 }
 
 
@@ -337,13 +341,55 @@ class MistralAdapter:
         return decoded
 
 
+def _content_part_to_mistral(part: dict[str, Any]) -> dict[str, Any]:
+    """Translate one content part into the shape Mistral's endpoint accepts.
+
+    Mistral is OpenAI-compatible but narrower here, and measured (T085) is what
+    settles it: a text part passes through, and an image is
+    ``{"type": "image_url", "image_url": {"url": <data URL>}}``. The boundary
+    also admits the Responses spelling (``input_image``), which Mistral rejects
+    with a 422 when forwarded verbatim, so both spellings are normalised to the
+    one shape Mistral documents.
+
+    Normalization has already refused remote URLs and malformed data URLs, so
+    this translates what arrived rather than re-deciding what is acceptable.
+    """
+    if part.get("type") == "text":
+        return {"type": "text", "text": part["text"]}
+
+    image = part.get("image_url") if "image_url" in part else part.get("input_image")
+    url = image.get("url") if isinstance(image, dict) else image
+    if not isinstance(url, str):
+        raise ValueError(
+            "image part reached the adapter without a data URL; "
+            "normalization should have refused it."
+        )
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
+def _without_extra_content(tool_call: Any) -> Any:
+    """Drop a provider passthrough key before forwarding a tool call to Mistral.
+
+    ``extra_content`` carries Gemini's thought signature. It means nothing to
+    Mistral, and forwarding a field the provider does not define risks a
+    rejection for a value it never asked for. It is removed at this adapter's
+    edge rather than at the boundary because another adapter still reads it.
+    """
+    if not isinstance(tool_call, dict):
+        return tool_call
+    return {key: value for key, value in tool_call.items() if key != "extra_content"}
+
+
 def to_mistral_request(request: NormalizedRequest, provider_model_id: str) -> dict[str, Any]:
     """Translate a :class:`NormalizedRequest` into a Mistral payload.
 
     Messages pass through in order with their roles intact, because ``system``
-    is a native role here rather than something to be lifted out. The only
-    substitution is the model: the router's external ``provider/model`` id is
-    replaced by the provider-native id resolved from configuration.
+    is a native role here rather than something to be lifted out. Assistant
+    tool_calls and role: "tool" result messages pass through intact, except for
+    ``extra_content``, which is Gemini-specific and meaningless here.
+    The only other substitution is the model: the router's external
+    ``provider/model`` id is replaced by the provider-native id resolved from
+    configuration.
 
     Args:
         request: The internal normalized request.
@@ -354,26 +400,57 @@ def to_mistral_request(request: NormalizedRequest, provider_model_id: str) -> di
     """
     messages: list[dict[str, Any]] = []
     for message in request.messages:
-        content = message.get("content", "")
-        # Guard the invariant the ingress normalizer already enforced, so this
-        # function is safe to call from a test with a hand-built request.
-        if not isinstance(content, str):
-            content = str(content)
-        messages.append({"role": message.get("role"), "content": content})
+        role = message.get("role")
+        if role == "assistant" and "tool_calls" in message:
+            entry: dict[str, Any] = {
+                "role": "assistant",
+                "content": message.get("content"),
+                "tool_calls": [
+                    _without_extra_content(tool_call) for tool_call in message["tool_calls"]
+                ],
+            }
+            messages.append(entry)
+        elif role == "tool":
+            entry = {
+                "role": "tool",
+                "content": message.get("content", ""),
+            }
+            if "tool_call_id" in message:
+                entry["tool_call_id"] = message["tool_call_id"]
+            if "name" in message:
+                entry["name"] = message["name"]
+            messages.append(entry)
+        else:
+            content = message.get("content", "")
+            if isinstance(content, list):
+                parts = [_content_part_to_mistral(part) for part in content]
+                messages.append({"role": role, "content": parts})
+            else:
+                if not isinstance(content, str):
+                    content = str(content)
+                messages.append({"role": role, "content": content})
 
     # stream=False is explicit rather than omitted. The response is read with
     # aread() outside the header timeout, which requires a complete body, and
     # relying on Mistral's default would make that an implicit coupling.
-    return {"model": provider_model_id, "messages": messages, "stream": False}
+    payload: dict[str, Any] = {"model": provider_model_id, "messages": messages, "stream": False}
+    if request.tools:
+        payload["tools"] = request.tools
+    if request.tool_choice is not None:
+        payload["tool_choice"] = request.tool_choice
+    if request.response_format is not None:
+        payload["response_format"] = request.response_format
+    return payload
 
 
 def _chunk_from_mistral(event: dict[str, Any]) -> NormalizedChunk | None:
     """Translate one Mistral stream event, or drop it if it carries nothing.
 
     Mistral's chunks are already OpenAI-shaped, so the translation is mostly
-    reading the first choice's ``delta.content``. The role arrives on the first
-    chunk and is deliberately **discarded**: emitting it is the writer's job, so
-    that the role delta appears exactly once regardless of what a provider does.
+    reading the first choice's ``delta.content`` and any ``delta.tool_calls``.
+    The role arrives on the first chunk and is deliberately **discarded**:
+    emitting it is the writer's job, so that the role delta appears exactly
+    once regardless of what a provider does.
 
     A usage-only event has an empty ``choices`` array, which is why the choice
     handling is guarded rather than indexed.
@@ -386,6 +463,7 @@ def _chunk_from_mistral(event: dict[str, Any]) -> NormalizedChunk | None:
     """
     delta = ""
     finish_reason: FinishReason | None = None
+    tool_call_deltas: list[ToolCallDelta] | None = None
 
     choices = event.get("choices") or []
     if choices and isinstance(choices[0], dict):
@@ -395,14 +473,30 @@ def _chunk_from_mistral(event: dict[str, Any]) -> NormalizedChunk | None:
             content = delta_block.get("content")
             if isinstance(content, str):
                 delta = content
+            raw_tool_calls = delta_block.get("tool_calls")
+            if isinstance(raw_tool_calls, list):
+                tool_call_deltas = [
+                    ToolCallDelta(
+                        index=tc.get("index", idx),
+                        id=tc.get("id"),
+                        function=tc.get("function"),
+                    )
+                    for idx, tc in enumerate(raw_tool_calls)
+                    if isinstance(tc, dict)
+                ]
         raw_finish_reason = choice.get("finish_reason")
         if raw_finish_reason:
             finish_reason = _FINISH_REASON_MAP.get(str(raw_finish_reason).lower(), "stop")
 
     usage = _usage_from_mistral(event)
-    if not delta and finish_reason is None and usage is None:
+    if not delta and finish_reason is None and usage is None and not tool_call_deltas:
         return None
-    return NormalizedChunk(delta=delta, finish_reason=finish_reason, usage=usage)
+    return NormalizedChunk(
+        delta=delta,
+        finish_reason=finish_reason,
+        usage=usage,
+        tool_call_deltas=tool_call_deltas,
+    )
 
 
 def _usage_from_mistral(raw: dict[str, Any]) -> TokenUsage | None:
@@ -471,22 +565,45 @@ def from_mistral_response(raw: dict[str, Any], provider_model_id: str) -> Normal
     if not isinstance(message, dict):
         raise ProviderServerError("The upstream provider returned a choice without a message.")
 
+    raw_tool_calls = message.get("tool_calls")
+    tool_calls: list[ToolCall] | None = None
+    if isinstance(raw_tool_calls, list):
+        tool_calls = [
+            ToolCall(
+                id=tc.get("id", ""),
+                type="function",
+                function={
+                    "name": tc.get("function", {}).get("name", ""),
+                    "arguments": tc.get("function", {}).get("arguments", "{}"),
+                },
+            )
+            for tc in raw_tool_calls
+            if isinstance(tc, dict)
+        ]
+
     content = message.get("content")
-    if not isinstance(content, str):
-        # A null content is how Mistral represents a message carrying only
-        # tool_calls. M0 strips tools at ingress, so this is not reachable, and
-        # an empty string is a safer answer than raising on a complete response.
-        content = "" if content is None else str(content)
+    if content is not None and not isinstance(content, str):
+        content = str(content)
+    # Mistral sometimes sends content: "" when returning a tool call; normalise to
+    # None so that Scenario 10 ("content is null") is satisfied for both providers.
+    if content == "" and tool_calls:
+        content = None
 
     finish_reason: FinishReason = _FINISH_REASON_MAP.get(
-        str(choice.get("finish_reason", "stop")), "stop"
+        str(choice.get("finish_reason", "stop")).lower(), "stop"
     )
+    if tool_calls and finish_reason == "stop":
+        # A tool-call turn can arrive with "stop". OpenAI clients branch on the
+        # finish reason to decide whether to run the call, so the two are kept
+        # distinct here as they already are on the streaming path.
+        finish_reason = "tool_calls"
 
     return NormalizedResponse(
         content=content,
         model_used=provider_model_id,
         finish_reason=finish_reason,
         usage=_usage_from_mistral(raw),
+        tool_calls=tool_calls or None,
     )
 
 

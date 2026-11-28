@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -24,10 +24,14 @@ from free_router.core.exceptions import (
 )
 from free_router.quota.estimation import estimate_input_tokens
 
+if TYPE_CHECKING:
+    from free_router.core.routing import ModelScore
+
 __all__ = [
     "CapacityProbe",
     "Mismatch",
     "RequestRequirements",
+    "SelectionKind",
     "Target",
     "detect_requirements",
     "eligible_models",
@@ -61,8 +65,9 @@ class RequestRequirements(BaseModel):
             ``json_schema``. Both map to structured output requirements.
         requires_streaming: True if ``payload.stream is True``.
         input_tokens: Estimated input tokens computed using the shared reservation
-            estimator. Documented bias: under-counts per-message framing overhead and
-            returns 1 for list-shaped content.
+            estimator, which counts per-message framing overhead, serialised tool
+            and response-format payloads, and image parts by a configured
+            tokens-per-image assumption rather than by base64 length.
         reserved_output: Expected response tokens: ``max_tokens`` or ``max_completion_tokens``
             when either is a positive integer, otherwise the caller-supplied
             ``assumed_output`` (normally ``quota.output_token_assumption``).
@@ -214,13 +219,19 @@ class Mismatch(BaseModel):
     detail: str
 
 
+SelectionKind = Literal["explicit", "substituted", "auto"]
+
+
 @dataclass(frozen=True, slots=True)
 class Target:
     """Resolved execution target for a request."""
 
     model: ModelConfig
+    selection: SelectionKind = "explicit"
     substituted_from: str | None = None
     forcing_requirement: str | None = None
+    score: ModelScore | None = None
+    """The winning score, populated only when ``selection == "auto"``."""
 
 
 def _capability_mismatch(model: ModelConfig, requirements: RequestRequirements) -> Mismatch | None:
@@ -345,7 +356,9 @@ def resolve_target(
 
     m = mismatch(model, requirements)
     if m is None:
-        return Target(model=model, substituted_from=None, forcing_requirement=None)
+        return Target(
+            model=model, selection="explicit", substituted_from=None, forcing_requirement=None
+        )
 
     considered: list[ModelConfig] = [model]
     capacity_error: RouterBaseError | None = None
@@ -366,6 +379,7 @@ def resolve_target(
 
         return Target(
             model=fallback,
+            selection="substituted",
             substituted_from=requested_model,
             forcing_requirement=m.code,
         )

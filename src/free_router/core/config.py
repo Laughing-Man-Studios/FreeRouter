@@ -16,6 +16,7 @@ can never end up in version-controlled configuration (spec 6, CONSTITUTION 9.2).
 from __future__ import annotations
 
 import contextvars
+import logging
 import os
 import re
 from collections.abc import Mapping
@@ -138,6 +139,8 @@ custom source, so the path travels via a context variable. Configuration is
 loaded once during startup, before the server accepts traffic.
 """
 
+logger = logging.getLogger(__name__)
+
 
 class ConfigError(RuntimeError):
     """A condition that must prevent the process from starting."""
@@ -191,6 +194,66 @@ class CapabilityValue[T](BaseModel):
         return self
 
 
+class RoutingWeights(BaseModel):
+    """Routing weights for auto-selection (spec §2, ADR-0010).
+
+    Weights are non-negative relative numbers. They are normalized by dividing by
+    their total sum, so they may be fractions, percentages or points.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    quality: float = Field(default=0.60, ge=0, allow_inf_nan=False)
+    tool_support: float = Field(default=0.30, ge=0, allow_inf_nan=False)
+    latency: float = Field(default=0.10, ge=0, allow_inf_nan=False)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_weight_keys(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            allowed = {"quality", "tool_support", "latency"}
+            for key in sorted(data.keys()):
+                if key in ("quota", "reliability"):
+                    raise ValueError(
+                        f"weight '{key}' is not supported: {key} is a hard constraint "
+                        "(quota/health), not a score dimension (spec §2, ADR-0010)."
+                    )
+                if key not in allowed:
+                    raise ValueError(
+                        f"unknown weight key '{key}'. Supported weights are: "
+                        "quality, tool_support, latency."
+                    )
+        return data
+
+    @model_validator(mode="after")
+    def _validate_total_weight(self) -> RoutingWeights:
+        total = self.quality + self.tool_support + self.latency
+        if total <= 0:
+            raise ValueError(
+                f"total weight must be greater than zero, found {total}. "
+                "At least one weight dimension must be positive (spec §2, §9)."
+            )
+        return self
+
+
+class RoutingConfig(BaseModel):
+    """Router-controlled virtual model policy."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    weights: RoutingWeights
+    latency_ceiling_ms: int = Field(default=5000, gt=0)
+
+
+class RoutingPrior(BaseModel):
+    """Operator-declared priors. Not measurements; see spec R2, ADR-0010."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    quality: int = Field(ge=0, le=100)
+    latency_ms: int = Field(gt=0)
+
+
 class Capabilities(BaseModel):
     """The capability set declared by a model (spec §1, ROADMAP §3.7)."""
 
@@ -223,6 +286,7 @@ class ModelConfig(BaseModel):
     provider: str
     provider_id: str
     capabilities: Capabilities
+    routing: RoutingPrior | None = None
     fallback_models: list[str] = Field(default_factory=list)
     cooldown_seconds: float = Field(default=60.0, gt=0)
     """How long to wait after a rate limit before this model may be dispatched again.
@@ -467,6 +531,7 @@ class Config(BaseSettings):
     )
 
     models: list[ModelConfig] = Field(min_length=1)
+    routing: RoutingConfig | None = None
     quota: QuotaConfig = Field(default_factory=QuotaConfig)
     dispatch: DispatchConfig = Field(default_factory=DispatchConfig)
     max_cooldown_seconds: float = Field(default=86_400.0, gt=0)
@@ -800,6 +865,28 @@ def load_config(path: str | Path | None = None, *, resolve_keys: bool = True) ->
         _config_path_override.reset(token)
 
     config._config_mtime = _modified_at(resolved)
+
+    if config.routing is not None:
+        # Cross-field policy check lives here rather than in a model validator:
+        # ``Config`` is also constructed directly (tests, embedding), and a
+        # settings source may supply ``routing`` while the caller supplies
+        # ``models``. Startup is the point at which the two must agree, and a
+        # policy with nothing to score could never serve ``free`` (spec §9, R10).
+        if not any(model.routing is not None for model in config.models):
+            raise ConfigError(
+                f"Configuration file '{resolved}': routing policy is configured, but no "
+                "model declares routing priors. At least one model must configure a "
+                "'routing' block with quality and latency_ms, otherwise 'free' could "
+                "never be served (spec §9, R10)."
+            )
+
+        unconfigured = [m.id for m in config.models if m.routing is None]
+        if unconfigured:
+            logger.warning(
+                "model_routing_unconfigured: models %s have no routing priors and will "
+                "be excluded from 'free' selection",
+                ", ".join(unconfigured),
+            )
 
     if resolve_keys:
         config.resolve_key_material()

@@ -41,6 +41,7 @@ from free_router.providers.mistral.adapter import (
     MISTRAL_CHAT_PATH,
     PROVIDER_TIMEOUT_SECONDS,
     MistralAdapter,
+    _chunk_from_mistral,
     from_mistral_response,
     to_mistral_request,
 )
@@ -98,10 +99,18 @@ def http_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=httpx.Timeout(10.0))
 
 
-def _request(messages: list[dict[str, Any]] | None = None) -> NormalizedRequest:
+def _request(
+    messages: list[dict[str, Any]] | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
+    response_format: dict[str, Any] | None = None,
+) -> NormalizedRequest:
     return NormalizedRequest(
         model=f"mistral/{MODEL_ID}",
         messages=messages if messages is not None else [{"role": "user", "content": "hello"}],
+        tools=tools,
+        tool_choice=tool_choice,
+        response_format=response_format,
     )
 
 
@@ -239,16 +248,50 @@ def test_unknown_finish_reason_does_not_fail_a_complete_completion() -> None:
     assert from_mistral_response(body, MODEL_ID).finish_reason == "stop"
 
 
-def test_null_content_becomes_empty_string() -> None:
-    """Mistral returns null content for a tool-call-only message.
+def test_null_content_is_preserved() -> None:
+    """Mistral returns null content for a tool-call message.
 
-    M0 strips tools at ingress so this is not reachable today; raising on a
-    complete response would be the wrong behaviour if it ever were.
+    Preserved as None rather than coerced to empty string, matching the
+    OpenAI contract (M4 T076 / T079).
     """
     body = json.loads(json.dumps(SUCCESS_BODY))
     body["choices"][0]["message"]["content"] = None
 
-    assert from_mistral_response(body, MODEL_ID).content == ""
+    assert from_mistral_response(body, MODEL_ID).content is None
+
+
+def test_empty_string_content_normalised_to_none_when_tool_calls_present() -> None:
+    """Mistral sends content='' (not null) when returning tool calls.
+
+    The router normalises empty-string content to None in that case so that
+    Scenario 10 ('content is null') is satisfied.
+    """
+    body = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "tc1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"location": "Tokyo"}',
+                            },
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "model": MODEL_ID,
+    }
+    resp = from_mistral_response(body, MODEL_ID)
+    assert resp.content is None
+    assert resp.finish_reason == "tool_calls"
+    assert resp.tool_calls is not None and len(resp.tool_calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -452,3 +495,527 @@ def test_provider_timeout_is_shared_with_the_google_adapter() -> None:
     from free_router.providers.google import adapter as google_adapter
 
     assert PROVIDER_TIMEOUT_SECONDS == google_adapter.PROVIDER_TIMEOUT_SECONDS
+
+
+# --- Tools and function calling (M4 T079 / T080) ---
+
+
+def test_to_mistral_request_tools_and_tool_choice_forwarded() -> None:
+    """tools and tool_choice are forwarded directly in the payload."""
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Look up an item",
+                "parameters": {"type": "object", "properties": {"id": {"type": "string"}}},
+            },
+        }
+    ]
+    payload = to_mistral_request(_request(tools=tools, tool_choice="auto"), MODEL_ID)
+    assert payload["tools"] == tools
+    assert payload["tool_choice"] == "auto"
+
+    payload_named = to_mistral_request(
+        _request(tools=tools, tool_choice={"type": "function", "function": {"name": "lookup"}}),
+        MODEL_ID,
+    )
+    assert payload_named["tool_choice"] == {"type": "function", "function": {"name": "lookup"}}
+
+
+def test_to_mistral_request_assistant_tool_calls_in_history() -> None:
+    """Assistant tool_calls and null content are preserved."""
+    req = _request(
+        messages=[
+            {"role": "user", "content": "Fetch data"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"id": "42"}'},
+                    }
+                ],
+            },
+        ]
+    )
+    payload = to_mistral_request(req, MODEL_ID)
+    assert len(payload["messages"]) == 2
+    assistant_msg = payload["messages"][1]
+    assert assistant_msg["role"] == "assistant"
+    assert assistant_msg["content"] is None
+    assert assistant_msg["tool_calls"] == [
+        {
+            "id": "call_abc",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": '{"id": "42"}'},
+        }
+    ]
+
+
+def test_to_mistral_request_drops_the_gemini_signature_passthrough() -> None:
+    """A Gemini thought signature must not reach Mistral's schema.
+
+    ``extra_content`` only has meaning to the Google adapter. Forwarding it
+    verbatim would send an unknown key to a provider that validates its
+    tool_calls shape, so the Mistral edge removes it.
+    """
+    req = _request(
+        messages=[
+            {"role": "user", "content": "Fetch data"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"id": "42"}'},
+                        "extra_content": {"google": {"thought_signature": "sig"}},
+                    }
+                ],
+            },
+        ]
+    )
+    payload = to_mistral_request(req, MODEL_ID)
+    assert payload["messages"][1]["tool_calls"] == [
+        {
+            "id": "call_abc",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": '{"id": "42"}'},
+        }
+    ]
+
+
+def test_to_mistral_request_tool_result_message() -> None:
+    """role: 'tool' message passes through with tool_call_id and content."""
+    req = _request(
+        messages=[
+            {"role": "user", "content": "Fetch data"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"id": "42"}'},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_abc",
+                "content": '{"result": "found"}',
+            },
+        ]
+    )
+    payload = to_mistral_request(req, MODEL_ID)
+    assert len(payload["messages"]) == 3
+    tool_msg = payload["messages"][2]
+    assert tool_msg["role"] == "tool"
+    assert tool_msg["tool_call_id"] == "call_abc"
+    assert tool_msg["content"] == '{"result": "found"}'
+
+
+def test_from_mistral_response_tool_calls() -> None:
+    """Mistral response with tool_calls produces tool_calls.
+
+    Produces content: None and finish_reason: tool_calls.
+    """
+    raw = {
+        "id": "cmpl-tool-123",
+        "object": "chat.completion",
+        "created": 1702256327,
+        "model": MODEL_ID,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_mistral_1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": '{"id": "42"}'},
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"prompt_tokens": 8, "completion_tokens": 12, "total_tokens": 20},
+    }
+
+    resp = from_mistral_response(raw, MODEL_ID)
+    assert resp.content is None
+    assert resp.finish_reason == "tool_calls"
+    assert resp.model_used == MODEL_ID
+    assert resp.tool_calls is not None
+    assert len(resp.tool_calls) == 1
+    tc = resp.tool_calls[0]
+    assert tc.id == "call_mistral_1"
+    assert tc.type == "function"
+    assert tc.function == {"name": "lookup", "arguments": '{"id": "42"}'}
+
+
+def test_tool_call_turn_reported_as_stop_is_promoted() -> None:
+    """A tool-call turn that says "stop" still reports ``tool_calls``.
+
+    Mistral can end a call with "stop"; an OpenAI client branches on the finish
+    reason to decide whether to run the call, so the two must stay distinct.
+    """
+    raw = {
+        "id": "cmpl-promoted",
+        "object": "chat.completion",
+        "created": 1702256328,
+        "model": MODEL_ID,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_stop_1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ],
+                },
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+    resp = from_mistral_response(raw, MODEL_ID)
+    assert resp.finish_reason == "tool_calls"
+    assert resp.content is None
+
+
+def test_chunk_from_mistral_tool_call_delta() -> None:
+    """Streaming chunk with delta.tool_calls produces tool_call_deltas."""
+    event = {
+        "id": "cmpl-stream-1",
+        "object": "chat.completion.chunk",
+        "created": 1702256327,
+        "model": MODEL_ID,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_m1",
+                            "function": {"name": "lookup", "arguments": '{"id": "42"}'},
+                        }
+                    ]
+                },
+                "finish_reason": None,
+            }
+        ],
+    }
+
+    chunk = _chunk_from_mistral(event)
+    assert chunk is not None
+    assert chunk.delta == ""
+    assert chunk.tool_call_deltas is not None
+    assert len(chunk.tool_call_deltas) == 1
+    assert chunk.tool_call_deltas[0].index == 0
+    assert chunk.tool_call_deltas[0].id == "call_m1"
+    assert chunk.tool_call_deltas[0].function == {"name": "lookup", "arguments": '{"id": "42"}'}
+
+
+@respx.mock
+async def test_mistral_unary_second_turn_round_trip(
+    http_client: httpx.AsyncClient,
+    key: KeyRef,
+) -> None:
+    """Second-turn tool result produces normal assistant answer in Mistral."""
+    turn1_body = {
+        "id": "cmpl-t1",
+        "object": "chat.completion",
+        "created": 1702256327,
+        "model": MODEL_ID,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_mis_1",
+                            "type": "function",
+                            "function": {"name": "get_stock", "arguments": '{"ticker": "AAPL"}'},
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+    }
+    turn2_body = {
+        "id": "cmpl-t2",
+        "object": "chat.completion",
+        "created": 1702256328,
+        "model": MODEL_ID,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "AAPL is at $150.00."},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+    route = respx.post(CHAT_URL)
+    route.side_effect = [
+        httpx.Response(200, json=turn1_body),
+        httpx.Response(200, json=turn2_body),
+    ]
+
+    adapter = MistralAdapter(http_client=http_client)
+
+    req1 = _request(
+        messages=[{"role": "user", "content": "What is AAPL stock price?"}],
+        tools=[{"type": "function", "function": {"name": "get_stock"}}],
+    )
+    resp1 = await adapter.chat_completion(req1, MODEL_ID, key)
+    assert resp1.finish_reason == "tool_calls"
+    assert resp1.tool_calls is not None
+    call_id = resp1.tool_calls[0].id
+
+    req2 = _request(
+        messages=[
+            {"role": "user", "content": "What is AAPL stock price?"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [tc.model_dump() for tc in resp1.tool_calls],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": '{"price": 150.00}',
+            },
+        ],
+        tools=[{"type": "function", "function": {"name": "get_stock"}}],
+    )
+    resp2 = await adapter.chat_completion(req2, MODEL_ID, key)
+    assert resp2.finish_reason == "stop"
+    assert resp2.content == "AAPL is at $150.00."
+    assert resp2.tool_calls is None
+
+
+# --- Structured output (T083) ---
+
+
+def test_json_object_passthrough() -> None:
+    """Mistral is OpenAI-shaped, so ``response_format`` passes through as sent."""
+    req = _request(
+        messages=[{"role": "user", "content": "Return json"}],
+        response_format={"type": "json_object"},
+    )
+    payload = to_mistral_request(req, MODEL_ID)
+    assert payload.get("response_format") == {"type": "json_object"}
+
+
+def test_json_schema_passthrough() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"name": {"type": "string"}},
+        "required": ["name"],
+    }
+    fmt = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "Person",
+            "schema": schema,
+        },
+    }
+    req = _request(
+        messages=[{"role": "user", "content": "Return json"}],
+        response_format=fmt,
+    )
+    payload = to_mistral_request(req, MODEL_ID)
+    assert payload.get("response_format") == fmt
+
+
+def test_text_response_format_is_forwarded() -> None:
+    """``text`` means "no constraint" and Mistral accepts it, so it is not stripped.
+
+    Measured, not assumed: ``ministral-3b-2512`` returns 200 for it. Stripping
+    it here would be a second translation rule with nothing to justify it.
+    """
+    req = _request(
+        messages=[{"role": "user", "content": "Return text"}],
+        response_format={"type": "text"},
+    )
+    payload = to_mistral_request(req, MODEL_ID)
+    assert payload.get("response_format") == {"type": "text"}
+
+
+def test_no_response_format() -> None:
+    req = _request(messages=[{"role": "user", "content": "Return text"}])
+    payload = to_mistral_request(req, MODEL_ID)
+    assert "response_format" not in payload
+
+
+def test_response_format_coexists_with_tools() -> None:
+    tools = [{"type": "function", "function": {"name": "get_stock"}}]
+    req = _request(
+        messages=[{"role": "user", "content": "Hi"}],
+        tools=tools,
+        response_format={"type": "json_object"},
+    )
+    payload = to_mistral_request(req, MODEL_ID)
+    assert payload.get("response_format") == {"type": "json_object"}
+    assert payload.get("tools") == tools
+
+
+@respx.mock
+async def test_round_trip_with_response_format(http_client: httpx.AsyncClient, key: KeyRef) -> None:
+    route = respx.post(CHAT_URL).respond(
+        200,
+        json={
+            "id": "cmpl-fmt-1",
+            "object": "chat.completion",
+            "created": 1702256327,
+            "model": MODEL_ID,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": '{"success": true}'},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        },
+    )
+    adapter = MistralAdapter(http_client=http_client)
+    req = _request(
+        messages=[{"role": "user", "content": "Return json"}],
+        response_format={"type": "json_object"},
+    )
+    resp = await adapter.chat_completion(req, MODEL_ID, key)
+    assert resp.content == '{"success": true}'
+    assert resp.finish_reason == "stop"
+    sent_body = json.loads(route.calls[0].request.content)
+    assert sent_body.get("response_format") == {"type": "json_object"}
+
+
+# --- Vision pass-through (T085) ---
+
+
+def test_to_mistral_request_base64_image_part() -> None:
+    """A base64 image part is forwarded in the shape Mistral documents."""
+    b64 = "iVBORw0KGgo="
+    request = NormalizedRequest(
+        model="mistral/ministral-3b-2512",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe:"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                ],
+            }
+        ],
+    )
+    payload = to_mistral_request(request, MODEL_ID)
+    content = payload["messages"][0]["content"]
+    assert isinstance(content, list)
+    assert content == [
+        {"type": "text", "text": "Describe:"},
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+    ]
+
+
+def test_to_mistral_request_input_image_spelling_is_normalised() -> None:
+    """``input_image`` becomes ``image_url``: Mistral rejects the former.
+
+    Measured (T085): forwarding the Responses spelling verbatim returns 422.
+    """
+    request = NormalizedRequest(
+        model="mistral/ministral-3b-2512",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "input_image": {"url": "data:image/png;base64,AAA"}},
+                ],
+            }
+        ],
+    )
+    payload = to_mistral_request(request, MODEL_ID)
+    assert payload["messages"][0]["content"] == [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}
+    ]
+
+
+def test_content_part_without_url_is_refused_not_forwarded() -> None:
+    """A part the boundary would reject raises rather than reaching the provider."""
+    request = NormalizedRequest(
+        model="mistral/ministral-3b-2512",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+                    {"type": "file", "file": {"file_id": "f-1"}},
+                ],
+            }
+        ],
+    )
+    with pytest.raises(ValueError, match="without a data URL"):
+        to_mistral_request(request, MODEL_ID)
+
+
+@respx.mock
+async def test_mistral_image_round_trip(http_client: httpx.AsyncClient, key: KeyRef) -> None:
+    """A base64 image part round-trips and the completion is returned (T085)."""
+    route = respx.post(CHAT_URL).respond(
+        200,
+        json={
+            "id": "cmpl-img-1",
+            "object": "chat.completion",
+            "created": 1702256327,
+            "model": MODEL_ID,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "A red pixel."},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14},
+        },
+    )
+    adapter = MistralAdapter(http_client=http_client)
+    req = NormalizedRequest(
+        model="mistral/ministral-3b-2512",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What colour is this?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+                ],
+            }
+        ],
+    )
+    resp = await adapter.chat_completion(req, MODEL_ID, key)
+
+    assert resp.content == "A red pixel."
+    assert resp.finish_reason == "stop"
+    sent_body = json.loads(route.calls[0].request.content)
+    assert sent_body["messages"][0]["content"] == [
+        {"type": "text", "text": "What colour is this?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+    ]

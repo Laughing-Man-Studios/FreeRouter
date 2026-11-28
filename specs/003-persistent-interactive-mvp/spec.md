@@ -525,7 +525,7 @@ carried by Milestone 4.** M3's design (`specs/004-capability-aware-router/`) fou
 that the convergence assumed here does not exist: M3's four issues scope capability
 *awareness* — the schema, local requirement detection and filtering — and no issue
 scopes adapter work. Neither adapter forwards `tools`; the ingress boundary discards
-the field before dispatch (`core/normalization.py`, `SUPPORTED_INGRESS_FIELDS`). A
+the field before dispatch (`core/normalization.py`, `REQUIRED_INGRESS_FIELDS`). A
 filter that admitted a tools request would pass it to an adapter that strips the
 tools, which is the silent degradation CONSTITUTION §7.1 names first.
 

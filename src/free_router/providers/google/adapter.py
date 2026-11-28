@@ -19,10 +19,11 @@ unary path passes ``header_window=None`` and is bounded by the client's read
 timeout instead. A single window cannot mean both things, and a 5 s one silently
 capped unary generation at five seconds.
 
-**Only the messages the normalizer kept are sent.** M0 honours ``model`` and
-``messages`` exclusively; ``temperature`` and ``max_tokens`` were already
-stripped at ingress and have no representation here. Adding a generationConfig
-would be scope for a later milestone, not a fix.
+**Only what the boundary admitted is sent.** The normalizer keeps ``model``,
+``messages``, ``stream``, ``include_usage``, the tool fields
+(``tools``/``tool_choice``), and ``response_format``; ``temperature`` and
+``max_tokens`` are stripped at ingress and have no representation here. Adding
+other generationConfig parameters would be scope for a later milestone, not a fix.
 
 Note the API surface: Gemini's newer Interactions API is not used here. The
 spec mandates ``generateContent``, and confining all Gemini specifics to this
@@ -32,6 +33,7 @@ module keeps a future migration contained.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from collections.abc import AsyncIterator, Mapping
@@ -53,6 +55,8 @@ from free_router.core.normalization import (
     NormalizedRequest,
     NormalizedResponse,
     TokenUsage,
+    ToolCall,
+    ToolCallDelta,
 )
 from free_router.keys.manager import KeyRef
 from free_router.providers.sse import SSEDecodeError, iter_sse_data, response_lines
@@ -84,6 +88,40 @@ _FINISH_REASON_MAP: Mapping[str, FinishReason] = {
     "SAFETY": "content_filter",
 }
 """Gemini ``finishReason`` values mapped to the OpenAI vocabulary."""
+
+_SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator"
+"""Gemini's documented placeholder for a call whose real signature is unavailable.
+
+Gemini 3 rejects a replayed ``functionCall`` that carries no ``thoughtSignature``
+with a 400, and the signature can only come back from the client: this router is
+a stateless OpenAI-shaped boundary, so it has nowhere else to keep it.
+
+The docs offer these placeholder values for exactly that situation -- "transferring
+a trace from a different model that does not include thought signatures". That is
+also what a cross-provider failover produces: a Mistral call replayed to Gemini.
+Validation is skipped, and the documented cost is reasoning quality, not
+correctness. Refusing the second turn instead would make the loop unusable for
+every plain OpenAI client.
+"""
+
+
+def _thought_signature(tool_call: Mapping[str, Any]) -> str | None:
+    """Read a replayed Gemini thought signature from an OpenAI tool call.
+
+    Uses the ``extra_content.google.thought_signature`` spelling that Gemini's
+    own OpenAI-compatible endpoint emits, so a client that simply echoes the
+    assistant message back needs no translation of its own.
+    """
+    extra = tool_call.get("extra_content")
+    if not isinstance(extra, dict):
+        return None
+    google = extra.get("google")
+    if not isinstance(google, dict):
+        return None
+    signature = google.get("thought_signature")
+    if isinstance(signature, str) and signature:
+        return signature
+    return None
 
 
 def _timeout_message(header_window: float | None) -> str:
@@ -206,10 +244,30 @@ class GoogleAdapter:
         )
         response = await self._send(url, headers, payload)
 
+        saw_tool_call = False
+        finish_emitted = False
         try:
             async for event in iter_sse_data(response_lines(response)):
-                chunk = _chunk_from_gemini(event)
-                if chunk is not None:
+                chunk = _chunk_from_gemini(event, saw_tool_call=saw_tool_call)
+                if chunk is None:
+                    continue
+                if chunk.tool_call_deltas:
+                    saw_tool_call = True
+                if chunk.finish_reason is not None:
+                    if finish_emitted:
+                        # Gemini reports the terminal reason on the event after a
+                        # functionCall, which already supplied "tool_calls". Drop
+                        # the repeat so the client sees exactly one terminal chunk;
+                        # any usage on the event survives.
+                        chunk = chunk.model_copy(update={"finish_reason": None})
+                    else:
+                        finish_emitted = True
+                if (
+                    chunk.delta
+                    or chunk.tool_call_deltas
+                    or chunk.usage is not None
+                    or chunk.finish_reason is not None
+                ):
                     yield chunk
         except SSEDecodeError as exc:
             # A malformed event is an upstream fault, so it joins the rest of the
@@ -344,12 +402,118 @@ class GoogleAdapter:
         return decoded
 
 
+def _content_part_to_gemini(part: dict[str, Any]) -> dict[str, Any]:
+    """Translate one content part into a Gemini part.
+
+    Normalization admits only two kinds of part and requires an image to be a
+    base64 ``data:`` URL, so this translates what arrived rather than deciding
+    what is acceptable. Anything else raises instead of being rendered as
+    ``str(part)``: a Python ``repr`` in the prompt is not a translation of what
+    the client asked for, and pretending otherwise would be the silent
+    degradation spec 7.9 prohibits.
+    """
+    if part.get("type") == "text":
+        return {"text": part["text"]}
+
+    image = part.get("image_url") if "image_url" in part else part.get("input_image")
+    url = image.get("url") if isinstance(image, dict) else image
+    if not isinstance(url, str):
+        raise ValueError(
+            "image part reached the adapter without a data URL; "
+            "normalization should have refused it."
+        )
+    header, separator, data = url.partition(",")
+    mime_type = header.partition(";")[0].partition(":")[2]
+    if not separator or not mime_type or not data:
+        raise ValueError(
+            "malformed image data URL reached the adapter; normalization should have refused it."
+        )
+    return {"inlineData": {"mimeType": mime_type, "data": data}}
+
+
+def _synthesise_call_id(fn_name: str, call_index: int) -> str:
+    """Synthesise a deterministic call id within a response.
+
+    Gemini does return an ``id`` inside ``functionCall`` -- observed live, though
+    the documented examples omit it -- but the value is not something the router
+    can promise anything about. OpenAI clients only use the id to correlate a
+    call with its result, so the adapter derives one whose contract it can keep:
+    stable within a response, not across requests, identical whether or not the
+    provider supplied a field.
+    """
+    digest = hashlib.sha1(f"{fn_name}:{call_index}".encode()).hexdigest()[:8]
+    return f"call_{digest}"
+
+
+def _tool_choice_to_gemini(tool_choice: str | dict[str, Any]) -> dict[str, Any]:
+    """Translate an OpenAI tool_choice value into Gemini's toolConfig.
+
+    Every supported form is enumerated. An unrecognised value raises rather than
+    defaulting to ``AUTO``: normalization refuses those values before dispatch,
+    and defaulting here would quietly replace the client's instruction with a
+    different one if that ever stopped being true.
+    """
+    if tool_choice == "auto":
+        return {"functionCallingConfig": {"mode": "AUTO"}}
+    if tool_choice == "none":
+        return {"functionCallingConfig": {"mode": "NONE"}}
+    if tool_choice == "required":
+        return {"functionCallingConfig": {"mode": "ANY"}}
+    if isinstance(tool_choice, dict):
+        fn = tool_choice.get("function")
+        name = fn.get("name") if isinstance(fn, dict) else None
+        config: dict[str, Any] = {"mode": "ANY"}
+        if isinstance(name, str) and name:
+            config["allowedFunctionNames"] = [name]
+        return {"functionCallingConfig": config}
+    raise ValueError(
+        f"Unsupported tool_choice {tool_choice!r}; normalization should have refused it."
+    )
+
+
+def _response_format_to_gemini(response_format: dict[str, Any]) -> dict[str, Any]:
+    """Translate an OpenAI ``response_format`` into Gemini ``generationConfig`` keys.
+
+    ``json_object`` becomes ``responseMimeType`` alone; ``json_schema`` adds
+    ``responseSchema``; ``text`` means "no constraint" and contributes nothing.
+
+    The schema is forwarded as the client wrote it rather than rewritten. Gemini
+    accepts an OpenAPI 3.0 subset, so a schema outside that subset cannot be
+    forwarded faithfully; the choice made in Batch 3 was to let the provider
+    reject it and surface that rejection (ADR-0011 decision 7), rather than
+    approximate it locally and return something that looks like compliance.
+
+    Every form is enumerated, and anything else raises. Normalization refuses
+    those values before dispatch, so reaching the raise means that contract
+    broke — and falling back to *no* constraint would answer a request that
+    asked for structured output with prose.
+    """
+    fmt_type = response_format.get("type")
+    if fmt_type == "text":
+        return {}
+    if fmt_type == "json_object":
+        return {"responseMimeType": "application/json"}
+    if fmt_type == "json_schema":
+        container = response_format.get("json_schema")
+        schema = container.get("schema") if isinstance(container, dict) else None
+        if not isinstance(schema, dict):
+            raise ValueError(
+                "response_format.json_schema.schema is missing; "
+                "normalization should have refused it."
+            )
+        return {"responseMimeType": "application/json", "responseSchema": schema}
+    raise ValueError(
+        f"Unsupported response_format type {fmt_type!r}; normalization should have refused it."
+    )
+
+
 def to_gemini_request(request: NormalizedRequest) -> dict[str, Any]:
     """Translate a :class:`NormalizedRequest` into a Gemini payload.
 
     System messages become Gemini's top-level ``systemInstruction`` because the
     API has no ``system`` role inside ``contents``. Remaining messages keep
-    their order.
+    their order, with assistant tool calls converted to ``functionCall`` parts
+    and ``role: "tool"`` results converted to ``functionResponse`` parts.
 
     Args:
         request: The internal normalized request.
@@ -357,29 +521,140 @@ def to_gemini_request(request: NormalizedRequest) -> dict[str, Any]:
     Returns:
         A JSON-ready ``generateContent`` body.
     """
+    call_id_to_name: dict[str, str] = {}
+    for message in request.messages:
+        if message.get("role") == "assistant":
+            for tc in message.get("tool_calls") or []:
+                if isinstance(tc, dict):
+                    tc_id = tc.get("id")
+                    fn_name = tc.get("function", {}).get("name")
+                    if tc_id and fn_name:
+                        call_id_to_name[str(tc_id)] = str(fn_name)
+
     contents: list[dict[str, Any]] = []
     system_instruction: dict[str, Any] | None = None
 
     for message in request.messages:
         role = message.get("role")
-        content = message.get("content", "")
-        # Guard the invariant the ingress normalizer already enforced, so this
-        # function is safe to call from a test with a hand-built request.
-        if not isinstance(content, str):
-            content = str(content)
 
         if role == "system":
+            content = message.get("content", "")
+            if not isinstance(content, str):
+                content = str(content)
             if system_instruction is None:
                 system_instruction = {"parts": [{"text": content}]}
             else:
                 system_instruction["parts"].append({"text": content})
             continue
 
-        contents.append({"role": role, "parts": [{"text": content}]})
+        if role == "assistant" and message.get("tool_calls"):
+            parts: list[dict[str, Any]] = []
+            content = message.get("content")
+            if content:
+                parts.append({"text": str(content)})
+            for idx, tc in enumerate(message.get("tool_calls") or []):
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function", {})
+                fn_name = str(fn.get("name", ""))
+                raw_args = fn.get("arguments", "{}")
+                if isinstance(raw_args, str):
+                    try:
+                        args = json.loads(raw_args)
+                        if not isinstance(args, dict):
+                            args = {}
+                    except (json.JSONDecodeError, ValueError):
+                        args = {}
+                elif isinstance(raw_args, dict):
+                    args = raw_args
+                else:
+                    args = {}
+                part: dict[str, Any] = {"functionCall": {"name": fn_name, "args": args}}
+                signature = _thought_signature(tc)
+                if signature:
+                    part["thoughtSignature"] = signature
+                elif idx == 0:
+                    # Gemini validates the first call of each step and rejects the
+                    # turn outright without a signature. A client that did not echo
+                    # one gets the documented placeholder rather than a 400.
+                    part["thoughtSignature"] = _SKIP_THOUGHT_SIGNATURE
+                parts.append(part)
+            contents.append({"role": "model", "parts": parts})
+            continue
+
+        if role == "tool":
+            call_id = message.get("tool_call_id")
+            fn_name = (
+                message.get("name")
+                or (call_id_to_name.get(str(call_id)) if call_id else None)
+                or (str(call_id) if call_id else "function")
+            )
+            raw_content = message.get("content", "")
+            if isinstance(raw_content, str):
+                try:
+                    parsed = json.loads(raw_content)
+                    if isinstance(parsed, dict):
+                        response_obj = parsed
+                    else:
+                        response_obj = {"output": parsed}
+                except (json.JSONDecodeError, ValueError):
+                    response_obj = {"output": raw_content}
+            elif isinstance(raw_content, dict):
+                response_obj = raw_content
+            else:
+                response_obj = {"output": raw_content}
+
+            part = {
+                "functionResponse": {
+                    "name": fn_name,
+                    "response": response_obj,
+                }
+            }
+            if contents and contents[-1].get("role") == "user":
+                contents[-1]["parts"].append(part)
+            else:
+                contents.append({"role": "user", "parts": [part]})
+            continue
+
+        content = message.get("content", "")
+        if isinstance(content, list):
+            parts_list: list[dict[str, Any]] = [
+                _content_part_to_gemini(p) for p in content if isinstance(p, dict)
+            ]
+            if not parts_list:
+                parts_list = [{"text": ""}]
+            contents.append({"role": role, "parts": parts_list})
+        else:
+            if not isinstance(content, str):
+                content = str(content)
+            contents.append({"role": role, "parts": [{"text": content}]})
 
     payload: dict[str, Any] = {"contents": contents}
     if system_instruction is not None:
         payload["systemInstruction"] = system_instruction
+
+    if request.tools:
+        declarations: list[dict[str, Any]] = []
+        for tool in request.tools:
+            fn = tool.get("function", {})
+            decl: dict[str, Any] = {
+                "name": fn.get("name", ""),
+            }
+            if "description" in fn:
+                decl["description"] = fn["description"]
+            if "parameters" in fn:
+                decl["parameters"] = fn["parameters"]
+            declarations.append(decl)
+        payload["tools"] = [{"functionDeclarations": declarations}]
+
+    if request.tool_choice is not None:
+        payload["toolConfig"] = _tool_choice_to_gemini(request.tool_choice)
+
+    if request.response_format:
+        gen_config = _response_format_to_gemini(request.response_format)
+        if gen_config:
+            payload.setdefault("generationConfig", {}).update(gen_config)
+
     return payload
 
 
@@ -423,7 +698,11 @@ def _usage_from_gemini(raw: dict[str, Any]) -> TokenUsage | None:
     )
 
 
-def _chunk_from_gemini(event: dict[str, Any]) -> NormalizedChunk | None:
+def _chunk_from_gemini(
+    event: dict[str, Any],
+    *,
+    saw_tool_call: bool = False,
+) -> NormalizedChunk | None:
     """Translate one Gemini stream event, or drop it if it carries nothing.
 
     Gemini's stream is not one event per token with a uniform shape. It sends
@@ -434,6 +713,7 @@ def _chunk_from_gemini(event: dict[str, Any]) -> NormalizedChunk | None:
 
     Args:
         event: One decoded ``data:`` payload.
+        saw_tool_call: Whether an earlier chunk in the stream carried a tool call.
 
     Returns:
         The normalized chunk, or ``None`` if the event carries nothing usable.
@@ -441,22 +721,52 @@ def _chunk_from_gemini(event: dict[str, Any]) -> NormalizedChunk | None:
     candidates = event.get("candidates") or []
     delta = ""
     finish_reason: FinishReason | None = None
+    tool_call_deltas: list[ToolCallDelta] | None = None
 
     if candidates and isinstance(candidates[0], dict):
         candidate = candidates[0]
         parts = (candidate.get("content") or {}).get("parts") or []
-        delta = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
-        raw_finish_reason = candidate.get("finishReason")
-        if raw_finish_reason:
-            # An unrecognised reason maps to "stop" for the same reason the unary
-            # path does it: the OpenAI vocabulary has three values and a client
-            # needs one of them.
-            finish_reason = _FINISH_REASON_MAP.get(str(raw_finish_reason).upper(), "stop")
+        delta = "".join(
+            part.get("text", "") for part in parts if isinstance(part, dict) and "text" in part
+        )
+
+        function_call_parts = [
+            (p["functionCall"], p.get("thoughtSignature"))
+            for p in parts
+            if isinstance(p, dict) and "functionCall" in p and isinstance(p["functionCall"], dict)
+        ]
+        if function_call_parts:
+            tool_call_deltas = []
+            for idx, (fc, signature) in enumerate(function_call_parts):
+                call_delta = ToolCallDelta(
+                    index=idx,
+                    id=_synthesise_call_id(str(fc.get("name", "")), idx),
+                    function={
+                        "name": str(fc.get("name", "")),
+                        "arguments": json.dumps(fc.get("args") or {}),
+                    },
+                )
+                if isinstance(signature, str) and signature:
+                    call_delta.extra_content = {"google": {"thought_signature": signature}}
+                tool_call_deltas.append(call_delta)
+            finish_reason = "tool_calls"
+        else:
+            raw_finish_reason = candidate.get("finishReason")
+            if raw_finish_reason:
+                if saw_tool_call:
+                    finish_reason = "tool_calls"
+                else:
+                    finish_reason = _FINISH_REASON_MAP.get(str(raw_finish_reason).upper(), "stop")
 
     usage = _usage_from_gemini(event)
-    if not delta and finish_reason is None and usage is None:
+    if not delta and finish_reason is None and usage is None and not tool_call_deltas:
         return None
-    return NormalizedChunk(delta=delta, finish_reason=finish_reason, usage=usage)
+    return NormalizedChunk(
+        delta=delta,
+        finish_reason=finish_reason,
+        usage=usage,
+        tool_call_deltas=tool_call_deltas,
+    )
 
 
 def from_gemini_response(raw: dict[str, Any], provider_model_id: str) -> NormalizedResponse:
@@ -480,6 +790,34 @@ def from_gemini_response(raw: dict[str, Any], provider_model_id: str) -> Normali
 
     candidate = candidates[0]
     parts = (candidate.get("content") or {}).get("parts") or []
+
+    function_call_parts = [
+        (p["functionCall"], p.get("thoughtSignature"))
+        for p in parts
+        if isinstance(p, dict) and "functionCall" in p and isinstance(p["functionCall"], dict)
+    ]
+    if function_call_parts:
+        tool_calls: list[ToolCall] = []
+        for idx, (fc, signature) in enumerate(function_call_parts):
+            call = ToolCall(
+                id=_synthesise_call_id(str(fc.get("name", "")), idx),
+                type="function",
+                function={
+                    "name": str(fc.get("name", "")),
+                    "arguments": json.dumps(fc.get("args") or {}),
+                },
+            )
+            if isinstance(signature, str) and signature:
+                call.extra_content = {"google": {"thought_signature": signature}}
+            tool_calls.append(call)
+        return NormalizedResponse(
+            content=None,
+            model_used=provider_model_id,
+            finish_reason="tool_calls",
+            usage=_usage_from_gemini(raw),
+            tool_calls=tool_calls,
+        )
+
     text = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
 
     raw_finish_reason = str(candidate.get("finishReason", "STOP")).upper()

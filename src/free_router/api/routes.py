@@ -19,7 +19,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 
 from free_router.api import stream_dispatch
-from free_router.core.capabilities import CapacityProbe, detect_requirements, resolve_target
+from free_router.core.capabilities import CapacityProbe, detect_requirements
 from free_router.core.config import Config, ModelConfig
 from free_router.core.debug_logging import debug_payload
 from free_router.core.dispatch import Dispatcher
@@ -31,6 +31,7 @@ from free_router.core.normalization import (
     normalize_chat_completion_request,
     to_openai_completion,
 )
+from free_router.core.routing import resolve_request
 
 __all__ = [
     "chat_completions",
@@ -90,16 +91,21 @@ def resolve_model(config: Config, model: str) -> tuple[str, str]:
 
 
 def _capacity_probe(dispatcher: Dispatcher) -> CapacityProbe:
-    """Adapt the dispatcher's capacity gate into a fallback-selection probe.
+    """Adapt the dispatcher's capacity gate into a selection probe.
 
-    Substitution must respect the same quota, cooldown and breaker rules as
-    dispatch (spec §4 step 2). Reusing ``Dispatcher._check_capacity`` keeps one
-    implementation of those rules: a fallback that would be refused at dispatch
-    is skipped during selection instead, and the error it would have raised is
-    preserved for the case where no fallback is available.
+    Substitution and auto-routing must respect the same quota, cooldown and
+    breaker rules as dispatch (spec §3 step 2). Reusing
+    ``Dispatcher._check_capacity`` keeps one implementation of those rules: a
+    candidate that would be refused at dispatch is skipped during selection
+    instead, and the error it would have raised is preserved for the case where
+    no candidate is available.
 
-    The requested model is deliberately not probed here; the dispatcher still
-    gates it exactly as in M2, so a rate limit on it keeps its existing outcome.
+    M3 probes fallbacks only, so the requested model keeps its M2 outcome; the
+    auto-routing sweep probes every model, because ``free`` has no requested
+    model to preserve.
+
+    The probe is in-memory by design (cooldown, breaker and quota counters), so
+    a sweep over every configured model costs dictionary lookups, not I/O.
     """
 
     def probe(model: ModelConfig, estimated_tokens: int) -> RouterBaseError | None:
@@ -147,13 +153,31 @@ async def chat_completions(
     requirements = detect_requirements(payload, assumed_output=config.quota.output_token_assumption)
     normalized = normalize_chat_completion_request(payload)
 
-    target = resolve_target(
+    target, routing_decision = resolve_request(
         config,
         requirements,
         normalized.model,
         capacity_probe=_capacity_probe(dispatcher),
     )
-    if target.substituted_from is not None:
+    if target.selection == "auto":
+        assert routing_decision is not None
+        logger.info(
+            "routing_decision: requested 'free', selected '%s' with score %s",
+            target.model.id,
+            routing_decision.score,
+            extra={
+                "event": "routing_decision",
+                "requested": routing_decision.requested,
+                "selected": routing_decision.selected,
+                "score": routing_decision.score,
+                "contributions": routing_decision.contributions,
+                "weights": routing_decision.weights.model_dump(),
+                "candidates": [c.model_dump() for c in routing_decision.candidates],
+                "excluded": [e.model_dump() for e in routing_decision.excluded],
+            },
+        )
+        effective_request = normalized.model_copy(update={"model": target.model.id})
+    elif target.selection == "substituted":
         logger.info(
             "model_substituted: requested '%s', substituted '%s' due to %s",
             target.substituted_from,

@@ -41,6 +41,9 @@ def capabilities_yaml(
     streaming: bool = True,
     fallback_models: tuple[str, ...] = (),
     indent: str = "    ",
+    tools: bool = False,
+    tools_provenance: str = "assumed",
+    tools_source: str | None = None,
 ) -> str:
     """A complete capability block, for tests that build their own config.
 
@@ -52,6 +55,9 @@ def capabilities_yaml(
     fallback = (
         "[]" if not fallback_models else "[" + ", ".join(f'"{m}"' for m in fallback_models) + "]"
     )
+    if tools_provenance == "measured" and tools_source is None:
+        tools_source = "test measurement, tools, 2026-11-18"
+    tools_source_line = f'{indent}    source: "{tools_source}"\n' if tools_source else ""
     return (
         f"{indent}capabilities:\n"
         f"{indent}  context_window:\n"
@@ -63,8 +69,9 @@ def capabilities_yaml(
         f"{indent}    provenance: measured\n"
         f'{indent}    source: "test measurement, 1/1 streamed, 2026-11-04"\n'
         f"{indent}  supports_tools:\n"
-        f"{indent}    value: false\n"
-        f"{indent}    provenance: assumed\n"
+        f"{indent}    value: {str(tools).lower()}\n"
+        f"{indent}    provenance: {tools_provenance}\n"
+        f"{tools_source_line}"
         f"{indent}  supports_vision:\n"
         f"{indent}    value: false\n"
         f"{indent}    provenance: assumed\n"
@@ -99,12 +106,21 @@ def sample_capabilities(
 
 
 MINIMAL_CONFIG = (
+    "routing:\n"
+    "  weights:\n"
+    "    quality: 0.60\n"
+    "    tool_support: 0.30\n"
+    "    latency: 0.10\n"
+    "  latency_ceiling_ms: 5000\n"
     "models:\n"
     '  - id: "google/gemini-3.5-flash-lite"\n'
     '    provider: "google"\n'
-    '    provider_id: "gemini-3.5-flash-lite"\n' + capabilities_yaml()
+    '    provider_id: "gemini-3.5-flash-lite"\n'
+    "    routing:\n"
+    "      quality: 75\n"
+    "      latency_ms: 1200\n" + capabilities_yaml()
 )
-"""The shipped M0 configuration."""
+"""The shipped M4 configuration: one model, its priors, and the routing policy."""
 
 
 @pytest.fixture
@@ -120,7 +136,7 @@ def workdir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
 
 @pytest.fixture
 def minimal_config() -> str:
-    """The shipped M0 configuration, as a YAML document."""
+    """The shipped M4 configuration, as a YAML document."""
     return MINIMAL_CONFIG
 
 
